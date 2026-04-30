@@ -1,0 +1,13 @@
+[package]
+name = "bevy_ensemble_steam"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = "0.18"
+bevy-steamworks = "0.16"
+bevy_ensemble = { path = "../.." }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+bevy_immediate = "0.5"

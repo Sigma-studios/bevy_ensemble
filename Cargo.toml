@@ -1,0 +1,12 @@
+[package]
+name = "bevy_ensemble"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = ["crates/bevy_ensemble_steam"]
+
+[dependencies]
+bevy = { version = "0.18", features = ["serialize"] }
+serde_cbor = "0.11"
+serde = { version = "1", features = ["derive"] }
