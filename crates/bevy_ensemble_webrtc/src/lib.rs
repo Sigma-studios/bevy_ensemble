@@ -1,0 +1,175 @@
+pub mod protocol;
+
+#[cfg(feature = "server")]
+pub mod server;
+
+#[cfg(feature = "client")]
+mod connection;
+#[cfg(feature = "client")]
+mod systems;
+
+
+#[cfg(feature = "client")]
+use bevy::prelude::*;
+#[cfg(feature = "client")]
+use bevy_ensemble::EnsembleAppExt;
+
+/// Bevy plugin for WebRTC P2P networking via a signaling server.
+///
+/// Connects to a signaling server for lobby management, then uses matchbox
+/// for cross-platform WebRTC data channels (works on both native and WASM).
+#[cfg(feature = "client")]
+pub struct BevyEnsembleWebrtcPlugin {
+    pub server_url: String,
+    pub display_name: String,
+    pub max_players: u32,
+}
+
+#[cfg(feature = "client")]
+impl Default for BevyEnsembleWebrtcPlugin {
+    fn default() -> Self {
+        Self {
+            server_url: "ws://localhost:9090/ws".into(),
+            display_name: "Player".into(),
+            max_players: 8,
+        }
+    }
+}
+
+/// Marks a lobby entity with its server-assigned lobby ID.
+#[cfg(feature = "client")]
+#[derive(Component)]
+pub struct LobbyWebrtcId(pub u64);
+
+/// Marks a lobby client entity with the remote peer's player UUID.
+#[cfg(feature = "client")]
+#[derive(Component)]
+pub struct LobbyClientWebrtcUuid(pub u128);
+
+/// Temporary marker for lobby client entities awaiting handshake completion.
+#[cfg(feature = "client")]
+#[derive(Component)]
+pub struct PendingWebrtcLobbyClient;
+
+/// Write this message to request a lobby list refresh from the signaling server.
+#[cfg(feature = "client")]
+#[derive(Message, Clone, Copy, Debug)]
+pub struct RefreshLobbyList;
+
+/// Write this message to join a lobby by its server-assigned ID.
+#[cfg(feature = "client")]
+#[derive(Message, Clone, Copy, Debug)]
+pub struct JoinWebrtcLobby(pub u64);
+
+/// Internal handshake message exchanged over data channels to confirm readiness.
+#[cfg(feature = "client")]
+#[derive(Message, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WebrtcReadyHandshake {
+    pub from_host: bool,
+}
+
+/// Newtype wrapper around [`matchbox_socket::WebRtcSocket`] so it can be used as a Bevy Resource.
+#[cfg(feature = "client")]
+#[derive(Resource, Deref, DerefMut)]
+pub(crate) struct MatchboxSocket(matchbox_socket::WebRtcSocket);
+
+/// Holds the Tokio runtime and plugin config so the socket can be recreated
+/// when leaving and rejoining lobbies.
+#[cfg(feature = "client")]
+#[derive(Resource)]
+pub(crate) struct WebrtcRuntime {
+    runtime: tokio::runtime::Runtime,
+    server_url: String,
+    display_name: String,
+    pub(crate) max_players: u32,
+}
+
+#[cfg(feature = "client")]
+impl WebrtcRuntime {
+    /// Build a fresh matchbox socket + lobby connection and spawn the message loop.
+    /// Called at init and again each time the player leaves a lobby.
+    pub(crate) fn build_socket(
+        &self,
+    ) -> (MatchboxSocket, connection::LobbyConnection) {
+        use std::sync::{Arc, Mutex};
+
+        use connection::EnsembleSignallerBuilder;
+        use tokio::sync::mpsc;
+
+        let (lobby_event_tx, lobby_event_rx) = mpsc::unbounded_channel();
+        let (lobby_command_tx, lobby_command_rx) = mpsc::unbounded_channel();
+
+        let lobby_connection = connection::LobbyConnection {
+            command_tx: lobby_command_tx,
+            event_rx: std::sync::Mutex::new(lobby_event_rx),
+            local_player_uuid: None,
+        };
+
+        let signaller_builder = Arc::new(EnsembleSignallerBuilder {
+            display_name: self.display_name.clone(),
+            lobby_event_tx,
+            lobby_command_rx: Arc::new(Mutex::new(Some(lobby_command_rx))),
+            runtime_handle: self.runtime.handle().clone(),
+        });
+
+        let (socket, message_loop) = matchbox_socket::WebRtcSocket::builder(&self.server_url)
+            .add_reliable_channel()
+            .signaller_builder(signaller_builder)
+            .build();
+
+        self.runtime.spawn(message_loop);
+
+        (MatchboxSocket(socket), lobby_connection)
+    }
+}
+
+#[cfg(feature = "client")]
+impl Plugin for BevyEnsembleWebrtcPlugin {
+    fn build(&self, app: &mut App) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create Tokio runtime");
+
+        let webrtc_runtime = WebrtcRuntime {
+            runtime,
+            server_url: self.server_url.clone(),
+            display_name: self.display_name.clone(),
+            max_players: self.max_players,
+        };
+
+        let (socket, lobby_connection) = webrtc_runtime.build_socket();
+
+        app.insert_resource(webrtc_runtime)
+            .insert_resource(lobby_connection)
+            .insert_resource(socket)
+            .add_message::<connection::LobbyEvent>()
+            .add_message::<JoinWebrtcLobby>()
+            .add_message::<RefreshLobbyList>()
+            .register_ensemble_message_type::<WebrtcReadyHandshake>()
+            .add_systems(
+                Update,
+                (
+                    systems::flush_lobby_events,
+                    systems::apply_lobby_events,
+                )
+                    .chain(),
+            )
+            .add_systems(
+                Update,
+                (
+                    systems::create_lobby,
+                    systems::join_requested_lobbies,
+                    systems::refresh_lobby_list,
+                    systems::poll_matchbox_peers,
+                    systems::send_client_handshakes,
+                    systems::send_host_handshakes,
+                    systems::promote_client_lobby_on_host_handshake,
+                    systems::promote_host_client_on_client_handshake,
+                    systems::detect_lobby_leave,
+                ),
+            )
+            .add_systems(Update, systems::read_peer_messages)
+            .add_observer(systems::send_serialized_lobby_packet);
+    }
+}

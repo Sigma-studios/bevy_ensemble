@@ -21,6 +21,9 @@ pub use crate::{
     // Participant components
     LobbyParticipant, LobbyParticipantOf, LobbyParticipants,
 
+    // Lobby discovery
+    PublicLobbies, PublicLobbyInfo,
+
     // Ownership
     PlayerOwned, PlayerOwnedEntities,
 

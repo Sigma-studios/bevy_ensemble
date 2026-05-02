@@ -30,8 +30,8 @@ pub struct EnsembleMessageRegistry {
 }
 
 struct RegisteredEnsembleMessage {
-    type_name: &'static str,
-    dispatch: fn(&mut World, Option<PlayerUUID>, &[u8]),
+    _type_name: &'static str,
+    dispatch: fn(&mut World, Option<PlayerUUID>, &[u8]) -> bool,
 }
 
 impl EnsembleMessageRegistry {
@@ -51,7 +51,7 @@ impl EnsembleMessageRegistry {
         });
 
         self.entries.push(RegisteredEnsembleMessage {
-            type_name,
+            _type_name: type_name,
             dispatch: dispatch_message::<T>,
         });
         self.type_indices.insert(type_id, next_index);
@@ -69,7 +69,7 @@ impl EnsembleMessageRegistry {
 /// Serializes a message into a network packet.
 ///
 /// The returned `Vec<u8>` contains a 2-byte little-endian type index followed by
-/// the CBOR-encoded message payload.
+/// the postcard-encoded message payload.
 ///
 /// # Panics
 ///
@@ -86,7 +86,7 @@ pub fn encode_ensemble_message<T: EnsembleMessage>(
             type_name::<T>()
         )
     });
-    let payload = serde_cbor::to_vec(message).unwrap_or_else(|error| {
+    let payload = postcard::to_allocvec(message).unwrap_or_else(|error| {
         panic!(
             "Failed to serialize ensemble message type `{}`: {error}",
             type_name::<T>()
@@ -102,49 +102,56 @@ pub fn encode_ensemble_message<T: EnsembleMessage>(
 /// Deserializes a network packet and dispatches it as a [`ReceivedEnsembleMessage`].
 ///
 /// Reads the 2-byte type index from the front of `packet`, looks up the registered
-/// dispatch function, deserializes the CBOR payload, and writes the resulting
+/// dispatch function, deserializes the postcard payload, and writes the resulting
 /// [`ReceivedEnsembleMessage<T>`](ReceivedEnsembleMessage) to the world's message buffer.
 ///
-/// # Panics
-///
-/// Panics if the packet is too short, the type index is unregistered, or
-/// deserialization fails.
-pub fn decode_ensemble_packet(world: &mut World, sender: Option<PlayerUUID>, packet: &[u8]) {
-    assert!(
-        packet.len() >= MESSAGE_TYPE_INDEX_BYTES,
-        "Received ensemble packet that was too short to contain a type index"
-    );
+/// Returns `true` if the packet was successfully decoded and dispatched, `false` otherwise.
+/// Malformed packets are logged as warnings and skipped rather than panicking.
+pub fn decode_ensemble_packet(world: &mut World, sender: Option<PlayerUUID>, packet: &[u8]) -> bool {
+    if packet.len() < MESSAGE_TYPE_INDEX_BYTES {
+        warn!("Received ensemble packet too short to contain a type index ({} bytes)", packet.len());
+        return false;
+    }
 
     let index = u16::from_le_bytes([packet[0], packet[1]]);
     let dispatch = {
         let registry = world.resource::<EnsembleMessageRegistry>();
-        let entry = registry.entry(index).unwrap_or_else(|| {
-            panic!("Received ensemble packet for unregistered type index {index}")
-        });
+        let Some(entry) = registry.entry(index) else {
+            warn!("Received ensemble packet for unregistered type index {index}");
+            return false;
+        };
         entry.dispatch
     };
 
-    dispatch(world, sender, &packet[MESSAGE_TYPE_INDEX_BYTES..]);
+    dispatch(world, sender, &packet[MESSAGE_TYPE_INDEX_BYTES..])
 }
 
 fn dispatch_message<T: EnsembleMessage>(
     world: &mut World,
     sender: Option<PlayerUUID>,
     payload: &[u8],
-) {
-    let message = serde_cbor::from_slice::<T>(payload).unwrap_or_else(|error| {
-        panic!(
-            "Failed to deserialize ensemble message type `{}`: {error}",
-            type_name::<T>()
-        )
-    });
-
-    world
-        .write_message(ReceivedEnsembleMessage::<T> { sender, message })
-        .unwrap_or_else(|| {
-            panic!(
-                "Message buffer for ensemble message type `{}` is missing",
+) -> bool {
+    let message = match postcard::from_bytes::<T>(payload) {
+        Ok(msg) => msg,
+        Err(error) => {
+            warn!(
+                "Failed to deserialize ensemble message type `{}`: {error}",
                 type_name::<T>()
-            )
-        });
+            );
+            return false;
+        }
+    };
+
+    if world
+        .write_message(ReceivedEnsembleMessage::<T> { sender, message })
+        .is_none()
+    {
+        warn!(
+            "Message buffer for ensemble message type `{}` is missing",
+            type_name::<T>()
+        );
+        return false;
+    }
+
+    true
 }

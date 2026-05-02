@@ -1,0 +1,2 @@
+[alias]
+server = "run -p bevy_ensemble_webrtc --no-default-features --features server --bin bevy_ensemble_webrtc_server"

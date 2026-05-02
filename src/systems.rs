@@ -210,9 +210,13 @@ pub(crate) fn apply_received_lobby_participants(
     mut commands: Commands,
     mut messages: MessageReader<ReceivedEnsembleMessage<SyncLobbyParticipant>>,
     client_lobby: Option<Single<Entity, (With<Lobby>, Without<Host>)>>,
+    pending_client_lobby: Option<Single<Entity, (With<PendingLobby>, Without<Host>)>>,
     existing_participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
 ) {
-    let Some(client_lobby) = client_lobby else {
+    let Some(client_lobby) = client_lobby
+        .map(|s| *s)
+        .or_else(|| pending_client_lobby.map(|s| *s))
+    else {
         return;
     };
 
@@ -221,7 +225,7 @@ pub(crate) fn apply_received_lobby_participants(
             existing_participants
                 .iter()
                 .find(|(_, participant, participant_of)| {
-                    participant_of.0 == *client_lobby
+                    participant_of.0 == client_lobby
                         && participant.player_uuid == message.message.player_uuid
                 })
         {
@@ -239,7 +243,7 @@ pub(crate) fn apply_received_lobby_participants(
                 player_uuid: message.message.player_uuid,
                 is_host: message.message.is_host,
             },
-            LobbyParticipantOf(*client_lobby),
+            LobbyParticipantOf(client_lobby),
         ));
     }
 }
@@ -252,9 +256,13 @@ pub(crate) fn apply_removed_lobby_participants(
     mut commands: Commands,
     mut messages: MessageReader<ReceivedEnsembleMessage<RemoveLobbyParticipant>>,
     client_lobby: Option<Single<Entity, (With<Lobby>, Without<Host>)>>,
+    pending_client_lobby: Option<Single<Entity, (With<PendingLobby>, Without<Host>)>>,
     existing_participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
 ) {
-    let Some(client_lobby) = client_lobby else {
+    let Some(client_lobby) = client_lobby
+        .map(|s| *s)
+        .or_else(|| pending_client_lobby.map(|s| *s))
+    else {
         return;
     };
 
@@ -263,7 +271,7 @@ pub(crate) fn apply_removed_lobby_participants(
             existing_participants
                 .iter()
                 .find(|(_, participant, participant_of)| {
-                    participant_of.0 == *client_lobby
+                    participant_of.0 == client_lobby
                         && participant.player_uuid == message.message.player_uuid
                 })
         {

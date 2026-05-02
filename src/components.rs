@@ -148,6 +148,30 @@ impl LobbyParticipants {
     }
 }
 
+/// Summary information about a publicly listed lobby.
+///
+/// Used by backends that support lobby discovery (e.g. WebRTC signaling server).
+/// The [`PublicLobbies`] resource contains a list of these.
+#[derive(Clone, Debug)]
+pub struct PublicLobbyInfo {
+    /// Backend-specific lobby identifier (e.g. server-assigned u64 for WebRTC).
+    pub lobby_id: u64,
+    /// Display name of the lobby host.
+    pub host_name: String,
+    /// Current number of players in the lobby.
+    pub player_count: u32,
+    /// Maximum number of players allowed.
+    pub max_players: u32,
+}
+
+/// Resource containing the list of publicly available lobbies.
+///
+/// Populated by backends that support lobby discovery. For Steam, friend lobbies
+/// are tracked separately via `SteamFriendLobbies`. For WebRTC, this is populated
+/// from the signaling server's lobby list.
+#[derive(Resource, Clone, Debug, Default)]
+pub struct PublicLobbies(pub Vec<PublicLobbyInfo>);
+
 /// Relationship marking an entity as owned by a specific player.
 ///
 /// Use this to associate game entities (characters, inventories, etc.) with the
