@@ -1,9 +1,9 @@
 use bevy::prelude::*;
 use bevy_ensemble::{
-    Host, Lobby, LobbyClient, LobbyMessage, LobbyParticipant, LobbyParticipantOf,
-    LocalMultiplayerPlayerId, EnsembleAppExt, PendingLobby, RemoveLobbyParticipant,
-    RequestLobby, SerializedLobbyPacket, crate_steam_bridge::LobbyClientPlayerUuid,
-    decode_ensemble_packet, encode_ensemble_message,
+    Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyMessage, LobbyParticipant,
+    LobbyParticipantOf, LocalMultiplayerPlayerId, EnsembleAppExt, PendingLobby,
+    RemoveLobbyParticipant, RequestLobby, SerializedLobbyPacket, decode_ensemble_packet,
+    encode_ensemble_message,
 };
 pub use bevy_steamworks::LobbyId;
 use bevy_steamworks::{

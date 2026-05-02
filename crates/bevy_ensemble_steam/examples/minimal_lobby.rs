@@ -1,13 +1,11 @@
 use bevy::prelude::*;
-use bevy_immediate::{BevyImmediatePlugin, ImmCtx, ui::CapsUi};
 use bevy_ensemble::{
-    Host, Lobby, LobbyClient, LobbyMessage, LobbyParticipant, LobbyParticipantOf,
-    LocalMultiplayerPlayerId, EnsembleAppExt, EnsemblePlugin, PendingLobby,
-    ReceivedEnsembleMessage, StartHosting,
+    EnsembleAppExt, EnsemblePlugin, Host, Lobby, LobbyClient, LobbyMessage, LobbyParticipant,
+    LobbyParticipantOf, LocalMultiplayerPlayerId, PendingLobby, ReceivedEnsembleMessage,
+    StartHosting,
 };
-use bevy_ensemble_steam::{
-    BevyEnsembleSteamPlugin, LobbyClientSteamId, LobbySteamId,
-};
+use bevy_ensemble_steam::{BevyEnsembleSteamPlugin, LobbyClientSteamId, LobbySteamId};
+use bevy_immediate::{BevyImmediatePlugin, ImmCtx, ui::CapsUi};
 use bevy_steamworks::{Client as SteamClient, SteamId};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -66,24 +64,26 @@ fn render_ui(
     host_lobbies: Query<Entity, (With<Lobby>, With<Host>)>,
     client_lobbies: Query<Entity, (With<Lobby>, Without<Host>)>,
     participants: Query<(&LobbyParticipant, &LobbyParticipantOf)>,
-    lobby_clients: Query<(&bevy_ensemble::crate_steam_bridge::LobbyClientPlayerUuid, &LobbyClientSteamId), With<LobbyClient>>,
+    lobby_clients: Query<
+        (&bevy_ensemble::LobbyClientPlayerUuid, &LobbyClientSteamId),
+        With<LobbyClient>,
+    >,
     client_lobby_ids: Query<&LobbySteamId, (With<Lobby>, Without<Host>)>,
     chat_log: Res<ChatLog>,
 ) {
     let mut root = ctx.build_immediate_root("minimal_lobby");
 
     if !pending_lobbies.is_empty() {
-        root.ch_id("loading")
-            .on_change_insert(true, || {
-                (
-                    Node {
-                        align_self: AlignSelf::Center,
-                        justify_self: JustifySelf::Center,
-                        ..default()
-                    },
-                    Text::new("Loading..."),
-                )
-            });
+        root.ch_id("loading").on_change_insert(true, || {
+            (
+                Node {
+                    align_self: AlignSelf::Center,
+                    justify_self: JustifySelf::Center,
+                    ..default()
+                },
+                Text::new("Loading..."),
+            )
+        });
         return;
     }
 
@@ -93,17 +93,16 @@ fn render_ui(
         .or_else(|| client_lobbies.iter().next());
 
     let Some(lobby_entity) = ready_lobby else {
-        root.ch_id("menu")
-            .on_change_insert(true, || {
-                (
-                    Node {
-                        align_self: AlignSelf::Center,
-                        justify_self: JustifySelf::Center,
-                        ..default()
-                    },
-                    Text::new("Host: Press H\nJoin: Use the steam overlay"),
-                )
-            });
+        root.ch_id("menu").on_change_insert(true, || {
+            (
+                Node {
+                    align_self: AlignSelf::Center,
+                    justify_self: JustifySelf::Center,
+                    ..default()
+                },
+                Text::new("Host: Press H\nJoin: Use the steam overlay"),
+            )
+        });
         return;
     };
 
@@ -117,37 +116,38 @@ fn render_ui(
     let messages_text = if chat_log.0.is_empty() {
         "Messages:\n".to_string()
     } else {
-        format!("Messages:\n{}", chat_log.0.iter().cloned().collect::<Vec<_>>().join("\n"))
+        format!(
+            "Messages:\n{}",
+            chat_log.0.iter().cloned().collect::<Vec<_>>().join("\n")
+        )
     };
 
     let lobby_info_text = format!(
         "Players:\n{}\n\nPress H to send hello\nPress Escape to exit the lobby",
         roster_text
     );
-    root.ch_id("lobby_info")
-        .on_change_insert(true, move || {
-            (
-                Node {
-                    align_self: AlignSelf::Start,
-                    justify_self: JustifySelf::Start,
-                    margin: UiRect::axes(px(12.), px(8.)),
-                    ..default()
-                },
-                Text::new(lobby_info_text),
-            )
-        });
-    root.ch_id("messages")
-        .on_change_insert(true, move || {
-            (
-                Node {
-                    align_self: AlignSelf::End,
-                    justify_self: JustifySelf::Start,
-                    margin: UiRect::axes(px(12.), px(8.)),
-                    ..default()
-                },
-                Text::new(messages_text),
-            )
-        });
+    root.ch_id("lobby_info").on_change_insert(true, move || {
+        (
+            Node {
+                align_self: AlignSelf::Start,
+                justify_self: JustifySelf::Start,
+                margin: UiRect::axes(px(12.), px(8.)),
+                ..default()
+            },
+            Text::new(lobby_info_text),
+        )
+    });
+    root.ch_id("messages").on_change_insert(true, move || {
+        (
+            Node {
+                align_self: AlignSelf::End,
+                justify_self: JustifySelf::Start,
+                margin: UiRect::axes(px(12.), px(8.)),
+                ..default()
+            },
+            Text::new(messages_text),
+        )
+    });
 }
 
 fn handle_h_key(
@@ -196,7 +196,7 @@ fn relay_hello_messages_on_host(
     steam_client: Res<SteamClient>,
     host_lobbies: Query<Entity, (With<Lobby>, With<Host>)>,
     lobby_clients: Query<
-        (&bevy_ensemble::crate_steam_bridge::LobbyClientPlayerUuid, &LobbyClientSteamId),
+        (&bevy_ensemble::LobbyClientPlayerUuid, &LobbyClientSteamId),
         With<LobbyClient>,
     >,
     client_lobby_ids: Query<&LobbySteamId, (With<Lobby>, Without<Host>)>,
@@ -219,12 +219,12 @@ fn relay_hello_messages_on_host(
             text: "Hello".to_string(),
         };
         push_chat_message(&mut chat_log, &display.sender_name, &display.text);
-        commands.entity(host_lobby).trigger(move |entity| {
-            LobbyMessage::<DisplayChatMessage> {
+        commands
+            .entity(host_lobby)
+            .trigger(move |entity| LobbyMessage::<DisplayChatMessage> {
                 entity,
                 message: display,
-            }
-        });
+            });
     }
 }
 
@@ -261,7 +261,9 @@ fn handle_escape_key(
 
     if let Some((host_entity, lobby_id)) = host_lobbies.iter().next() {
         for (client_entity, client_steam_id) in lobby_clients.iter() {
-            steam_client.networking().close_p2p_session(client_steam_id.0);
+            steam_client
+                .networking()
+                .close_p2p_session(client_steam_id.0);
             commands.entity(client_entity).try_despawn();
         }
         steam_client.matchmaking().leave_lobby(lobby_id.0);
@@ -284,7 +286,7 @@ fn build_roster_text(
     lobby_entity: Entity,
     participants: &Query<(&LobbyParticipant, &LobbyParticipantOf)>,
     lobby_clients: &Query<
-        (&bevy_ensemble::crate_steam_bridge::LobbyClientPlayerUuid, &LobbyClientSteamId),
+        (&bevy_ensemble::LobbyClientPlayerUuid, &LobbyClientSteamId),
         With<LobbyClient>,
     >,
     client_lobby_ids: &Query<&LobbySteamId, (With<Lobby>, Without<Host>)>,
@@ -296,9 +298,13 @@ fn build_roster_text(
             continue;
         }
 
-        let mut line =
-            steam_name_for_player_uuid(steam_client, participant.player_uuid, lobby_clients, client_lobby_ids)
-                .unwrap_or_else(|| participant.player_uuid.to_string());
+        let mut line = steam_name_for_player_uuid(
+            steam_client,
+            participant.player_uuid,
+            lobby_clients,
+            client_lobby_ids,
+        )
+        .unwrap_or_else(|| participant.player_uuid.to_string());
         if participant.is_host {
             line.push_str(" (Host)");
         }
@@ -316,7 +322,7 @@ fn steam_name_for_player_uuid(
     steam_client: &SteamClient,
     player_uuid: u128,
     lobby_clients: &Query<
-        (&bevy_ensemble::crate_steam_bridge::LobbyClientPlayerUuid, &LobbyClientSteamId),
+        (&bevy_ensemble::LobbyClientPlayerUuid, &LobbyClientSteamId),
         With<LobbyClient>,
     >,
     client_lobby_ids: &Query<&LobbySteamId, (With<Lobby>, Without<Host>)>,
