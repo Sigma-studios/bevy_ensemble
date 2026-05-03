@@ -10,11 +10,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 fn main() {
+    let server_url = std::env::var("SIGNALLING_SERVER_URL")
+        .unwrap_or_else(|_| "ws://localhost:9090/ws".into());
+
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(EnsemblePlugin)
         .add_plugins(BevyEnsembleWebrtcPlugin {
-            server_url: "ws://localhost:9090/ws".into(),
+            server_url,
             display_name: "Player".into(),
             ..default()
         })

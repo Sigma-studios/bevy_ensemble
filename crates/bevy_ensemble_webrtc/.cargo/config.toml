@@ -1,2 +1,3 @@
 [alias]
 server = "run -p bevy_ensemble_webrtc --no-default-features --features server --bin bevy_ensemble_webrtc_server"
+server-build = "build -p bevy_ensemble_webrtc --no-default-features --features server --bin bevy_ensemble_webrtc_server --release --target x86_64-unknown-linux-musl"
