@@ -5,9 +5,7 @@ use bevy_ensemble::{
     RemoveLobbyParticipant, RequestLobby, SerializedLobbyPacket, decode_ensemble_packet,
     encode_ensemble_message,
 };
-use matchbox_protocol::PeerId;
-use matchbox_socket::PeerState;
-use uuid::Uuid;
+use bevy_ensemble_sockets::PeerState;
 
 use crate::connection::{LobbyConnection, LobbyEvent};
 use crate::protocol::ClientMessage;
@@ -32,6 +30,7 @@ pub(crate) fn flush_lobby_events(
 pub(crate) fn apply_lobby_events(
     mut commands: Commands,
     mut lobby_conn: ResMut<LobbyConnection>,
+    mut socket: ResMut<crate::EnsembleSocketRes>,
     mut events: MessageReader<LobbyEvent>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
     pending_host_lobbies: Query<Entity, (With<PendingLobby>, With<RequestLobby>, With<Host>)>,
@@ -102,6 +101,9 @@ pub(crate) fn apply_lobby_events(
                     continue;
                 }
 
+                // Initiate WebRTC connection to the new peer
+                socket.connect_peer(player_uuid);
+
                 commands.spawn((
                     PendingWebrtcLobbyClient,
                     LobbyParticipantOf(**lobby),
@@ -113,6 +115,9 @@ pub(crate) fn apply_lobby_events(
             LobbyEvent::PlayerLeft { player_uuid } => {
                 let player_uuid = *player_uuid;
                 info!("Player left lobby: {player_uuid}");
+
+                // Disconnect the WebRTC peer
+                socket.disconnect_peer(player_uuid);
 
                 if let Some(lobby) = host_lobby.as_ref() {
                     let host_entity = **lobby;
@@ -224,11 +229,11 @@ pub(crate) fn refresh_lobby_list(
     }
 }
 
-/// Poll matchbox for peer connect/disconnect events.
+/// Poll the EnsembleSocket for peer connect/disconnect events.
 /// Despawns lobby client entities when a peer disconnects.
-pub(crate) fn poll_matchbox_peers(
+pub(crate) fn poll_socket_peers(
     mut commands: Commands,
-    mut socket: ResMut<crate::MatchboxSocket>,
+    mut socket: ResMut<crate::EnsembleSocketRes>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
     lobby_clients: Query<
         (Entity, &LobbyClientWebrtcUuid, &LobbyClientPlayerUuid),
@@ -237,13 +242,12 @@ pub(crate) fn poll_matchbox_peers(
     participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
 ) {
     for (peer_id, state) in socket.update_peers() {
-        let uuid = peer_id.0.as_u128();
         match state {
             PeerState::Connected => {
-                info!("Matchbox peer connected: {peer_id}");
+                info!("Peer connected: {peer_id}");
             }
             PeerState::Disconnected => {
-                info!("Matchbox peer disconnected: {peer_id}");
+                info!("Peer disconnected: {peer_id}");
 
                 let Some(lobby) = host_lobby.as_ref() else {
                     continue;
@@ -252,7 +256,7 @@ pub(crate) fn poll_matchbox_peers(
 
                 if let Some((client_entity, _, player_uuid)) = lobby_clients
                     .iter()
-                    .find(|(_, client_uuid, _)| client_uuid.0 == uuid)
+                    .find(|(_, client_uuid, _)| client_uuid.0 == peer_id)
                 {
                     commands
                         .entity(host_entity)
@@ -278,33 +282,59 @@ pub(crate) fn poll_matchbox_peers(
     }
 }
 
+/// Each frame, pump signals between the WS handler and the EnsembleSocket:
+/// 1. Drain incoming signals from LobbyConnection's signal_rx and feed them to socket.receive_signal()
+/// 2. Drain outbound signals from socket.drain_signals() and send them as ClientMessage::Signal
+pub(crate) fn pump_socket_signals(
+    mut socket: ResMut<crate::EnsembleSocketRes>,
+    lobby_conn: Res<LobbyConnection>,
+) {
+    if let Ok(mut signal_rx) = lobby_conn.signal_rx.lock() {
+        while let Ok((sender, signal)) = signal_rx.try_recv() {
+            socket.receive_signal(sender, signal);
+        }
+    }
+
+    for outgoing in socket.drain_signals() {
+        let data = serde_json::to_string(&outgoing.signal)
+            .expect("Failed to serialize PeerSignal");
+        let _ = lobby_conn.command_tx.send(ClientMessage::Signal {
+            receiver_uuid: outgoing.peer,
+            data,
+        });
+    }
+}
+
 /// Detects when a lobby entity with a server-assigned ID is despawned.
-/// Sends LeaveLobby to the server through the existing connection, then
-/// rebuilds the matchbox socket so stale WebRTC peer state doesn't block future joins.
+/// Sends LeaveLobby to the server, disconnects all peers, then
+/// rebuilds the WS connection.
 pub(crate) fn detect_lobby_leave(
     mut commands: Commands,
     lobby_conn: Res<LobbyConnection>,
+    mut socket: ResMut<crate::EnsembleSocketRes>,
     webrtc_runtime: Res<crate::WebrtcRuntime>,
     mut removed: RemovedComponents<LobbyWebrtcId>,
 ) {
     for _entity in removed.read() {
-        info!("Lobby entity removed, sending LeaveLobby and rebuilding socket");
+        info!("Lobby entity removed, sending LeaveLobby and rebuilding connection");
 
-        // Send LeaveLobby on the current connection — the WS task is still alive
-        // and will forward it before we drop the old resources next frame.
+        // Send LeaveLobby on the current connection
         let _ = lobby_conn.command_tx.send(ClientMessage::LeaveLobby);
 
-        // Rebuild the socket + connection from scratch.
+        // Disconnect all WebRTC peers
+        socket.disconnect_all();
+
+        // Rebuild the WS connection from scratch.
         // The old WS task will naturally exit when its channels are dropped.
-        let (socket, lobby_connection) = webrtc_runtime.build_socket();
-        commands.insert_resource(socket);
+        let (new_socket, lobby_connection) = webrtc_runtime.build_socket();
+        commands.insert_resource(new_socket);
         commands.insert_resource(lobby_connection);
     }
 }
 
 pub(crate) fn send_serialized_lobby_packet(
     packet: On<SerializedLobbyPacket>,
-    mut socket: ResMut<crate::MatchboxSocket>,
+    socket: ResMut<crate::EnsembleSocketRes>,
     lobby_query: Query<(Option<&Host>, Option<&LobbyWebrtcId>), With<Lobby>>,
     pending_lobby_query: Query<
         (Option<&Host>, Option<&LobbyWebrtcId>),
@@ -316,16 +346,16 @@ pub(crate) fn send_serialized_lobby_packet(
 
     // Triggered on a lobby entity (active)
     if let Ok((host, _)) = lobby_query.get(packet.entity) {
-        let peers: Vec<PeerId> = socket.connected_peers().collect();
+        let peers: Vec<u128> = socket.connected_peers().collect();
         match host {
             Some(_) => {
                 for peer in peers {
-                    socket.channel_mut(0).send(data.clone(), peer);
+                    socket.send(data.clone(), peer);
                 }
             }
             None => {
-                if let Some(peer) = peers.first() {
-                    socket.channel_mut(0).send(data, *peer);
+                if let Some(&peer) = peers.first() {
+                    socket.send(data, peer);
                 }
             }
         }
@@ -334,16 +364,16 @@ pub(crate) fn send_serialized_lobby_packet(
 
     // Triggered on a pending lobby entity
     if let Ok((host, _)) = pending_lobby_query.get(packet.entity) {
-        let peers: Vec<PeerId> = socket.connected_peers().collect();
+        let peers: Vec<u128> = socket.connected_peers().collect();
         match host {
             Some(_) => {
                 for peer in peers {
-                    socket.channel_mut(0).send(data.clone(), peer);
+                    socket.send(data.clone(), peer);
                 }
             }
             None => {
-                if let Some(peer) = peers.first() {
-                    socket.channel_mut(0).send(data, *peer);
+                if let Some(&peer) = peers.first() {
+                    socket.send(data, peer);
                 }
             }
         }
@@ -352,8 +382,7 @@ pub(crate) fn send_serialized_lobby_packet(
 
     // Triggered on a LobbyClient entity (targeted send)
     if let Ok(client_uuid) = lobby_client_query.get(packet.entity) {
-        let peer_id = PeerId(Uuid::from_u128(client_uuid.0));
-        socket.channel_mut(0).send(data, peer_id);
+        socket.send(data, client_uuid.0);
         return;
     }
 
@@ -367,9 +396,8 @@ pub(crate) fn read_peer_messages(world: &mut World) {
     let mut packets = Vec::new();
 
     {
-        let mut socket = world.resource_mut::<crate::MatchboxSocket>();
-        for (peer_id, packet) in socket.channel_mut(0).receive() {
-            let sender_uuid = peer_id.0.as_u128();
+        let mut socket = world.resource_mut::<crate::EnsembleSocketRes>();
+        for (sender_uuid, packet) in socket.receive() {
             packets.push((sender_uuid, packet.to_vec()));
         }
     }
@@ -387,11 +415,10 @@ pub(crate) fn read_peer_messages(world: &mut World) {
 /// `PendingLobby` to `Lobby`. The host creates its `PendingWebrtcLobbyClient` entity
 /// from the `PlayerJoined` signaling event, which can arrive AFTER the host's own
 /// handshake has already promoted the client. If we stop sending here, the host may
-/// never receive a client handshake to promote with → the client becomes invisible
-/// to the host (can send but never receives messages or participant sync).
+/// never receive a client handshake to promote with.
 pub(crate) fn send_client_handshakes(
     registry: Res<bevy_ensemble::EnsembleMessageRegistry>,
-    mut socket: ResMut<crate::MatchboxSocket>,
+    socket: ResMut<crate::EnsembleSocketRes>,
     client_lobbies: Query<
         &LobbyWebrtcId,
         (Without<Host>, Or<(With<PendingLobby>, With<Lobby>)>),
@@ -412,15 +439,15 @@ pub(crate) fn send_client_handshakes(
     let packet = encode_ensemble_message(&registry, &WebrtcReadyHandshake { from_host: false });
     let data: Box<[u8]> = packet.into_boxed_slice();
 
-    let peers: Vec<PeerId> = socket.connected_peers().collect();
+    let peers: Vec<u128> = socket.connected_peers().collect();
     for peer in peers {
-        socket.channel_mut(0).send(data.clone(), peer);
+        socket.send(data.clone(), peer);
     }
 }
 
 pub(crate) fn send_host_handshakes(
     registry: Res<bevy_ensemble::EnsembleMessageRegistry>,
-    mut socket: ResMut<crate::MatchboxSocket>,
+    socket: ResMut<crate::EnsembleSocketRes>,
     host_lobbies: Query<&LobbyWebrtcId, (With<Lobby>, With<Host>)>,
     time: Res<Time>,
     mut cooldown: Local<f32>,
@@ -438,9 +465,9 @@ pub(crate) fn send_host_handshakes(
     let packet = encode_ensemble_message(&registry, &WebrtcReadyHandshake { from_host: true });
     let data: Box<[u8]> = packet.into_boxed_slice();
 
-    let peers: Vec<PeerId> = socket.connected_peers().collect();
+    let peers: Vec<u128> = socket.connected_peers().collect();
     for peer in peers {
-        socket.channel_mut(0).send(data.clone(), peer);
+        socket.send(data.clone(), peer);
     }
 }
 

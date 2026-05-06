@@ -7,17 +7,13 @@ edition = "2024"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 serde_json = "1"
-tokio = { version = "1", features = ["sync", "rt", "macros", "time", "rt-multi-thread", "net"] }
 futures-util = "0.3"
 
 # Client plugin deps
 bevy = { version = "0.18", optional = true }
 bevy_ensemble = { path = "../..", optional = true }
-matchbox_socket = { version = "0.14", optional = true }
-matchbox_protocol = { version = "0.14", optional = true }
+bevy_ensemble_sockets = { path = "../bevy_ensemble_sockets", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
-async-trait = { version = "0.1", optional = true }
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"], optional = true }
 
 # Server deps
 axum = { version = "0.8", features = ["ws"], optional = true }
@@ -25,16 +21,26 @@ dashmap = { version = "6", optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["sync", "rt", "macros", "time", "rt-multi-thread", "net"] }
+async-tungstenite = { version = "0.32", features = ["tokio-runtime", "tokio-rustls-native-certs"], optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", features = ["sync"] }
+ws_stream_wasm = { version = "0.7", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
 [features]
 default = ["client"]
 client = [
     "dep:bevy",
     "dep:bevy_ensemble",
-    "dep:matchbox_socket",
-    "dep:matchbox_protocol",
+    "dep:bevy_ensemble_sockets",
     "dep:uuid",
-    "dep:async-trait",
-    "dep:tokio-tungstenite",
+    "dep:async-tungstenite",
+    "dep:ws_stream_wasm",
+    "dep:wasm-bindgen-futures",
 ]
 server = [
     "dep:axum",

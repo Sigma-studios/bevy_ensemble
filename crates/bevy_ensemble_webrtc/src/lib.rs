@@ -16,8 +16,9 @@ use bevy_ensemble::EnsembleAppExt;
 
 /// Bevy plugin for WebRTC P2P networking via a signaling server.
 ///
-/// Connects to a signaling server for lobby management, then uses matchbox
-/// for cross-platform WebRTC data channels (works on both native and WASM).
+/// Connects to a signaling server for lobby management, then uses
+/// bevy_ensemble_sockets for cross-platform WebRTC data channels
+/// (works on both native and WASM).
 #[cfg(feature = "client")]
 pub struct BevyEnsembleWebrtcPlugin {
     pub server_url: String,
@@ -68,16 +69,17 @@ pub(crate) struct WebrtcReadyHandshake {
     pub from_host: bool,
 }
 
-/// Newtype wrapper around [`matchbox_socket::WebRtcSocket`] so it can be used as a Bevy Resource.
+/// Newtype wrapper around [`bevy_ensemble_sockets::EnsembleSocket`] so it can be used as a Bevy Resource.
 #[cfg(feature = "client")]
 #[derive(Resource, Deref, DerefMut)]
-pub(crate) struct MatchboxSocket(matchbox_socket::WebRtcSocket);
+pub(crate) struct EnsembleSocketRes(bevy_ensemble_sockets::EnsembleSocket);
 
-/// Holds the Tokio runtime and plugin config so the socket can be recreated
+/// Holds the Tokio runtime (native only) and plugin config so the socket can be recreated
 /// when leaving and rejoining lobbies.
 #[cfg(feature = "client")]
 #[derive(Resource)]
 pub(crate) struct WebrtcRuntime {
+    #[cfg(not(target_arch = "wasm32"))]
     runtime: tokio::runtime::Runtime,
     server_url: String,
     display_name: String,
@@ -86,53 +88,57 @@ pub(crate) struct WebrtcRuntime {
 
 #[cfg(feature = "client")]
 impl WebrtcRuntime {
-    /// Build a fresh matchbox socket + lobby connection and spawn the message loop.
+    /// Build a fresh EnsembleSocket + lobby connection and start the WS handler task.
     /// Called at init and again each time the player leaves a lobby.
     pub(crate) fn build_socket(
         &self,
-    ) -> (MatchboxSocket, connection::LobbyConnection) {
+    ) -> (EnsembleSocketRes, connection::LobbyConnection) {
         use std::sync::{Arc, Mutex};
 
-        use connection::EnsembleSignallerBuilder;
+        use connection::WsHandlerBuilder;
         use tokio::sync::mpsc;
 
         let (lobby_event_tx, lobby_event_rx) = mpsc::unbounded_channel();
         let (lobby_command_tx, lobby_command_rx) = mpsc::unbounded_channel();
+        let (signal_tx, signal_rx) = mpsc::unbounded_channel();
+
+        let ws_builder = WsHandlerBuilder {
+            display_name: self.display_name.clone(),
+            lobby_event_tx,
+            lobby_command_rx: Arc::new(Mutex::new(Some(lobby_command_rx))),
+            signal_tx,
+            #[cfg(not(target_arch = "wasm32"))]
+            runtime_handle: self.runtime.handle().clone(),
+        };
+
+        ws_builder.start(self.server_url.clone());
+
+        // Create the EnsembleSocket
+        #[cfg(not(target_arch = "wasm32"))]
+        let socket = bevy_ensemble_sockets::EnsembleSocket::new(self.runtime.handle().clone());
+        #[cfg(target_arch = "wasm32")]
+        let socket = bevy_ensemble_sockets::EnsembleSocket::new();
 
         let lobby_connection = connection::LobbyConnection {
             command_tx: lobby_command_tx,
             event_rx: std::sync::Mutex::new(lobby_event_rx),
+            signal_rx: std::sync::Mutex::new(signal_rx),
             local_player_uuid: None,
         };
 
-        let signaller_builder = Arc::new(EnsembleSignallerBuilder {
-            display_name: self.display_name.clone(),
-            lobby_event_tx,
-            lobby_command_rx: Arc::new(Mutex::new(Some(lobby_command_rx))),
-            runtime_handle: self.runtime.handle().clone(),
-        });
-
-        let (socket, message_loop) = matchbox_socket::WebRtcSocket::builder(&self.server_url)
-            .add_reliable_channel()
-            .signaller_builder(signaller_builder)
-            .build();
-
-        self.runtime.spawn(message_loop);
-
-        (MatchboxSocket(socket), lobby_connection)
+        (EnsembleSocketRes(socket), lobby_connection)
     }
 }
 
 #[cfg(feature = "client")]
 impl Plugin for BevyEnsembleWebrtcPlugin {
     fn build(&self, app: &mut App) {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create Tokio runtime");
-
         let webrtc_runtime = WebrtcRuntime {
-            runtime,
+            #[cfg(not(target_arch = "wasm32"))]
+            runtime: tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create Tokio runtime"),
             server_url: self.server_url.clone(),
             display_name: self.display_name.clone(),
             max_players: self.max_players,
@@ -161,7 +167,8 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
                     systems::create_lobby,
                     systems::join_requested_lobbies,
                     systems::refresh_lobby_list,
-                    systems::poll_matchbox_peers,
+                    systems::poll_socket_peers,
+                    systems::pump_socket_signals,
                     systems::send_client_handshakes,
                     systems::send_host_handshakes,
                     systems::promote_client_lobby_on_host_handshake,

@@ -11,7 +11,9 @@ use std::collections::VecDeque;
 
 fn main() {
     let server_url = std::env::var("SIGNALLING_SERVER_URL")
-        .unwrap_or_else(|_| "ws://localhost:9090/ws".into());
+        .ok()
+        .or_else(|| option_env!("SIGNALLING_SERVER_URL").map(String::from))
+        .unwrap_or_else(|| "ws://localhost:9090/ws".into());
 
     App::new()
         .add_plugins(DefaultPlugins)
@@ -96,8 +98,8 @@ fn render_ui(
         .or_else(|| client_lobbies.iter().next());
 
     let Some(lobby_entity) = ready_lobby else {
-        let mut menu_text = "Host: Press H\nRefresh lobbies: Press R\nJoin first lobby: Press J"
-            .to_string();
+        let mut menu_text =
+            "Host: Press H\nRefresh lobbies: Press R\nJoin first lobby: Press J".to_string();
 
         if let Some(lobby_list) = &lobby_list {
             if lobby_list.0.is_empty() {
@@ -106,7 +108,7 @@ fn render_ui(
                 menu_text.push_str("\n\nAvailable lobbies:");
                 for lobby in &lobby_list.0 {
                     menu_text.push_str(&format!(
-                        "\n  {} — {}/{} players (id: {})",
+                        "\n  {} - {}/{} players (id: {})",
                         lobby.host_name, lobby.player_count, lobby.max_players, lobby.lobby_id,
                     ));
                 }
@@ -287,25 +289,15 @@ fn receive_display_chat_messages(
 fn handle_escape_key(
     mut commands: Commands,
     keyboard_input: Res<ButtonInput<KeyCode>>,
-    host_lobbies: Query<Entity, (With<Lobby>, With<Host>)>,
-    client_lobbies: Query<Entity, (With<Lobby>, Without<Host>)>,
-    pending_lobbies: Query<Entity, With<PendingLobby>>,
+    lobbies: Query<Entity, Or<(With<Lobby>, With<PendingLobby>)>>,
     mut chat_log: ResMut<ChatLog>,
 ) {
     if !keyboard_input.just_pressed(KeyCode::Escape) {
         return;
     }
 
-    for entity in pending_lobbies.iter() {
+    for entity in lobbies.iter() {
         commands.entity(entity).try_despawn();
-    }
-
-    if let Some(host_entity) = host_lobbies.iter().next() {
-        commands.entity(host_entity).try_despawn();
-    }
-
-    if let Some(client_entity) = client_lobbies.iter().next() {
-        commands.entity(client_entity).try_despawn();
     }
 
     commands.remove_resource::<LocalMultiplayerPlayerId>();
