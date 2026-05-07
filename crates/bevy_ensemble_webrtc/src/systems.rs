@@ -10,8 +10,8 @@ use bevy_ensemble_sockets::PeerState;
 use crate::connection::{LobbyConnection, LobbyEvent};
 use crate::protocol::ClientMessage;
 use crate::{
-    JoinWebrtcLobby, LobbyClientWebrtcUuid, LobbyWebrtcId, PendingWebrtcLobbyClient,
-    RefreshLobbyList, WebrtcReadyHandshake,
+    JoinWebrtcLobby, JoinWebrtcLobbyByCode, LobbyClientWebrtcUuid, LobbyWebrtcCode, LobbyWebrtcId,
+    PendingWebrtcLobbyClient, RefreshLobbyList, WebrtcReadyHandshake,
 };
 
 pub(crate) fn flush_lobby_events(
@@ -49,8 +49,8 @@ pub(crate) fn apply_lobby_events(
                 lobby_conn.local_player_uuid = Some(*player_uuid);
             }
 
-            LobbyEvent::LobbyCreated { lobby_id } => {
-                info!("Lobby created: {lobby_id}");
+            LobbyEvent::LobbyCreated { lobby_id, code } => {
+                info!("Lobby created: {lobby_id} (code: {code})");
                 let Some(player_uuid) = lobby_conn.local_player_uuid else {
                     continue;
                 };
@@ -60,7 +60,7 @@ pub(crate) fn apply_lobby_events(
                     commands
                         .entity(entity)
                         .remove::<(PendingLobby, RequestLobby)>()
-                        .insert((Lobby, LobbyWebrtcId(*lobby_id)));
+                        .insert((Lobby, LobbyWebrtcId(*lobby_id), LobbyWebrtcCode(code.clone())));
                 }
             }
 
@@ -170,6 +170,7 @@ pub(crate) fn apply_lobby_events(
                         .iter()
                         .map(|l| PublicLobbyInfo {
                             lobby_id: l.lobby_id,
+                            code: l.code.clone(),
                             host_name: l.host_name.clone(),
                             player_count: l.player_count,
                             max_players: l.max_players,
@@ -217,6 +218,30 @@ pub(crate) fn join_requested_lobbies(
         .command_tx
         .send(ClientMessage::JoinLobby {
             lobby_id: join_request.0,
+        });
+}
+
+pub(crate) fn join_requested_lobbies_by_code(
+    mut commands: Commands,
+    lobby_conn: Res<LobbyConnection>,
+    mut join_requests: MessageReader<JoinWebrtcLobbyByCode>,
+    existing_client_lobbies: Query<(), (With<Lobby>, Without<Host>)>,
+    pending_client_lobbies: Query<(), (With<PendingLobby>, Without<Host>)>,
+) {
+    let Some(join_request) = join_requests.read().last().cloned() else {
+        return;
+    };
+    if !existing_client_lobbies.is_empty() || !pending_client_lobbies.is_empty() {
+        warn!("Ignoring join request while a client lobby is already active or pending");
+        return;
+    }
+
+    commands.spawn(PendingLobby);
+
+    let _ = lobby_conn
+        .command_tx
+        .send(ClientMessage::JoinLobbyByCode {
+            code: join_request.0,
         });
 }
 

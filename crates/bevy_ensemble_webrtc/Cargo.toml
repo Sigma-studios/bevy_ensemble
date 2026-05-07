@@ -20,6 +20,11 @@ axum = { version = "0.8", features = ["ws"], optional = true }
 dashmap = { version = "6", optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
+rand = { version = "0.9", optional = true }
+
+# CLI tool deps
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"], optional = true }
+rustls = { version = "0.23", features = ["ring"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["sync", "rt", "macros", "time", "rt-multi-thread", "net"] }
@@ -48,6 +53,11 @@ server = [
     "dep:uuid",
     "dep:tracing",
     "dep:tracing-subscriber",
+    "dep:rand",
+]
+cli = [
+    "dep:tokio-tungstenite",
+    "dep:rustls",
 ]
 
 [dev-dependencies]
@@ -57,3 +67,8 @@ bevy_immediate = "0.5"
 name = "bevy_ensemble_webrtc_server"
 path = "src/bin/server.rs"
 required-features = ["server"]
+
+[[bin]]
+name = "list_lobbies"
+path = "src/bin/list_lobbies.rs"
+required-features = ["cli"]

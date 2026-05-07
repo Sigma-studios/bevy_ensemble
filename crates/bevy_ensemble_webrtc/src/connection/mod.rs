@@ -20,7 +20,7 @@ pub(crate) use self::wasm::WsHandlerBuilder;
 #[derive(Message, Debug)]
 pub(crate) enum LobbyEvent {
     Welcome { player_uuid: u128 },
-    LobbyCreated { lobby_id: u64 },
+    LobbyCreated { lobby_id: u64, code: String },
     LobbyJoined { lobby_id: u64 },
     LobbyError { reason: String },
     PlayerJoined { player_uuid: u128 },
@@ -69,8 +69,8 @@ pub(crate) fn dispatch_server_message(
             }
         }
 
-        ServerMessage::LobbyCreated { lobby_id } => {
-            let _ = lobby_event_tx.send(LobbyEvent::LobbyCreated { lobby_id });
+        ServerMessage::LobbyCreated { lobby_id, code } => {
+            let _ = lobby_event_tx.send(LobbyEvent::LobbyCreated { lobby_id, code });
         }
         ServerMessage::LobbyJoined { lobby_id, .. } => {
             let _ = lobby_event_tx.send(LobbyEvent::LobbyJoined { lobby_id });

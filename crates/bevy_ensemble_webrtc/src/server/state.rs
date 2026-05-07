@@ -8,12 +8,14 @@ use crate::protocol::ServerMessage;
 
 pub struct ServerState {
     pub lobbies: DashMap<u64, LobbyState>,
+    pub lobby_codes: DashMap<String, u64>,
     pub connections: DashMap<u128, ConnectionHandle>,
     next_lobby_id: AtomicU64,
 }
 
 pub struct LobbyState {
     pub lobby_id: u64,
+    pub code: String,
     pub host_uuid: u128,
     pub host_name: String,
     pub members: HashSet<u128>,
@@ -30,6 +32,7 @@ impl ServerState {
     pub fn new() -> Self {
         Self {
             lobbies: DashMap::new(),
+            lobby_codes: DashMap::new(),
             connections: DashMap::new(),
             next_lobby_id: AtomicU64::new(1),
         }

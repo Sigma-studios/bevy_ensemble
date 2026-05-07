@@ -9,6 +9,8 @@ pub enum ClientMessage {
     CreateLobby { max_players: u32 },
     /// Join an existing lobby by ID. Server responds with `LobbyJoined` or `LobbyError`.
     JoinLobby { lobby_id: u64 },
+    /// Join an existing lobby by its short code. Server responds with `LobbyJoined` or `LobbyError`.
+    JoinLobbyByCode { code: String },
     /// Leave the current lobby.
     LeaveLobby,
     /// Request the list of available lobbies. Server responds with `LobbyList`.
@@ -25,7 +27,7 @@ pub enum ServerMessage {
     /// Response to `Authenticate`. Assigns a unique player UUID.
     Welcome { player_uuid: u128 },
     /// Lobby was successfully created. The caller is the host.
-    LobbyCreated { lobby_id: u64 },
+    LobbyCreated { lobby_id: u64, code: String },
     /// Successfully joined a lobby.
     LobbyJoined {
         lobby_id: u64,
@@ -50,6 +52,7 @@ pub enum ServerMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LobbyInfo {
     pub lobby_id: u64,
+    pub code: String,
     pub host_name: String,
     pub player_count: u32,
     pub max_players: u32,

@@ -62,6 +62,16 @@ pub struct RefreshLobbyList;
 #[derive(Message, Clone, Copy, Debug)]
 pub struct JoinWebrtcLobby(pub u64);
 
+/// Write this message to join a lobby by its 4-letter code.
+#[cfg(feature = "client")]
+#[derive(Message, Clone, Debug)]
+pub struct JoinWebrtcLobbyByCode(pub String);
+
+/// Stores the lobby's short join code, assigned by the signaling server.
+#[cfg(feature = "client")]
+#[derive(Component)]
+pub struct LobbyWebrtcCode(pub String);
+
 /// Internal handshake message exchanged over data channels to confirm readiness.
 #[cfg(feature = "client")]
 #[derive(Message, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -151,6 +161,7 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
             .insert_resource(socket)
             .add_message::<connection::LobbyEvent>()
             .add_message::<JoinWebrtcLobby>()
+            .add_message::<JoinWebrtcLobbyByCode>()
             .add_message::<RefreshLobbyList>()
             .register_ensemble_message_type::<WebrtcReadyHandshake>()
             .add_systems(
@@ -166,6 +177,7 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
                 (
                     systems::create_lobby,
                     systems::join_requested_lobbies,
+                    systems::join_requested_lobbies_by_code,
                     systems::refresh_lobby_list,
                     systems::poll_socket_peers,
                     systems::pump_socket_signals,

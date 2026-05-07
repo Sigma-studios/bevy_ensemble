@@ -91,6 +91,18 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                 let _ = tx.send(response);
             }
 
+            ClientMessage::JoinLobbyByCode { code } => {
+                let Some(uuid) = player_uuid else {
+                    let _ = tx.send(ServerMessage::LobbyError {
+                        reason: "Not authenticated".into(),
+                    });
+                    continue;
+                };
+
+                let response = lobby::join_lobby_by_code(&state, uuid, &code);
+                let _ = tx.send(response);
+            }
+
             ClientMessage::LeaveLobby => {
                 if let Some(uuid) = player_uuid {
                     lobby::leave_lobby(&state, uuid);

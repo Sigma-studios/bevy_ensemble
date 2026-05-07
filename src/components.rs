@@ -156,6 +156,8 @@ impl LobbyParticipants {
 pub struct PublicLobbyInfo {
     /// Backend-specific lobby identifier (e.g. server-assigned u64 for WebRTC).
     pub lobby_id: u64,
+    /// Short join code for the lobby (e.g. "ABCD").
+    pub code: String,
     /// Display name of the lobby host.
     pub host_name: String,
     /// Current number of players in the lobby.

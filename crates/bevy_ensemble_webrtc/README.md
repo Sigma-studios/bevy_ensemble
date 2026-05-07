@@ -16,6 +16,20 @@ cargo server-build
 
 Binary will be at `target/x86_64-unknown-linux-musl/release/bevy_ensemble_webrtc_server`.
 
+## CLI Tools
+
+List active lobbies on the signaling server:
+
+```bash
+cargo lobbies
+```
+
+Against a remote server:
+
+```bash
+SERVER_URL="wss://signal.sigma-dev.eu/ws" cargo lobbies
+```
+
 ## Example
 
 Desktop:

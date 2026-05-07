@@ -1,8 +1,22 @@
 use std::collections::HashSet;
 
+use rand::Rng;
+
 use crate::protocol::{LobbyInfo, ServerMessage};
 
 use super::state::{LobbyState, ServerState};
+
+fn generate_lobby_code(state: &ServerState) -> String {
+    let mut rng = rand::rng();
+    loop {
+        let code: String = (0..4)
+            .map(|_| rng.random_range(b'A'..=b'Z') as char)
+            .collect();
+        if !state.lobby_codes.contains_key(&code) {
+            return code;
+        }
+    }
+}
 
 pub fn create_lobby(state: &ServerState, host_uuid: u128, max_players: u32) -> ServerMessage {
     let conn = state.connections.get(&host_uuid);
@@ -22,13 +36,16 @@ pub fn create_lobby(state: &ServerState, host_uuid: u128, max_players: u32) -> S
     drop(conn);
 
     let lobby_id = state.next_lobby_id();
+    let code = generate_lobby_code(state);
     let mut members = HashSet::new();
     members.insert(host_uuid);
 
+    state.lobby_codes.insert(code.clone(), lobby_id);
     state.lobbies.insert(
         lobby_id,
         LobbyState {
             lobby_id,
+            code: code.clone(),
             host_uuid,
             host_name,
             members,
@@ -40,7 +57,7 @@ pub fn create_lobby(state: &ServerState, host_uuid: u128, max_players: u32) -> S
         conn.lobby_id = Some(lobby_id);
     }
 
-    ServerMessage::LobbyCreated { lobby_id }
+    ServerMessage::LobbyCreated { lobby_id, code }
 }
 
 pub fn join_lobby(state: &ServerState, player_uuid: u128, lobby_id: u64) -> ServerMessage {
@@ -93,6 +110,16 @@ pub fn join_lobby(state: &ServerState, player_uuid: u128, lobby_id: u64) -> Serv
     }
 }
 
+pub fn join_lobby_by_code(state: &ServerState, player_uuid: u128, code: &str) -> ServerMessage {
+    let code = code.to_uppercase();
+    let Some(lobby_id) = state.lobby_codes.get(&code).map(|r| *r) else {
+        return ServerMessage::LobbyError {
+            reason: "Lobby not found".into(),
+        };
+    };
+    join_lobby(state, player_uuid, lobby_id)
+}
+
 pub fn leave_lobby(state: &ServerState, player_uuid: u128) {
     let lobby_id = {
         let Some(mut conn) = state.connections.get_mut(&player_uuid) else {
@@ -119,10 +146,13 @@ pub fn leave_lobby(state: &ServerState, player_uuid: u128) {
 
     lobby.members.remove(&player_uuid);
 
+    let lobby_code = lobby.code.clone();
+
     if lobby.host_uuid == player_uuid {
         let remaining = lobby.members.clone();
         drop(lobby);
         state.lobbies.remove(&lobby_id);
+        state.lobby_codes.remove(&lobby_code);
 
         for &uuid in &remaining {
             state.send_to(
@@ -141,6 +171,7 @@ pub fn leave_lobby(state: &ServerState, player_uuid: u128) {
         if lobby.members.is_empty() {
             drop(lobby);
             state.lobbies.remove(&lobby_id);
+            state.lobby_codes.remove(&lobby_code);
         } else {
             drop(lobby);
             state.send_to_all_except(
@@ -171,6 +202,7 @@ pub fn list_lobbies(state: &ServerState) -> ServerMessage {
             let lobby = entry.value();
             LobbyInfo {
                 lobby_id: lobby.lobby_id,
+                code: lobby.code.clone(),
                 host_name: lobby.host_name.clone(),
                 player_count: lobby.members.len() as u32,
                 max_players: lobby.max_players,
