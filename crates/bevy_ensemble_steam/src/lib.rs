@@ -1,22 +1,21 @@
 use bevy::prelude::*;
 use bevy_ensemble::{
-    Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyMessage, LobbyParticipant,
-    LobbyParticipantOf, LocalMultiplayerPlayerId, EnsembleAppExt, PendingLobby,
+    EnsembleAppExt, Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyMessage,
+    LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId, PendingLobby,
     RemoveLobbyParticipant, RequestLobby, SerializedLobbyPacket, decode_ensemble_packet,
     encode_ensemble_message,
 };
 pub use bevy_steamworks::LobbyId;
 use bevy_steamworks::{
-    CallbackResult, ChatMemberStateChange, Client, FriendFlags, LobbyType, SendType, SteamId,
-    SteamworksEvent, SteamworksPlugin,
+    CallbackResult, ChatMemberStateChange, ChatRoomEnterResponse, Client, FriendFlags, LobbyType,
+    SteamId, SteamworksEvent, SteamworksPlugin,
+    networking_types::{NetworkingIdentity, SendFlags},
 };
 use std::collections::HashSet;
-use std::sync::{
-    Mutex,
-    mpsc::{Receiver, Sender, channel},
-};
 
 pub const DEFAULT_STEAM_APP_ID: u32 = 480;
+/// TODO: this is EResult::k_EResultOK, swap it out for the proper type once exposed by steamworks-rs
+const STEAM_RESULT_OK: u32 = 1;
 pub const MAX_LOBBY_PLAYERS: u32 = 8;
 pub struct BevyEnsembleSteamPlugin {
     pub app_id: u32,
@@ -41,20 +40,6 @@ pub struct SteamFriendLobbies(pub Vec<SteamFriendLobbySummary>);
 #[derive(Message, Clone, Copy, Debug)]
 pub struct JoinSteamLobby(pub LobbyId);
 
-#[derive(Resource)]
-struct SteamLobbyCallbackChannel {
-    sender: Sender<SteamLobbyCallback>,
-    receiver: Mutex<Receiver<SteamLobbyCallback>>,
-}
-
-#[derive(Message, Debug)]
-enum SteamLobbyCallback {
-    Created { entity: Entity, lobby_id: LobbyId },
-    CreateFailed { entity: Entity },
-    Joined { entity: Entity, lobby_id: LobbyId },
-    JoinFailed { entity: Entity },
-}
-
 #[derive(Component)]
 struct PendingSteamLobbyClient;
 
@@ -73,19 +58,12 @@ impl Default for BevyEnsembleSteamPlugin {
 
 impl Plugin for BevyEnsembleSteamPlugin {
     fn build(&self, app: &mut App) {
-        let (sender, receiver) = channel();
-
         app.add_plugins(
             SteamworksPlugin::init_app(self.app_id)
                 .expect("Steamworks initialization plugin should build with a valid app id"),
         )
-        .insert_resource(SteamLobbyCallbackChannel {
-            sender,
-            receiver: Mutex::new(receiver),
-        })
         .add_message::<JoinSteamLobby>()
         .register_ensemble_message_type::<SteamReadyHandshake>()
-        .add_message::<SteamLobbyCallback>()
         .add_systems(Startup, setup_join_policy)
         .add_systems(
             Update,
@@ -94,10 +72,6 @@ impl Plugin for BevyEnsembleSteamPlugin {
                 create_lobby,
                 join_requested_lobbies,
                 react_to_events,
-                flush_lobby_callback_channel,
-                apply_lobby_callbacks,
-                reconcile_host_lobby_membership,
-                reconcile_client_lobby_connection,
             ),
         )
         .add_systems(
@@ -114,6 +88,39 @@ impl Plugin for BevyEnsembleSteamPlugin {
     }
 }
 
+fn send_message(steam_client: &Client, target: SteamId, data: &[u8]) {
+    if let Err(e) = steam_client.networking_messages().send_message_to_user(
+        NetworkingIdentity::new_steam_id(target),
+        SendFlags::RELIABLE,
+        data,
+        0,
+    ) {
+        error!("Failed to send message to {:?}: {:?}", target, e);
+    }
+}
+
+fn send_to_lobby(
+    steam_client: &Client,
+    lobby_id: &LobbySteamId,
+    host: Option<&Host>,
+    packet: &[u8],
+) {
+    match host {
+        Some(_) => {
+            let local_steam_id = steam_client.user().steam_id();
+            for client in steam_client.matchmaking().lobby_members(lobby_id.0) {
+                if client != local_steam_id {
+                    send_message(steam_client, client, packet);
+                }
+            }
+        }
+        None => {
+            let host = steam_client.matchmaking().lobby_owner(lobby_id.0);
+            send_message(steam_client, host, packet);
+        }
+    }
+}
+
 fn send_serialized_lobby_packet(
     packet: On<SerializedLobbyPacket>,
     steam_client: Res<Client>,
@@ -125,65 +132,17 @@ fn send_serialized_lobby_packet(
     lobby_client_query: Query<&LobbyClientSteamId>,
 ) {
     if let Ok((lobby_id, host)) = lobby_query.get(packet.entity) {
-        match host {
-            Some(_) => {
-                let local_steam_id = steam_client.user().steam_id();
-                for client in steam_client.matchmaking().lobby_members(lobby_id.0) {
-                    if client == local_steam_id {
-                        continue;
-                    }
-                    steam_client.networking().send_p2p_packet(
-                        client.into(),
-                        SendType::Reliable,
-                        &packet.packet,
-                    );
-                }
-            }
-            None => {
-                let host = steam_client.matchmaking().lobby_owner(lobby_id.0);
-                steam_client.networking().send_p2p_packet(
-                    host.into(),
-                    SendType::Reliable,
-                    &packet.packet,
-                );
-            }
-        }
+        send_to_lobby(&steam_client, lobby_id, host, &packet.packet);
         return;
     }
 
     if let Ok((lobby_id, host)) = pending_lobby_query.get(packet.entity) {
-        match host {
-            Some(_) => {
-                let local_steam_id = steam_client.user().steam_id();
-                for client in steam_client.matchmaking().lobby_members(lobby_id.0) {
-                    if client == local_steam_id {
-                        continue;
-                    }
-                    steam_client.networking().send_p2p_packet(
-                        client.into(),
-                        SendType::Reliable,
-                        &packet.packet,
-                    );
-                }
-            }
-            None => {
-                let host = steam_client.matchmaking().lobby_owner(lobby_id.0);
-                steam_client.networking().send_p2p_packet(
-                    host.into(),
-                    SendType::Reliable,
-                    &packet.packet,
-                );
-            }
-        }
+        send_to_lobby(&steam_client, lobby_id, host, &packet.packet);
         return;
     }
 
     if let Ok(client_steam_id) = lobby_client_query.get(packet.entity) {
-        steam_client.networking().send_p2p_packet(
-            client_steam_id.0,
-            SendType::Reliable,
-            &packet.packet,
-        );
+        send_message(&steam_client, client_steam_id.0, &packet.packet);
         return;
     }
 
@@ -199,7 +158,7 @@ fn setup_join_policy(steam_client: Res<Client>) {
         .networking_messages()
         .session_request_callback(|args| {
             let res = args.accept();
-            println!("Session request received: {:?}", res);
+            info!("Session request received: {:?}", res);
         });
     steam_client
         .networking_messages()
@@ -208,48 +167,11 @@ fn setup_join_policy(steam_client: Res<Client>) {
         });
 }
 
-fn create_lobby(
-    steam_client: Res<Client>,
-    lobby_callback_channel: Res<SteamLobbyCallbackChannel>,
-    lobbies: Query<(Entity, Option<&Host>), Added<RequestLobby>>,
-) {
-    for (entity, maybe_host) in lobbies.iter() {
-        if maybe_host.is_none() {
-            continue;
-        }
-        let sender = lobby_callback_channel.sender.clone();
-        steam_client.matchmaking().create_lobby(
-            LobbyType::FriendsOnly,
-            MAX_LOBBY_PLAYERS,
-            move |lobby_id| {
-                info!("Lobby created: {:?}", lobby_id);
-
-                match lobby_id {
-                    Ok(lobby_id) => {
-                        info!("sending created lobby id back to Bevy: {:?}", lobby_id);
-                        if let Err(error) =
-                            sender.send(SteamLobbyCallback::Created { entity, lobby_id })
-                        {
-                            error!("Failed to send created lobby id back to Bevy: {:?}", error);
-                        }
-                    }
-                    Err(error) => {
-                        error!(
-                            "Steam failed to create lobby for entity {:?}: {:?}",
-                            entity, error
-                        );
-                        if let Err(callback_error) =
-                            sender.send(SteamLobbyCallback::CreateFailed { entity })
-                        {
-                            error!(
-                                "Failed to send create failure back to Bevy: {:?}",
-                                callback_error
-                            );
-                        }
-                    }
-                }
-            },
-        );
+fn create_lobby(steam_client: Res<Client>, lobbies: Query<(), (Added<RequestLobby>, With<Host>)>) {
+    for _ in lobbies.iter() {
+        steam_client
+            .matchmaking()
+            .create_lobby(LobbyType::FriendsOnly, MAX_LOBBY_PLAYERS, |_| {});
     }
 }
 
@@ -292,7 +214,6 @@ fn populate_friend_lobbies(
 fn join_requested_lobbies(
     mut commands: Commands,
     steam_client: Res<Client>,
-    lobby_callback_channel: Res<SteamLobbyCallbackChannel>,
     mut join_requests: MessageReader<JoinSteamLobby>,
     existing_client_lobbies: Query<(), (With<Lobby>, Without<Host>)>,
     pending_client_lobbies: Query<(), (With<PendingLobby>, Without<Host>)>,
@@ -305,80 +226,195 @@ fn join_requested_lobbies(
         return;
     }
 
-    let entity = commands.spawn(PendingLobby).id();
-
-    let sender = lobby_callback_channel.sender.clone();
+    commands.spawn(PendingLobby);
     steam_client
         .matchmaking()
-        .join_lobby(join_request.0, move |res| {
-            info!("Joined lobby: {:?}", res);
+        .join_lobby(join_request.0, |_| {});
+}
 
-            match res {
-                Ok(lobby_id) => {
-                    if let Err(error) = sender.send(SteamLobbyCallback::Joined { entity, lobby_id })
-                    {
-                        error!("Failed to send joined lobby id back to Bevy: {:?}", error);
+fn react_to_events(
+    mut commands: Commands,
+    steam_client: Res<Client>,
+    mut events: MessageReader<SteamworksEvent>,
+    host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
+    pending_host_lobbies: Query<Entity, (With<RequestLobby>, With<Host>)>,
+    client_lobbies: Query<(Entity, &LobbySteamId), (With<Lobby>, Without<Host>)>,
+    pending_client_lobbies: Query<
+        (Entity, Option<&LobbySteamId>),
+        (With<PendingLobby>, Without<Host>),
+    >,
+    lobby_clients: Query<
+        (
+            Entity,
+            &LobbyClientSteamId,
+            &LobbyClientPlayerUuid,
+            Option<&PendingSteamLobbyClient>,
+        ),
+        Or<(With<LobbyClient>, With<PendingSteamLobbyClient>)>,
+    >,
+    participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
+) {
+    let local_steam_id = steam_client.user().steam_id();
+
+    for event in events.read() {
+        match event {
+            SteamworksEvent::CallbackResult(event) => match event {
+                CallbackResult::LobbyCreated(lobby) => {
+                    info!("Lobby created: {:?}", lobby);
+                    if lobby.result != STEAM_RESULT_OK {
+                        error!("Lobby creation failed with result: {}", lobby.result);
+                        for entity in pending_host_lobbies.iter() {
+                            commands.entity(entity).try_despawn();
+                        }
+                        commands.remove_resource::<LocalMultiplayerPlayerId>();
+                        continue;
+                    }
+                    commands.insert_resource(LocalMultiplayerPlayerId(u128::from(
+                        local_steam_id.raw(),
+                    )));
+                    if let Some(entity) = pending_host_lobbies.iter().next() {
+                        commands
+                            .entity(entity)
+                            .remove::<(PendingLobby, RequestLobby)>()
+                            .insert((Lobby, LobbySteamId(lobby.lobby)));
                     }
                 }
-                Err(error) => {
-                    error!("Steam failed to join lobby: {:?}", error);
-                    if let Err(callback_error) =
-                        sender.send(SteamLobbyCallback::JoinFailed { entity })
-                    {
-                        error!(
-                            "Failed to send join failure back to Bevy: {:?}",
-                            callback_error
+                CallbackResult::LobbyEnter(enter) => {
+                    info!("Lobby entered: {:?}", enter.lobby);
+                    // Only handle for client joins; host is handled by LobbyCreated.
+                    let Some((entity, None)) = pending_client_lobbies
+                        .iter()
+                        .find(|(_, steam_id)| steam_id.is_none())
+                    else {
+                        continue;
+                    };
+                    match enter.chat_room_enter_response {
+                        ChatRoomEnterResponse::Success => {
+                            commands.insert_resource(LocalMultiplayerPlayerId(u128::from(
+                                local_steam_id.raw(),
+                            )));
+                            commands.entity(entity).insert(LobbySteamId(enter.lobby));
+                        }
+                        other => {
+                            error!("Failed to enter lobby: {:?}", other);
+                            commands.entity(entity).try_despawn();
+                            commands.remove_resource::<LocalMultiplayerPlayerId>();
+                        }
+                    }
+                }
+                CallbackResult::GameLobbyJoinRequested(request) => {
+                    if !client_lobbies.is_empty() || !pending_client_lobbies.is_empty() {
+                        warn!(
+                            "Ignoring Steam overlay join request while a client lobby is already active or pending"
+                        );
+                        continue;
+                    }
+                    info!("Game lobby join requested: {:?}", request.lobby_steam_id);
+                    commands.spawn(PendingLobby);
+                    steam_client
+                        .matchmaking()
+                        .join_lobby(request.lobby_steam_id, |_| {});
+                }
+                CallbackResult::LobbyDataUpdate(data) => {
+                    debug!(
+                        "Lobby member count: {:?}",
+                        steam_client.matchmaking().lobby_member_count(data.lobby)
+                    );
+                }
+                CallbackResult::LobbyChatUpdate(update) => {
+                    debug!("Lobby chat updated: {:?}", update);
+
+                    match update.member_state_change {
+                        ChatMemberStateChange::Left
+                        | ChatMemberStateChange::Disconnected
+                        | ChatMemberStateChange::Kicked
+                        | ChatMemberStateChange::Banned => {
+                            info!("Lobby member left: {:?}", update.user_changed);
+                            if update.user_changed == local_steam_id {
+                                despawn_client_lobby_for_lost_connection(
+                                    &mut commands,
+                                    &steam_client,
+                                    &client_lobbies,
+                                    update.lobby,
+                                );
+                            } else if let Some(ref lobby) = host_lobby {
+                                despawn_lobby_client_for_remote(
+                                    &mut commands,
+                                    &lobby_clients,
+                                    &participants,
+                                    **lobby,
+                                    update.user_changed,
+                                );
+                            }
+                        }
+                        ChatMemberStateChange::Entered => {
+                            if update.user_changed != local_steam_id {
+                                if let Some(lobby) = host_lobby.as_ref() {
+                                    ensure_pending_lobby_client_for_remote(
+                                        &mut commands,
+                                        &lobby_clients,
+                                        **lobby,
+                                        update.user_changed,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                CallbackResult::NetworkingMessagesSessionFailed(failed) => {
+                    debug!("Networking session failed: {:?}", failed);
+
+                    let Some(remote_identity) = failed.info.identity_remote() else {
+                        continue;
+                    };
+                    let Some(remote) = remote_identity.steam_id() else {
+                        continue;
+                    };
+
+                    if let Some(ref lobby) = host_lobby {
+                        despawn_lobby_client_for_remote(
+                            &mut commands,
+                            &lobby_clients,
+                            &participants,
+                            **lobby,
+                            remote,
+                        );
+                    } else {
+                        despawn_client_lobby_for_remote_owner(
+                            &mut commands,
+                            &steam_client,
+                            &client_lobbies,
+                            remote,
                         );
                     }
                 }
-            }
-        });
-}
-
-fn flush_lobby_callback_channel(
-    lobby_callback_channel: Res<SteamLobbyCallbackChannel>,
-    mut lobby_callbacks: MessageWriter<SteamLobbyCallback>,
-) {
-    let Ok(receiver) = lobby_callback_channel.receiver.lock() else {
-        error!("Failed to lock lobby creation receiver");
-        return;
-    };
-
-    for lobby_callback in receiver.try_iter() {
-        lobby_callbacks.write(lobby_callback);
+                CallbackResult::PersonaStateChange(_) => {}
+                CallbackResult::UserStatsReceived(_) => {}
+                e => {
+                    debug!("Unhandled event: {:?}", e);
+                }
+            },
+        }
     }
 }
 
-fn apply_lobby_callbacks(
-    mut commands: Commands,
-    steam_client: Res<Client>,
-    mut lobby_callbacks: MessageReader<SteamLobbyCallback>,
-) {
-    for lobby_callback in lobby_callbacks.read() {
-        match *lobby_callback {
-            SteamLobbyCallback::Created { entity, lobby_id } => {
-                commands.insert_resource(LocalMultiplayerPlayerId(u128::from(
-                    steam_client.user().steam_id().raw(),
-                )));
-                commands
-                    .entity(entity)
-                    .remove::<(PendingLobby, RequestLobby)>()
-                    .insert((Lobby, LobbySteamId(lobby_id)));
-            }
-            SteamLobbyCallback::CreateFailed { entity }
-            | SteamLobbyCallback::JoinFailed { entity } => {
-                commands.remove_resource::<LocalMultiplayerPlayerId>();
-                if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                    entity_commands.try_despawn();
-                }
-            }
-            SteamLobbyCallback::Joined { entity, lobby_id } => {
-                commands.insert_resource(LocalMultiplayerPlayerId(u128::from(
-                    steam_client.user().steam_id().raw(),
-                )));
-                commands.entity(entity).insert(LobbySteamId(lobby_id));
-            }
-        }
+fn read_messages(world: &mut World) {
+    let packets: Vec<_> = {
+        let steam_client = world.resource::<Client>();
+        steam_client
+            .networking_messages()
+            .receive_messages_on_channel(0, 64)
+            .into_iter()
+            .filter_map(|msg| {
+                let steam_id = msg.identity_peer().steam_id()?;
+                Some((steam_id, msg.data().to_vec()))
+            })
+            .collect()
+    };
+
+    for (steam_id, packet) in packets {
+        ensure_pending_lobby_client_for_remote_world(world, steam_id);
+        decode_ensemble_packet(world, Some(u128::from(steam_id.raw())), &packet);
     }
 }
 
@@ -401,9 +437,7 @@ fn send_client_handshakes(
     let packet = encode_ensemble_message(&registry, &SteamReadyHandshake { from_host: false });
     for lobby_id in pending_client_lobbies.iter() {
         let host = steam_client.matchmaking().lobby_owner(lobby_id.0);
-        steam_client
-            .networking()
-            .send_p2p_packet(host.into(), SendType::Reliable, &packet);
+        send_message(&steam_client, host, &packet);
     }
 }
 
@@ -430,9 +464,7 @@ fn send_host_handshakes(
         if remote == local_steam_id {
             continue;
         }
-        steam_client
-            .networking()
-            .send_p2p_packet(remote.into(), SendType::Reliable, &packet);
+        send_message(&steam_client, remote, &packet);
     }
 }
 
@@ -513,271 +545,6 @@ fn promote_host_client_on_client_handshake(
     }
 }
 
-fn react_to_events(
-    mut commands: Commands,
-    steam_client: Res<Client>,
-    lobby_callback_channel: Res<SteamLobbyCallbackChannel>,
-    mut events: MessageReader<SteamworksEvent>,
-    host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
-    client_lobbies: Query<(Entity, &LobbySteamId), (With<Lobby>, Without<Host>)>,
-    pending_client_lobbies: Query<(), (With<PendingLobby>, Without<Host>)>,
-    lobby_clients: Query<
-        (
-            Entity,
-            &LobbyClientSteamId,
-            &LobbyClientPlayerUuid,
-            Option<&PendingSteamLobbyClient>,
-        ),
-        Or<(With<LobbyClient>, With<PendingSteamLobbyClient>)>,
-    >,
-    pending_lobby_clients: Query<
-        (Entity, &LobbyClientSteamId, &LobbyClientPlayerUuid),
-        With<PendingSteamLobbyClient>,
-    >,
-    participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
-) {
-    let local_steam_id = steam_client.user().steam_id();
-
-    for event in events.read() {
-        match event {
-            SteamworksEvent::CallbackResult(event) => match event {
-                CallbackResult::LobbyEnter(enter) => {
-                    info!("Lobby entered: {:?}", enter.lobby);
-                }
-                CallbackResult::GameLobbyJoinRequested(request) => {
-                    if !client_lobbies.is_empty() || !pending_client_lobbies.is_empty() {
-                        warn!(
-                            "Ignoring Steam overlay join request while a client lobby is already active or pending"
-                        );
-                        continue;
-                    }
-                    info!("Game lobby join requested: {:?}", request.lobby_steam_id);
-                    let entity = commands.spawn(PendingLobby).id();
-                    let sender = lobby_callback_channel.sender.clone();
-                    steam_client
-                        .matchmaking()
-                        .join_lobby(request.lobby_steam_id, move |res| {
-                            info!("Joined lobby: {:?}", res);
-
-                            match res {
-                                Ok(lobby_id) => {
-                                    if let Err(error) =
-                                        sender.send(SteamLobbyCallback::Joined { entity, lobby_id })
-                                    {
-                                        error!(
-                                            "Failed to send joined lobby id back to Bevy: {:?}",
-                                            error
-                                        );
-                                    }
-                                }
-                                Err(error) => {
-                                    error!("Steam failed to join lobby: {:?}", error);
-                                    if let Err(callback_error) =
-                                        sender.send(SteamLobbyCallback::JoinFailed { entity })
-                                    {
-                                        error!(
-                                            "Failed to send join failure back to Bevy: {:?}",
-                                            callback_error
-                                        );
-                                    }
-                                }
-                            }
-                        });
-                }
-                CallbackResult::LobbyDataUpdate(data) => {
-                    info!(
-                        "Lobby member count: {:?}",
-                        steam_client.matchmaking().lobby_member_count(data.lobby)
-                    );
-                }
-                CallbackResult::LobbyChatUpdate(update) => {
-                    info!("Lobby chat updated: {:?}", update);
-
-                    match update.member_state_change {
-                        ChatMemberStateChange::Left
-                        | ChatMemberStateChange::Disconnected
-                        | ChatMemberStateChange::Kicked
-                        | ChatMemberStateChange::Banned => {
-                            info!("Lobby member left: {:?}", update.user_changed);
-                            if update.user_changed == local_steam_id {
-                                despawn_client_lobby_for_lost_connection(
-                                    &mut commands,
-                                    &steam_client,
-                                    &client_lobbies,
-                                    update.lobby,
-                                );
-                            } else if host_lobby.is_some() {
-                                despawn_lobby_client_for_remote(
-                                    &mut commands,
-                                    &steam_client,
-                                    &lobby_clients,
-                                    &participants,
-                                    **host_lobby.as_ref().unwrap(),
-                                    update.user_changed,
-                                );
-                            }
-                        }
-                        ChatMemberStateChange::Entered => {}
-                    }
-                }
-                CallbackResult::LobbyCreated(lobby) => {
-                    info!("Lobby created2: {:?}", lobby);
-                }
-                CallbackResult::P2PSessionConnectFail(failed) => {
-                    info!("P2P session failed: {:?}", failed);
-
-                    if host_lobby.is_some() {
-                        despawn_lobby_client_for_remote(
-                            &mut commands,
-                            &steam_client,
-                            &lobby_clients,
-                            &participants,
-                            **host_lobby.as_ref().unwrap(),
-                            failed.remote,
-                        );
-                    } else {
-                        despawn_client_lobby_for_remote_owner(
-                            &mut commands,
-                            &steam_client,
-                            &client_lobbies,
-                            failed.remote,
-                        );
-                    }
-                }
-                CallbackResult::P2PSessionRequest(request) => {
-                    let Some(lobby) = host_lobby.as_ref() else {
-                        error!("Lobby not found to accept P2P session request");
-                        continue;
-                    };
-                    steam_client.networking().accept_p2p_session(request.remote);
-                    ensure_pending_lobby_client_for_remote(
-                        &mut commands,
-                        &pending_lobby_clients,
-                        &lobby_clients,
-                        **lobby,
-                        request.remote,
-                    );
-                    info!("P2P session request: {:?}", request);
-                }
-                CallbackResult::PersonaStateChange(_) => {}
-                CallbackResult::UserStatsReceived(_) => {}
-                e => {
-                    info!("Unhandled event: {:?}", e);
-                }
-            },
-        }
-    }
-}
-
-fn read_messages(world: &mut World) {
-    let mut packets = Vec::new();
-
-    {
-        let steam_client = world.resource::<Client>();
-
-        while let Some(size) = steam_client
-            .networking()
-            .is_p2p_packet_available_on_channel(0)
-        {
-            let mut buf = vec![0; size];
-
-            let Some((steam_id, size)) = steam_client
-                .networking()
-                .read_p2p_packet_from_channel(&mut buf, 0)
-            else {
-                error!("No message received");
-                continue;
-            };
-
-            buf.truncate(size);
-            packets.push((steam_id, buf));
-        }
-    }
-
-    for (steam_id, packet) in packets {
-        ensure_pending_lobby_client_for_remote_world(world, steam_id);
-        decode_ensemble_packet(world, Some(u128::from(steam_id.raw())), &packet);
-    }
-}
-
-fn reconcile_host_lobby_membership(
-    mut commands: Commands,
-    steam_client: Res<Client>,
-    host_lobby: Option<Single<(Entity, &LobbySteamId), (With<Lobby>, With<Host>)>>,
-    lobby_clients: Query<
-        (
-            Entity,
-            &LobbyClientSteamId,
-            &LobbyClientPlayerUuid,
-            Option<&PendingSteamLobbyClient>,
-        ),
-        Or<(With<LobbyClient>, With<PendingSteamLobbyClient>)>,
-    >,
-    participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
-) {
-    let Some(host_lobby) = host_lobby else {
-        return;
-    };
-
-    let local_steam_id = steam_client.user().steam_id();
-    let current_members: HashSet<_> = steam_client
-        .matchmaking()
-        .lobby_members(host_lobby.1 .0)
-        .into_iter()
-        .filter(|member| *member != local_steam_id)
-        .collect();
-
-    let stale_remotes: Vec<_> = lobby_clients
-        .iter()
-        .filter_map(|(_, client_steam_id, _, _)| {
-            (!current_members.contains(&client_steam_id.0)).then_some(client_steam_id.0)
-        })
-        .collect();
-
-    for remote in stale_remotes {
-        despawn_lobby_client_for_remote(
-            &mut commands,
-            &steam_client,
-            &lobby_clients,
-            &participants,
-            host_lobby.0,
-            remote,
-        );
-    }
-}
-
-fn reconcile_client_lobby_connection(
-    mut commands: Commands,
-    steam_client: Res<Client>,
-    client_lobbies: Query<
-        (Entity, &LobbySteamId),
-        (
-            Without<Host>,
-            Or<(With<Lobby>, With<PendingLobby>)>,
-        ),
-    >,
-) {
-    let local_steam_id = steam_client.user().steam_id();
-
-    let stale_lobbies: Vec<_> = client_lobbies
-        .iter()
-        .filter_map(|(lobby_entity, lobby_steam_id)| {
-            let owner = steam_client.matchmaking().lobby_owner(lobby_steam_id.0);
-            let members = steam_client.matchmaking().lobby_members(lobby_steam_id.0);
-            let host_missing = owner == local_steam_id || !members.contains(&owner);
-            host_missing.then_some((lobby_entity, lobby_steam_id.0, owner))
-        })
-        .collect();
-
-    for (lobby_entity, lobby_id, owner) in stale_lobbies {
-        if owner != local_steam_id {
-            steam_client.networking().close_p2p_session(owner);
-        }
-        steam_client.matchmaking().leave_lobby(lobby_id);
-        commands.entity(lobby_entity).try_despawn();
-    }
-}
-
 fn ensure_pending_lobby_client_for_remote_world(world: &mut World, steam_id: SteamId) {
     let remote_player_uuid = u128::from(steam_id.raw());
     let host_lobby = {
@@ -815,10 +582,6 @@ fn ensure_pending_lobby_client_for_remote_world(world: &mut World, steam_id: Ste
 
 fn ensure_pending_lobby_client_for_remote(
     commands: &mut Commands,
-    pending_lobby_clients: &Query<
-        (Entity, &LobbyClientSteamId, &LobbyClientPlayerUuid),
-        With<PendingSteamLobbyClient>,
-    >,
     lobby_clients: &Query<
         (
             Entity,
@@ -836,12 +599,7 @@ fn ensure_pending_lobby_client_for_remote(
         .iter()
         .any(|(_, client_steam_id, player_uuid, _)| {
             client_steam_id.0 == remote || player_uuid.0 == remote_player_uuid
-        })
-        || pending_lobby_clients
-            .iter()
-            .any(|(_, client_steam_id, player_uuid)| {
-                client_steam_id.0 == remote || player_uuid.0 == remote_player_uuid
-            });
+        });
     if already_known {
         return;
     }
@@ -856,7 +614,6 @@ fn ensure_pending_lobby_client_for_remote(
 
 fn despawn_lobby_client_for_remote(
     commands: &mut Commands,
-    steam_client: &Client,
     lobby_clients: &Query<
         (
             Entity,
@@ -874,7 +631,6 @@ fn despawn_lobby_client_for_remote(
         .iter()
         .find(|(_, client_steam_id, _, _)| client_steam_id.0 == remote)
     {
-        steam_client.networking().close_p2p_session(remote);
         commands
             .entity(host_lobby)
             .trigger(move |entity| LobbyMessage::<RemoveLobbyParticipant> {
@@ -906,8 +662,6 @@ fn despawn_client_lobby_for_lost_connection(
         .iter()
         .find(|(_, lobby_steam_id)| lobby_steam_id.0 == lost_lobby_id)
     {
-        let host = steam_client.matchmaking().lobby_owner(lobby_steam_id.0);
-        steam_client.networking().close_p2p_session(host);
         steam_client.matchmaking().leave_lobby(lobby_steam_id.0);
         commands.entity(lobby_entity).try_despawn();
     }
@@ -924,7 +678,6 @@ fn despawn_client_lobby_for_remote_owner(
             steam_client.matchmaking().lobby_owner(lobby_steam_id.0) == remote
         })
     {
-        steam_client.networking().close_p2p_session(remote);
         steam_client.matchmaking().leave_lobby(lobby_steam_id.0);
         commands.entity(lobby_entity).try_despawn();
     }
