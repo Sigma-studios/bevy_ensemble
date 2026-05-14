@@ -361,6 +361,9 @@ fn relay_moves_on_host(
         return;
     };
 
+    // Track spawns within this system run to avoid duplicates from deferred commands
+    let mut spawned_this_frame = Vec::new();
+
     for message in messages.read() {
         let Some(sender) = message.sender else {
             continue;
@@ -376,7 +379,7 @@ fn relay_moves_on_host(
         {
             transform.translation.x = x;
             transform.translation.y = y;
-        } else {
+        } else if !spawned_this_frame.contains(&player_uuid) {
             let color = player_color(player_uuid);
             commands.spawn((
                 PlayerCircle(player_uuid),
@@ -384,6 +387,7 @@ fn relay_moves_on_host(
                 MeshMaterial2d(materials.add(ColorMaterial::from_color(color))),
                 Transform::from_translation(Vec3::new(x, y, 0.0)),
             ));
+            spawned_this_frame.push(player_uuid);
         }
 
         // Broadcast to all clients
@@ -409,6 +413,9 @@ fn receive_player_positions(
     mut messages: MessageReader<ReceivedEnsembleMessage<PlayerPosition>>,
     mut circles: Query<(&PlayerCircle, &mut Transform)>,
 ) {
+    // Track spawns within this system run to avoid duplicates from deferred commands
+    let mut spawned_this_frame = Vec::new();
+
     for message in messages.read() {
         let pos = &message.message;
 
@@ -426,7 +433,7 @@ fn receive_player_positions(
         {
             transform.translation.x = pos.x;
             transform.translation.y = pos.y;
-        } else {
+        } else if !spawned_this_frame.contains(&pos.player_uuid) {
             let color = player_color(pos.player_uuid);
             commands.spawn((
                 PlayerCircle(pos.player_uuid),
@@ -434,6 +441,7 @@ fn receive_player_positions(
                 MeshMaterial2d(materials.add(ColorMaterial::from_color(color))),
                 Transform::from_translation(Vec3::new(pos.x, pos.y, 0.0)),
             ));
+            spawned_this_frame.push(pos.player_uuid);
         }
     }
 }
