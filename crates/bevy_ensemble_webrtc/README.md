@@ -35,17 +35,18 @@ SERVER_URL="wss://signal.sigma-dev.eu/ws" cargo lobbies
 Desktop:
 
 ```bash
-cargo run -p bevy_ensemble_webrtc --example minimal_lobby --features client
+cargo run -p bevy_ensemble_webrtc --example minimal_lobby
 ```
 
 Desktop (remote server):
 
 ```bash
-SIGNALLING_SERVER_URL="wss://signal.sigma-dev.eu/ws" cargo run -p bevy_ensemble_webrtc --example minimal_lobby --features client
+SIGNALLING_SERVER_URL="wss://signal.sigma-dev.eu/ws" cargo run -p bevy_ensemble_webrtc --example minimal_lobby
 ```
 
 Browser:
 
 ```bash
-SIGNALLING_SERVER_URL="wss://signal.sigma-dev.eu/ws" bevy run -p bevy_ensemble_webrtc --example minimal_lobby --features client web
+SIGNALLING_SERVER_URL="wss://signal.sigma-dev.eu/ws" bevy run -p bevy_ensemble_webrtc --example minimal_lobby web
 ```
+SIGNALLING_SERVER_URL="wss://signal.sigma-dev.eu/ws" cargo run -p bevy_ensemble_webrtc --example circle_sync
