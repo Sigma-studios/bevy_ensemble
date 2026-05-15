@@ -2,7 +2,7 @@ use bevy::prelude::*;
 
 use crate::{
     Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipant, LobbyParticipantOf,
-    RemoveLobbyParticipant,
+    RemoveLobbyParticipant, SendMode,
     components::LobbyParticipants,
     messages::{EnsembleMessage, LobbyClientMessage, LobbyMessage, SerializedLobbyPacket},
     registry::{EnsembleMessageRegistry, encode_ensemble_message},
@@ -20,6 +20,8 @@ pub(crate) fn encode_lobby_message<T: EnsembleMessage>(
     lobby_clients: Query<(), With<LobbyClient>>,
     mut commands: Commands,
 ) {
+    let send_mode = message.send_mode;
+
     if host_lobbies.get(message.entity).is_ok() {
         let Ok(participants) = participants.get(message.entity) else {
             return;
@@ -36,6 +38,7 @@ pub(crate) fn encode_lobby_message<T: EnsembleMessage>(
                 .trigger(move |entity| LobbyClientMessage::<T> {
                     entity,
                     message: outgoing,
+                    send_mode,
                 });
         }
         return;
@@ -47,6 +50,7 @@ pub(crate) fn encode_lobby_message<T: EnsembleMessage>(
         .trigger(move |entity| LobbyClientMessage::<T> {
             entity,
             message: outgoing,
+            send_mode,
         });
 }
 
@@ -84,6 +88,7 @@ pub(crate) fn on_lobby_client_removed(
         .trigger(move |entity| LobbyClientMessage::<RemoveLobbyParticipant> {
             entity,
             message: RemoveLobbyParticipant { player_uuid },
+            send_mode: SendMode::Reliable,
         });
 
     // Broadcast to remaining clients
@@ -91,6 +96,7 @@ pub(crate) fn on_lobby_client_removed(
         lobby_commands.trigger(move |entity| LobbyMessage::<RemoveLobbyParticipant> {
             entity,
             message: RemoveLobbyParticipant { player_uuid },
+            send_mode: SendMode::Reliable,
         });
     }
 
@@ -113,7 +119,8 @@ pub(crate) fn encode_lobby_client_message<T: EnsembleMessage>(
     mut commands: Commands,
 ) {
     let packet = encode_ensemble_message(&registry, &message.message);
+    let send_mode = message.send_mode;
     commands
         .entity(message.entity)
-        .trigger(move |entity| SerializedLobbyPacket { entity, packet });
+        .trigger(move |entity| SerializedLobbyPacket { entity, packet, send_mode });
 }

@@ -31,5 +31,5 @@ pub use crate::{
     PeerRtt,
 
     // Messages & events
-    EnsembleAppExt, LobbyMessage, ReceivedEnsembleMessage, StartHosting,
+    EnsembleAppExt, LobbyMessage, ReceivedEnsembleMessage, SendMode, StartHosting,
 };

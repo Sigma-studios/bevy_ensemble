@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 
 use crate::{
-    Host, Lobby, LobbyClient, LobbyClientPlayerUuid, ReceivedEnsembleMessage,
+    Host, Lobby, LobbyClient, LobbyClientPlayerUuid, ReceivedEnsembleMessage, SendMode,
     messages::{LobbyClientMessage, LobbyMessage},
 };
 
@@ -51,6 +51,7 @@ pub(crate) fn send_pings(
             .trigger(move |entity| LobbyMessage {
                 entity,
                 message: EnsemblePing { timestamp },
+                send_mode: SendMode::Reliable,
             });
     }
 }
@@ -86,6 +87,7 @@ pub(crate) fn respond_to_pings(
                     .trigger(move |entity| LobbyClientMessage {
                         entity,
                         message: pong,
+                        send_mode: SendMode::Reliable,
                     });
             }
         } else if let Some(lobby) = client_lobby.as_ref() {
@@ -95,6 +97,7 @@ pub(crate) fn respond_to_pings(
                 .trigger(move |entity| LobbyMessage {
                     entity,
                     message: pong,
+                    send_mode: SendMode::Reliable,
                 });
         }
     }

@@ -87,10 +87,10 @@ impl Plugin for BevyEnsembleSteamPlugin {
     }
 }
 
-fn send_message(steam_client: &Client, target: SteamId, data: &[u8]) {
+fn send_message(steam_client: &Client, target: SteamId, data: &[u8], send_flags: SendFlags) {
     if let Err(e) = steam_client.networking_messages().send_message_to_user(
         NetworkingIdentity::new_steam_id(target),
-        SendFlags::RELIABLE,
+        send_flags,
         data,
         0,
     ) {
@@ -103,19 +103,20 @@ fn send_to_lobby(
     lobby_id: &LobbySteamId,
     host: Option<&Host>,
     packet: &[u8],
+    send_flags: SendFlags,
 ) {
     match host {
         Some(_) => {
             let local_steam_id = steam_client.user().steam_id();
             for client in steam_client.matchmaking().lobby_members(lobby_id.0) {
                 if client != local_steam_id {
-                    send_message(steam_client, client, packet);
+                    send_message(steam_client, client, packet, send_flags);
                 }
             }
         }
         None => {
             let host = steam_client.matchmaking().lobby_owner(lobby_id.0);
-            send_message(steam_client, host, packet);
+            send_message(steam_client, host, packet, send_flags);
         }
     }
 }
@@ -130,18 +131,23 @@ fn send_serialized_lobby_packet(
     >,
     lobby_client_query: Query<&LobbyClientSteamId>,
 ) {
+    let send_flags = match packet.send_mode {
+        bevy_ensemble::SendMode::Reliable => SendFlags::RELIABLE,
+        bevy_ensemble::SendMode::Unreliable => SendFlags::UNRELIABLE_NO_NAGLE,
+    };
+
     if let Ok((lobby_id, host)) = lobby_query.get(packet.entity) {
-        send_to_lobby(&steam_client, lobby_id, host, &packet.packet);
+        send_to_lobby(&steam_client, lobby_id, host, &packet.packet, send_flags);
         return;
     }
 
     if let Ok((lobby_id, host)) = pending_lobby_query.get(packet.entity) {
-        send_to_lobby(&steam_client, lobby_id, host, &packet.packet);
+        send_to_lobby(&steam_client, lobby_id, host, &packet.packet, send_flags);
         return;
     }
 
     if let Ok(client_steam_id) = lobby_client_query.get(packet.entity) {
-        send_message(&steam_client, client_steam_id.0, &packet.packet);
+        send_message(&steam_client, client_steam_id.0, &packet.packet, send_flags);
         return;
     }
 
@@ -431,7 +437,7 @@ fn send_client_handshakes(
     let packet = encode_ensemble_message(&registry, &SteamReadyHandshake { from_host: false });
     for lobby_id in pending_client_lobbies.iter() {
         let host = steam_client.matchmaking().lobby_owner(lobby_id.0);
-        send_message(&steam_client, host, &packet);
+        send_message(&steam_client, host, &packet, SendFlags::RELIABLE);
     }
 }
 
@@ -458,7 +464,7 @@ fn send_host_handshakes(
         if remote == local_steam_id {
             continue;
         }
-        send_message(&steam_client, remote, &packet);
+        send_message(&steam_client, remote, &packet, SendFlags::RELIABLE);
     }
 }
 

@@ -2,7 +2,7 @@ use bevy::prelude::*;
 
 use crate::{
     Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipant, LobbyParticipantOf,
-    LocalMultiplayerPlayerId, PendingLobby, RequestLobby,
+    LocalMultiplayerPlayerId, PendingLobby, RequestLobby, SendMode,
     messages::{
         LobbyClientMessage, LobbyMessage, ReceivedEnsembleMessage, RemoveLobbyParticipant,
         StartHosting, SyncLobbyParticipant,
@@ -133,6 +133,7 @@ pub(crate) fn sync_existing_participants_to_new_lobby_clients(
                 .trigger(move |entity| LobbyClientMessage::<SyncLobbyParticipant> {
                     entity,
                     message,
+                    send_mode: SendMode::Reliable,
                 });
         }
     }
@@ -198,7 +199,7 @@ pub(crate) fn broadcast_changed_lobby_participants(
         };
         commands
             .entity(participant_of.0)
-            .trigger(move |entity| LobbyMessage::<SyncLobbyParticipant> { entity, message });
+            .trigger(move |entity| LobbyMessage::<SyncLobbyParticipant> { entity, message, send_mode: SendMode::Reliable });
     }
 }
 
