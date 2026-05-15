@@ -8,8 +8,6 @@ mod connection;
 #[cfg(feature = "client")]
 mod handshake;
 #[cfg(feature = "client")]
-mod ping;
-#[cfg(feature = "client")]
 mod systems;
 
 
@@ -18,7 +16,7 @@ use bevy::prelude::*;
 #[cfg(feature = "client")]
 use bevy_ensemble::EnsembleAppExt;
 #[cfg(feature = "client")]
-pub use ping::PeerRtt;
+pub use bevy_ensemble::PeerRtt;
 
 /// Bevy plugin for WebRTC P2P networking via a signaling server.
 ///
@@ -163,7 +161,6 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
             .add_message::<JoinWebrtcLobby>()
             .add_message::<JoinWebrtcLobbyByCode>()
             .add_message::<RefreshLobbyList>()
-            .add_plugins(ping::PingPlugin)
             .register_ensemble_message_type::<handshake::WebrtcReadyHandshake>()
             .add_systems(
                 Update,

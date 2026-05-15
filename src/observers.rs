@@ -52,11 +52,14 @@ pub(crate) fn encode_lobby_message<T: EnsembleMessage>(
 
 /// Handles cleanup when a [`LobbyClient`] entity is removed.
 ///
-/// On a host lobby, this broadcasts a [`RemoveLobbyParticipant`] message to
-/// remaining clients and despawns the corresponding [`LobbyParticipant`] entity.
+/// On a host lobby, this:
+/// 1. Sends a [`RemoveLobbyParticipant`] directly to the kicked peer so they
+///    know to leave.
+/// 2. Broadcasts `RemoveLobbyParticipant` to all remaining clients.
+/// 3. Despawns the corresponding [`LobbyParticipant`] entity.
 ///
 /// This enables kicking a player by simply despawning their `LobbyClient` entity —
-/// the observer handles notifying other clients and cleaning up the participant roster.
+/// the observer handles notifying everyone and cleaning up the participant roster.
 pub(crate) fn on_lobby_client_removed(
     trigger: On<Remove, LobbyClient>,
     query: Query<(&LobbyClientPlayerUuid, &LobbyParticipantOf)>,
@@ -75,6 +78,15 @@ pub(crate) fn on_lobby_client_removed(
 
     let player_uuid = player_uuid.0;
 
+    // Notify the kicked peer directly (the backend will transmit this via its transport)
+    commands
+        .entity(trigger.event_target())
+        .trigger(move |entity| LobbyClientMessage::<RemoveLobbyParticipant> {
+            entity,
+            message: RemoveLobbyParticipant { player_uuid },
+        });
+
+    // Broadcast to remaining clients
     if let Ok(mut lobby_commands) = commands.get_entity(lobby) {
         lobby_commands.trigger(move |entity| LobbyMessage::<RemoveLobbyParticipant> {
             entity,

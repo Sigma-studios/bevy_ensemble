@@ -3,7 +3,6 @@ use bevy_ensemble::{
     Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipant,
     LobbyParticipantOf, LocalMultiplayerPlayerId, PendingLobby, PublicLobbies, PublicLobbyInfo,
     RequestLobby, SerializedLobbyPacket, decode_ensemble_packet,
-    encode_ensemble_message,
 };
 use bevy_ensemble_sockets::PeerState;
 
@@ -404,30 +403,19 @@ pub(crate) fn read_peer_messages(world: &mut World) {
     }
 }
 
-/// Sends a [`RemoveLobbyParticipant`] directly to the kicked peer then
-/// disconnects the WebRTC connection.
+/// Disconnects the WebRTC peer connection when a [`LobbyClient`] is removed.
 ///
-/// The core `on_lobby_client_removed` observer broadcasts `RemoveLobbyParticipant`
-/// to *remaining* clients, but the kicked client's `LobbyClient` is already gone
-/// by that point. This observer sends it directly via the socket so the kicked
-/// client knows to leave.
+/// The core `on_lobby_client_removed` observer handles notifying both the kicked
+/// peer and remaining clients. This observer only needs to tear down the
+/// transport-level connection.
 pub(crate) fn on_lobby_client_removed(
     trigger: On<Remove, LobbyClient>,
     query: Query<&LobbyClientWebrtcUuid>,
-    registry: Res<bevy_ensemble::EnsembleMessageRegistry>,
     mut socket: ResMut<crate::EnsembleSocketRes>,
 ) {
     let Ok(uuid) = query.get(trigger.event_target()) else {
         return;
     };
-
-    let packet = encode_ensemble_message(
-        &registry,
-        &bevy_ensemble::RemoveLobbyParticipant {
-            player_uuid: uuid.0,
-        },
-    );
-    socket.send(packet.into_boxed_slice(), uuid.0);
 
     socket.disconnect_peer(uuid.0);
 }

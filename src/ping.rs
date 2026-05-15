@@ -1,24 +1,22 @@
 use bevy::prelude::*;
-use bevy_ensemble::{
-    EnsembleAppExt, EnsembleMessageRegistry, Host, Lobby, LobbyClient, ReceivedEnsembleMessage,
-    encode_ensemble_message,
-};
 
-use crate::EnsembleSocketRes;
-use crate::LobbyClientWebrtcUuid;
+use crate::{
+    Host, Lobby, LobbyClient, LobbyClientPlayerUuid, ReceivedEnsembleMessage,
+    messages::{LobbyClientMessage, LobbyMessage},
+};
 
 const PING_INTERVAL_SECS: f32 = 1.0;
 
 /// Internal ping message sent over data channels to measure RTT.
 #[derive(Message, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct WebrtcPing {
+pub(crate) struct EnsemblePing {
     /// Monotonic timestamp (seconds) on the sender's clock when the ping was sent.
     pub timestamp: f64,
 }
 
 /// Internal pong response echoing back the original ping timestamp.
 #[derive(Message, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct WebrtcPong {
+pub(crate) struct EnsemblePong {
     /// The original timestamp from the ping, echoed back unchanged.
     pub timestamp: f64,
 }
@@ -30,24 +28,13 @@ pub(crate) struct WebrtcPong {
 #[derive(Component, Debug, Clone, Copy)]
 pub struct PeerRtt(pub f64);
 
-pub(crate) struct PingPlugin;
-
-impl Plugin for PingPlugin {
-    fn build(&self, app: &mut App) {
-        app.register_ensemble_message_type::<WebrtcPing>()
-            .register_ensemble_message_type::<WebrtcPong>()
-            .add_systems(
-                Update,
-                (send_pings, respond_to_pings, receive_pongs),
-            );
-    }
-}
-
 /// Both host and client send pings to all connected peers every 1 second.
-fn send_pings(
-    registry: Res<EnsembleMessageRegistry>,
-    socket: ResMut<EnsembleSocketRes>,
-    lobbies: Query<(), Or<(With<Lobby>, With<bevy_ensemble::PendingLobby>)>>,
+///
+/// Uses the standard [`LobbyMessage`] pipeline so pings are routed through
+/// whichever transport backend is active.
+pub(crate) fn send_pings(
+    mut commands: Commands,
+    lobbies: Query<Entity, With<Lobby>>,
     time: Res<Time>,
     mut cooldown: Local<f32>,
 ) {
@@ -57,37 +44,59 @@ fn send_pings(
     }
     *cooldown = PING_INTERVAL_SECS;
 
-    if lobbies.is_empty() {
-        return;
-    }
-
-    let ping = WebrtcPing {
-        timestamp: time.elapsed_secs_f64(),
-    };
-    let packet = encode_ensemble_message(&registry, &ping);
-    let data: Box<[u8]> = packet.into_boxed_slice();
-
-    let peers: Vec<u128> = socket.connected_peers().collect();
-    for peer in peers {
-        socket.send(data.clone(), peer);
+    let timestamp = time.elapsed_secs_f64();
+    for lobby in lobbies.iter() {
+        commands
+            .entity(lobby)
+            .trigger(move |entity| LobbyMessage {
+                entity,
+                message: EnsemblePing { timestamp },
+            });
     }
 }
 
 /// When we receive a ping, immediately echo it back as a pong.
-fn respond_to_pings(
-    registry: Res<EnsembleMessageRegistry>,
-    socket: ResMut<EnsembleSocketRes>,
-    mut messages: MessageReader<ReceivedEnsembleMessage<WebrtcPing>>,
+///
+/// On the host: sends a targeted [`LobbyClientMessage`] back to the specific
+/// client that sent the ping.
+/// On a client: sends a [`LobbyMessage`] which routes to the host.
+pub(crate) fn respond_to_pings(
+    mut commands: Commands,
+    mut messages: MessageReader<ReceivedEnsembleMessage<EnsemblePing>>,
+    host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
+    client_lobby: Option<Single<Entity, (With<Lobby>, Without<Host>)>>,
+    lobby_clients: Query<(Entity, &LobbyClientPlayerUuid), With<LobbyClient>>,
 ) {
     for message in messages.read() {
         let Some(sender) = message.sender else {
             continue;
         };
-        let pong = WebrtcPong {
+        let pong = EnsemblePong {
             timestamp: message.message.timestamp,
         };
-        let packet = encode_ensemble_message(&registry, &pong);
-        socket.send(packet.into_boxed_slice(), sender);
+
+        if host_lobby.is_some() {
+            // Host: respond to the specific client that sent this ping
+            if let Some((client_entity, _)) =
+                lobby_clients.iter().find(|(_, uuid)| uuid.0 == sender)
+            {
+                let pong = pong;
+                commands
+                    .entity(client_entity)
+                    .trigger(move |entity| LobbyClientMessage {
+                        entity,
+                        message: pong,
+                    });
+            }
+        } else if let Some(lobby) = client_lobby.as_ref() {
+            // Client: respond to host via lobby message
+            commands
+                .entity(**lobby)
+                .trigger(move |entity| LobbyMessage {
+                    entity,
+                    message: pong,
+                });
+        }
     }
 }
 
@@ -95,13 +104,13 @@ fn respond_to_pings(
 ///
 /// On the host: updates `PeerRtt` on the `LobbyClient` entity for that peer.
 /// On clients: updates `PeerRtt` on the lobby entity itself.
-fn receive_pongs(
+pub(crate) fn receive_pongs(
     mut commands: Commands,
-    mut messages: MessageReader<ReceivedEnsembleMessage<WebrtcPong>>,
+    mut messages: MessageReader<ReceivedEnsembleMessage<EnsemblePong>>,
     time: Res<Time>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
     client_lobby: Option<Single<Entity, (With<Lobby>, Without<Host>)>>,
-    lobby_clients: Query<(Entity, &LobbyClientWebrtcUuid, Option<&PeerRtt>), With<LobbyClient>>,
+    lobby_clients: Query<(Entity, &LobbyClientPlayerUuid, Option<&PeerRtt>), With<LobbyClient>>,
     client_lobby_rtt: Query<Option<&PeerRtt>, (With<Lobby>, Without<Host>)>,
 ) {
     let now = time.elapsed_secs_f64();
@@ -132,10 +141,7 @@ fn receive_pongs(
 
         // Client side: store on the lobby entity
         if let Some(lobby_entity) = client_lobby.as_ref() {
-            let existing = client_lobby_rtt
-                .get(**lobby_entity)
-                .ok()
-                .flatten();
+            let existing = client_lobby_rtt.get(**lobby_entity).ok().flatten();
             let smoothed = match existing {
                 Some(prev) => 0.8 * prev.0 + 0.2 * rtt,
                 None => rtt,

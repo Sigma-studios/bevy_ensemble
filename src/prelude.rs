@@ -27,6 +27,9 @@ pub use crate::{
     // Ownership
     PlayerOwned, PlayerOwnedEntities,
 
+    // Ping
+    PeerRtt,
+
     // Messages & events
     EnsembleAppExt, LobbyMessage, ReceivedEnsembleMessage, StartHosting,
 };
