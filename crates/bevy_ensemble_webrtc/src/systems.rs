@@ -1,8 +1,8 @@
 use bevy::prelude::*;
 use bevy_ensemble::{
-    Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipant,
-    LobbyParticipantOf, LocalMultiplayerPlayerId, PendingLobby, PublicLobbies, PublicLobbyInfo,
-    RequestLobby, SerializedLobbyPacket, decode_ensemble_packet,
+    Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipant, LobbyParticipantOf,
+    LocalMultiplayerPlayerId, PendingLobby, PublicLobbies, PublicLobbyInfo, RemoveLobbyParticipant,
+    RequestLobby, SerializedLobbyPacket, decode_ensemble_packet, encode_ensemble_message,
 };
 use bevy_ensemble_sockets::PeerState;
 
@@ -60,7 +60,11 @@ pub(crate) fn apply_lobby_events(
                     commands
                         .entity(entity)
                         .remove::<(PendingLobby, RequestLobby)>()
-                        .insert((Lobby, LobbyWebrtcId(*lobby_id), LobbyWebrtcCode(code.clone())));
+                        .insert((
+                            Lobby,
+                            LobbyWebrtcId(*lobby_id),
+                            LobbyWebrtcCode(code.clone()),
+                        ));
                 }
             }
 
@@ -192,11 +196,9 @@ pub(crate) fn join_requested_lobbies(
 
     commands.spawn(PendingLobby);
 
-    let _ = lobby_conn
-        .command_tx
-        .send(ClientMessage::JoinLobby {
-            lobby_id: join_request.0,
-        });
+    let _ = lobby_conn.command_tx.send(ClientMessage::JoinLobby {
+        lobby_id: join_request.0,
+    });
 }
 
 pub(crate) fn join_requested_lobbies_by_code(
@@ -216,11 +218,9 @@ pub(crate) fn join_requested_lobbies_by_code(
 
     commands.spawn(PendingLobby);
 
-    let _ = lobby_conn
-        .command_tx
-        .send(ClientMessage::JoinLobbyByCode {
-            code: join_request.0,
-        });
+    let _ = lobby_conn.command_tx.send(ClientMessage::JoinLobbyByCode {
+        code: join_request.0,
+    });
 }
 
 pub(crate) fn refresh_lobby_list(
@@ -290,8 +290,7 @@ pub(crate) fn pump_socket_signals(
     }
 
     for outgoing in socket.drain_signals() {
-        let data = serde_json::to_string(&outgoing.signal)
-            .expect("Failed to serialize PeerSignal");
+        let data = serde_json::to_string(&outgoing.signal).expect("Failed to serialize PeerSignal");
         let _ = lobby_conn.command_tx.send(ClientMessage::Signal {
             receiver_uuid: outgoing.peer,
             data,
@@ -403,19 +402,34 @@ pub(crate) fn read_peer_messages(world: &mut World) {
     }
 }
 
-/// Disconnects the WebRTC peer connection when a [`LobbyClient`] is removed.
+/// Sends a removal notification and disconnects the WebRTC peer when a
+/// [`LobbyClient`] is removed.
 ///
-/// The core `on_lobby_client_removed` observer handles notifying both the kicked
-/// peer and remaining clients. This observer only needs to tear down the
-/// transport-level connection.
-pub(crate) fn on_lobby_client_removed(
+/// The removal packet must be sent directly here (not via deferred commands)
+/// because observer ordering is non-deterministic and `disconnect_peer` severs
+/// the connection immediately — any deferred message would arrive too late.
+pub(crate) fn disconnect_removed_lobby_client(
     trigger: On<Remove, LobbyClient>,
-    query: Query<&LobbyClientWebrtcUuid>,
+    query: Query<(&LobbyClientWebrtcUuid, &LobbyClientPlayerUuid)>,
+    registry: Res<bevy_ensemble::EnsembleMessageRegistry>,
     mut socket: ResMut<crate::EnsembleSocketRes>,
 ) {
-    let Ok(uuid) = query.get(trigger.event_target()) else {
+    let Ok((webrtc_uuid, player_uuid)) = query.get(trigger.event_target()) else {
         return;
     };
 
-    socket.disconnect_peer(uuid.0);
+    // We send the removal packet manually here because Bevy does not
+    // guarantee observer execution order. If this observer runs before the
+    // core `on_lobby_client_removed`, the peer will be disconnected before
+    // the deferred LobbyClientMessage ever flushes, so the kicked client
+    // would never learn it was removed.
+    // TODO: fix this once observer ordering lands (bevyengine/bevy#14890)
+    let packet = encode_ensemble_message(
+        &registry,
+        &RemoveLobbyParticipant {
+            player_uuid: player_uuid.0,
+        },
+    );
+    socket.send(packet.into_boxed_slice(), webrtc_uuid.0);
+    socket.disconnect_peer(webrtc_uuid.0);
 }
