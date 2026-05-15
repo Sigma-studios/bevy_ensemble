@@ -1,10 +1,10 @@
 use bevy::prelude::*;
 use bevy_ensemble::{
-    EnsembleAppExt, EnsemblePlugin, Host, Lobby, LobbyMessage, LobbyParticipant,
-    LobbyParticipantOf, LocalMultiplayerPlayerId, PendingLobby, PublicLobbies,
-    ReceivedEnsembleMessage, StartHosting,
+    EnsembleAppExt, EnsemblePlugin, Host, Lobby, LobbyClient, LobbyClientPlayerUuid,
+    LobbyMessage, LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId, PendingLobby,
+    PublicLobbies, ReceivedEnsembleMessage, StartHosting,
 };
-use bevy_ensemble_webrtc::{BevyEnsembleWebrtcPlugin, JoinWebrtcLobby, RefreshLobbyList};
+use bevy_ensemble_webrtc::{BevyEnsembleWebrtcPlugin, JoinWebrtcLobby, PeerRtt, RefreshLobbyList};
 use serde::{Deserialize, Serialize};
 
 const MOVE_SPEED: f32 = 200.0;
@@ -19,6 +19,19 @@ const PLAYER_COLORS: &[Color] = &[
     Color::srgb(1.0, 0.5, 0.0),
     Color::srgb(0.0, 1.0, 0.8),
     Color::srgb(1.0, 0.4, 0.7),
+];
+
+const NUMBER_KEYS: &[KeyCode] = &[
+    KeyCode::Digit1,
+    KeyCode::Digit2,
+    KeyCode::Digit3,
+    KeyCode::Digit4,
+    KeyCode::Digit5,
+    KeyCode::Digit6,
+    KeyCode::Digit7,
+    KeyCode::Digit8,
+    KeyCode::Digit9,
+    KeyCode::Digit0,
 ];
 
 fn player_color(player_uuid: u128) -> Color {
@@ -54,7 +67,7 @@ impl Plugin for CircleSyncPlugin {
                 Update,
                 (
                     handle_h_key,
-                    handle_j_key,
+                    handle_number_keys,
                     handle_r_key,
                     handle_escape_key,
                     update_menu_text,
@@ -102,7 +115,7 @@ fn setup(mut commands: Commands) {
     commands.spawn(Camera2d);
     commands.spawn((
         MenuText,
-        Text::new("Press H to host\nPress R to refresh lobbies\nPress J to join first lobby"),
+        Text::new("Press H to host\nPress R to refresh lobbies\nPress 1-0 to join a lobby"),
         Node {
             align_self: AlignSelf::Center,
             justify_self: JustifySelf::Center,
@@ -120,31 +133,70 @@ fn update_menu_text(
     client_lobbies: Query<(), (With<Lobby>, Without<Host>)>,
     lobby_list: Option<Res<PublicLobbies>>,
     participants: Query<(&LobbyParticipant, &LobbyParticipantOf)>,
+    lobby_clients: Query<(&LobbyClientPlayerUuid, Option<&PeerRtt>), With<LobbyClient>>,
+    lobby_rtt: Query<Option<&PeerRtt>, (With<Lobby>, Without<Host>)>,
     lobbies: Query<Entity, With<Lobby>>,
 ) {
     let Ok((mut text, mut vis)) = menu.single_mut() else {
         return;
     };
 
-    let in_lobby = !host_lobbies.is_empty() || !client_lobbies.is_empty();
+    let is_host = !host_lobbies.is_empty();
+    let in_lobby = is_host || !client_lobbies.is_empty();
 
     if in_lobby {
-        // Show participant roster in top-left
         *vis = Visibility::Visible;
         let lobby_entity = lobbies.iter().next().unwrap();
         let mut lines = vec!["Players:".to_string()];
-        for (p, pof) in participants.iter() {
-            if pof.0 != lobby_entity {
-                continue;
+
+        let mut players: Vec<(u128, bool)> = participants
+            .iter()
+            .filter(|(_, pof)| pof.0 == lobby_entity)
+            .map(|(p, _)| (p.player_uuid, p.is_host))
+            .collect();
+        players.sort_by_key(|(uuid, _)| *uuid);
+
+        let mut kick_index = 0usize;
+        for (uuid, participant_is_host) in &players {
+            let mut line = String::from("  ");
+
+            if is_host && !participant_is_host {
+                let key = if kick_index < 9 {
+                    kick_index + 1
+                } else {
+                    0
+                };
+                line.push_str(&format!("[{}] ", key));
+                kick_index += 1;
             }
-            let mut line = format!("  Player {}", p.player_uuid % 10000);
-            if p.is_host {
+
+            line.push_str(&format!("Player {}", uuid % 10000));
+            if *participant_is_host {
                 line.push_str(" (Host)");
             }
+
+            // Show ping
+            if is_host && !participant_is_host {
+                if let Some((_, rtt)) = lobby_clients.iter().find(|(id, _)| id.0 == *uuid) {
+                    if let Some(rtt) = rtt {
+                        line.push_str(&format!(" - {:.0}ms", rtt.0 * 1000.0));
+                    }
+                }
+            } else if !is_host && *participant_is_host {
+                if let Ok(Some(rtt)) = lobby_rtt.get(lobby_entity) {
+                    line.push_str(&format!(" - {:.0}ms", rtt.0 * 1000.0));
+                }
+            }
+
             lines.push(line);
         }
+
         lines.push(String::new());
-        lines.push("WASD to move | Escape to leave".into());
+        let mut controls = "WASD to move | Escape to leave".to_string();
+        if is_host {
+            controls.push_str(" | 1-0 to kick");
+        }
+        lines.push(controls);
         **text = lines.join("\n");
         return;
     }
@@ -158,25 +210,29 @@ fn update_menu_text(
     // Show main menu
     *vis = Visibility::Visible;
     let mut menu_str =
-        "Press H to host\nPress R to refresh lobbies\nPress J to join first lobby".to_string();
+        "Press H to host\nPress R to refresh lobbies\nPress 1-0 to join a lobby".to_string();
 
     if let Some(lobby_list) = &lobby_list {
         if lobby_list.0.is_empty() {
             menu_str.push_str("\n\nNo lobbies available");
         } else {
             menu_str.push_str("\n\nAvailable lobbies:");
-            for lobby in &lobby_list.0 {
+            for (i, lobby) in lobby_list.0.iter().enumerate() {
+                let key = if i < 9 { i + 1 } else { 0 };
                 menu_str.push_str(&format!(
-                    "\n  {} - {}/{} players",
-                    lobby.host_name, lobby.player_count, lobby.max_players,
+                    "\n  [{}] {} - {}/{} players",
+                    key, lobby.host_name, lobby.player_count, lobby.max_players,
                 ));
+                if i >= 9 {
+                    break;
+                }
             }
         }
     }
     **text = menu_str;
 }
 
-// -- Lobby management (same pattern as minimal_lobby) --
+// -- Lobby management --
 
 fn handle_h_key(
     keyboard_input: Res<ButtonInput<KeyCode>>,
@@ -194,24 +250,52 @@ fn handle_h_key(
     start_hosting.write(StartHosting);
 }
 
-fn handle_j_key(
+fn handle_number_keys(
+    mut commands: Commands,
     keyboard_input: Res<ButtonInput<KeyCode>>,
     lobby_list: Option<Res<PublicLobbies>>,
     mut join_writer: MessageWriter<JoinWebrtcLobby>,
     existing_lobbies: Query<(), With<Lobby>>,
     pending_lobbies: Query<(), With<PendingLobby>>,
+    host_lobbies: Query<Entity, (With<Lobby>, With<Host>)>,
+    participants: Query<(&LobbyParticipant, &LobbyParticipantOf)>,
+    lobby_clients: Query<(Entity, &LobbyClientPlayerUuid), With<LobbyClient>>,
 ) {
-    if !keyboard_input.just_pressed(KeyCode::KeyJ) {
+    let Some(pressed_index) = NUMBER_KEYS
+        .iter()
+        .position(|k| keyboard_input.just_pressed(*k))
+    else {
+        return;
+    };
+
+    // In a host lobby: kick the nth non-host participant
+    if let Some(host_lobby) = host_lobbies.iter().next() {
+        let mut kickable: Vec<u128> = participants
+            .iter()
+            .filter(|(p, pof)| pof.0 == host_lobby && !p.is_host)
+            .map(|(p, _)| p.player_uuid)
+            .collect();
+        kickable.sort();
+
+        if let Some(&target_uuid) = kickable.get(pressed_index) {
+            if let Some((client_entity, _)) = lobby_clients
+                .iter()
+                .find(|(_, uuid)| uuid.0 == target_uuid)
+            {
+                commands.entity(client_entity).try_despawn();
+            }
+        }
         return;
     }
+
+    // Not in a lobby: join the nth available lobby
     if !existing_lobbies.is_empty() || !pending_lobbies.is_empty() {
         return;
     }
     let Some(lobby_list) = lobby_list else { return };
-    let Some(first) = lobby_list.0.first() else {
-        return;
-    };
-    join_writer.write(JoinWebrtcLobby(first.lobby_id));
+    if let Some(lobby) = lobby_list.0.get(pressed_index) {
+        join_writer.write(JoinWebrtcLobby(lobby.lobby_id));
+    }
 }
 
 fn handle_r_key(
@@ -257,7 +341,6 @@ fn spawn_local_circle(
     if lobbies.is_empty() {
         return;
     }
-    // Don't spawn if we already have a circle for the local player
     if existing_circles
         .iter()
         .any(|c| c.0 == local_player.0)
@@ -306,7 +389,6 @@ fn handle_wasd_input(
     }
     let delta = direction.normalize() * MOVE_SPEED * time.delta_secs();
 
-    // Move local circle
     let Some((_, mut transform)) = circles
         .iter_mut()
         .find(|(c, _)| c.0 == local_player.0)
@@ -319,9 +401,7 @@ fn handle_wasd_input(
     let pos_x = transform.translation.x;
     let pos_y = transform.translation.y;
 
-    // Send position to network
     if let Some(host_lobby) = host_lobbies.iter().next() {
-        // We are host: broadcast our position to all clients
         let player_uuid = local_player.0;
         commands
             .entity(host_lobby)
@@ -334,7 +414,6 @@ fn handle_wasd_input(
                 },
             });
     } else if let Some(client_lobby) = client_lobbies.iter().next() {
-        // We are client: send our position to host
         commands
             .entity(client_lobby)
             .trigger(move |entity| LobbyMessage::<MoveIntent> {
@@ -347,8 +426,6 @@ fn handle_wasd_input(
     }
 }
 
-/// Host receives MoveIntent from clients, updates their circle locally,
-/// and broadcasts PlayerPosition to all clients.
 fn relay_moves_on_host(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -361,7 +438,6 @@ fn relay_moves_on_host(
         return;
     };
 
-    // Track spawns within this system run to avoid duplicates from deferred commands
     let mut spawned_this_frame = Vec::new();
 
     for message in messages.read() {
@@ -372,7 +448,6 @@ fn relay_moves_on_host(
         let x = message.message.x;
         let y = message.message.y;
 
-        // Update (or spawn) the client's circle on the host
         if let Some((_, mut transform)) = circles
             .iter_mut()
             .find(|(c, _)| c.0 == player_uuid)
@@ -390,7 +465,6 @@ fn relay_moves_on_host(
             spawned_this_frame.push(player_uuid);
         }
 
-        // Broadcast to all clients
         commands
             .entity(host_lobby)
             .trigger(move |entity| LobbyMessage::<PlayerPosition> {
@@ -404,7 +478,6 @@ fn relay_moves_on_host(
     }
 }
 
-/// Receive PlayerPosition broadcasts: spawn or update remote player circles.
 fn receive_player_positions(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -413,20 +486,17 @@ fn receive_player_positions(
     mut messages: MessageReader<ReceivedEnsembleMessage<PlayerPosition>>,
     mut circles: Query<(&PlayerCircle, &mut Transform)>,
 ) {
-    // Track spawns within this system run to avoid duplicates from deferred commands
     let mut spawned_this_frame = Vec::new();
 
     for message in messages.read() {
         let pos = &message.message;
 
-        // Skip our own position — we already moved locally
         if let Some(ref local) = local_player {
             if pos.player_uuid == local.0 {
                 continue;
             }
         }
 
-        // Find existing circle or spawn a new one
         if let Some((_, mut transform)) = circles
             .iter_mut()
             .find(|(c, _)| c.0 == pos.player_uuid)
@@ -446,7 +516,6 @@ fn receive_player_positions(
     }
 }
 
-/// Remove all circles when we leave the lobby (Escape or host disconnect).
 fn cleanup_circles_on_lobby_leave(
     mut commands: Commands,
     lobbies: Query<(), Or<(With<Lobby>, With<PendingLobby>)>>,
@@ -455,13 +524,11 @@ fn cleanup_circles_on_lobby_leave(
     if !lobbies.is_empty() || circles.is_empty() {
         return;
     }
-    // No lobby exists but circles remain — clean them up
     for (entity, _) in circles.iter() {
         commands.entity(entity).try_despawn();
     }
 }
 
-/// On the host, remove circles for players who disconnected.
 fn cleanup_disconnected_players(
     mut commands: Commands,
     host_lobbies: Query<Entity, (With<Lobby>, With<Host>)>,
@@ -480,7 +547,6 @@ fn cleanup_disconnected_players(
         .collect();
 
     for (entity, circle) in circles.iter() {
-        // Never remove local player's circle
         if let Some(ref local) = local_player {
             if circle.0 == local.0 {
                 continue;

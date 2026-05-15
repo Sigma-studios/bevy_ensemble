@@ -236,11 +236,15 @@ pub(crate) fn refresh_lobby_list(
 }
 
 /// Poll the EnsembleSocket for peer connect/disconnect events.
-/// Despawns lobby client entities when a peer disconnects.
+///
+/// - On the **host**: despawns lobby client entities when a peer disconnects.
+/// - On a **client**: despawns the lobby entity when the host peer disconnects
+///   (e.g. kicked or host left), which triggers the full leave/cleanup flow.
 pub(crate) fn poll_socket_peers(
     mut commands: Commands,
     mut socket: ResMut<crate::EnsembleSocketRes>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
+    client_lobbies: Query<Entity, (Or<(With<Lobby>, With<PendingLobby>)>, Without<Host>)>,
     lobby_clients: Query<
         (Entity, &LobbyClientWebrtcUuid),
         Or<(With<LobbyClient>, With<PendingWebrtcLobbyClient>)>,
@@ -254,16 +258,22 @@ pub(crate) fn poll_socket_peers(
             PeerState::Disconnected => {
                 info!("Peer disconnected: {peer_id}");
 
-                if host_lobby.is_none() {
+                // Host side: despawn the lobby client for this peer
+                if host_lobby.is_some() {
+                    if let Some((client_entity, _)) = lobby_clients
+                        .iter()
+                        .find(|(_, client_uuid)| client_uuid.0 == peer_id)
+                    {
+                        commands.entity(client_entity).try_despawn();
+                    }
                     continue;
                 }
 
-                if let Some((client_entity, _)) = lobby_clients
-                    .iter()
-                    .find(|(_, client_uuid)| client_uuid.0 == peer_id)
-                {
-                    commands.entity(client_entity).try_despawn();
+                // Client side: the host disconnected us — leave the lobby
+                for entity in client_lobbies.iter() {
+                    commands.entity(entity).try_despawn();
                 }
+                commands.remove_resource::<LocalMultiplayerPlayerId>();
             }
         }
     }
@@ -479,20 +489,34 @@ pub(crate) fn promote_client_lobby_on_host_handshake(
     }
 }
 
-/// Disconnects the WebRTC peer when a [`LobbyClient`] entity is removed.
+/// Sends a [`RemoveLobbyParticipant`] directly to the kicked peer then
+/// disconnects the WebRTC connection.
 ///
-/// This ensures the transport is cleaned up whether the client disconnected
-/// naturally or was kicked by despawning their entity.
+/// The core `on_lobby_client_removed` observer broadcasts `RemoveLobbyParticipant`
+/// to *remaining* clients, but the kicked client's `LobbyClient` is already gone
+/// by that point. This observer sends it directly via the socket so the kicked
+/// client knows to leave.
 pub(crate) fn on_lobby_client_removed(
     trigger: On<Remove, LobbyClient>,
     query: Query<&LobbyClientWebrtcUuid>,
+    registry: Res<bevy_ensemble::EnsembleMessageRegistry>,
     mut socket: ResMut<crate::EnsembleSocketRes>,
 ) {
     let Ok(uuid) = query.get(trigger.event_target()) else {
         return;
     };
+
+    let packet = encode_ensemble_message(
+        &registry,
+        &bevy_ensemble::RemoveLobbyParticipant {
+            player_uuid: uuid.0,
+        },
+    );
+    socket.send(packet.into_boxed_slice(), uuid.0);
+
     socket.disconnect_peer(uuid.0);
 }
+
 
 pub(crate) fn promote_host_client_on_client_handshake(
     mut commands: Commands,
