@@ -6,6 +6,10 @@ pub mod server;
 #[cfg(feature = "client")]
 mod connection;
 #[cfg(feature = "client")]
+mod handshake;
+#[cfg(feature = "client")]
+mod ping;
+#[cfg(feature = "client")]
 mod systems;
 
 
@@ -13,6 +17,8 @@ mod systems;
 use bevy::prelude::*;
 #[cfg(feature = "client")]
 use bevy_ensemble::EnsembleAppExt;
+#[cfg(feature = "client")]
+pub use ping::PeerRtt;
 
 /// Bevy plugin for WebRTC P2P networking via a signaling server.
 ///
@@ -72,36 +78,6 @@ pub struct JoinWebrtcLobbyByCode(pub String);
 #[derive(Component)]
 pub struct LobbyWebrtcCode(pub String);
 
-/// Internal handshake message exchanged over data channels to confirm readiness.
-#[cfg(feature = "client")]
-#[derive(Message, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct WebrtcReadyHandshake {
-    pub from_host: bool,
-}
-
-/// Internal ping message sent over data channels to measure RTT.
-#[cfg(feature = "client")]
-#[derive(Message, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct WebrtcPing {
-    /// Monotonic timestamp (seconds) on the sender's clock when the ping was sent.
-    pub timestamp: f64,
-}
-
-/// Internal pong response echoing back the original ping timestamp.
-#[cfg(feature = "client")]
-#[derive(Message, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct WebrtcPong {
-    /// The original timestamp from the ping, echoed back unchanged.
-    pub timestamp: f64,
-}
-
-/// Round-trip time to a connected peer, in seconds.
-///
-/// Added to `LobbyClient` entities on the host (one per peer) and to the
-/// lobby entity on clients (single connection to the host).
-#[cfg(feature = "client")]
-#[derive(Component, Debug, Clone, Copy)]
-pub struct PeerRtt(pub f64);
 
 /// Newtype wrapper around [`bevy_ensemble_sockets::EnsembleSocket`] so it can be used as a Bevy Resource.
 #[cfg(feature = "client")]
@@ -187,9 +163,8 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
             .add_message::<JoinWebrtcLobby>()
             .add_message::<JoinWebrtcLobbyByCode>()
             .add_message::<RefreshLobbyList>()
-            .register_ensemble_message_type::<WebrtcReadyHandshake>()
-            .register_ensemble_message_type::<WebrtcPing>()
-            .register_ensemble_message_type::<WebrtcPong>()
+            .add_plugins(ping::PingPlugin)
+            .register_ensemble_message_type::<handshake::WebrtcReadyHandshake>()
             .add_systems(
                 Update,
                 (
@@ -207,14 +182,11 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
                     systems::refresh_lobby_list,
                     systems::poll_socket_peers,
                     systems::pump_socket_signals,
-                    systems::send_client_handshakes,
-                    systems::send_host_handshakes,
-                    systems::promote_client_lobby_on_host_handshake,
-                    systems::promote_host_client_on_client_handshake,
+                    handshake::send_client_handshakes,
+                    handshake::send_host_handshakes,
+                    handshake::promote_client_lobby_on_host_handshake,
+                    handshake::promote_host_client_on_client_handshake,
                     systems::detect_lobby_leave,
-                    systems::send_pings,
-                    systems::respond_to_pings,
-                    systems::receive_pongs,
                 ),
             )
             .add_systems(Update, systems::read_peer_messages)
