@@ -9,9 +9,12 @@ use bevy_ensemble_sockets::PeerState;
 
 use crate::connection::{LobbyConnection, LobbyEvent};
 use crate::protocol::ClientMessage;
+const PING_INTERVAL_SECS: f32 = 1.0;
+
 use crate::{
     JoinWebrtcLobby, JoinWebrtcLobbyByCode, LobbyClientWebrtcUuid, LobbyWebrtcCode, LobbyWebrtcId,
-    PendingWebrtcLobbyClient, RefreshLobbyList, WebrtcReadyHandshake,
+    PeerRtt, PendingWebrtcLobbyClient, RefreshLobbyList, WebrtcPing, WebrtcPong,
+    WebrtcReadyHandshake,
 };
 
 pub(crate) fn flush_lobby_events(
@@ -527,5 +530,107 @@ pub(crate) fn promote_host_client_on_client_handshake(
             .entity(entity)
             .remove::<PendingWebrtcLobbyClient>()
             .insert(LobbyClient);
+    }
+}
+
+/// Both host and client send pings to all connected peers every 1 second.
+pub(crate) fn send_pings(
+    registry: Res<bevy_ensemble::EnsembleMessageRegistry>,
+    socket: ResMut<crate::EnsembleSocketRes>,
+    lobbies: Query<(), Or<(With<Lobby>, With<PendingLobby>)>>,
+    time: Res<Time>,
+    mut cooldown: Local<f32>,
+) {
+    *cooldown -= time.delta_secs();
+    if *cooldown > 0.0 {
+        return;
+    }
+    *cooldown = PING_INTERVAL_SECS;
+
+    if lobbies.is_empty() {
+        return;
+    }
+
+    let ping = WebrtcPing {
+        timestamp: time.elapsed_secs_f64(),
+    };
+    let packet = encode_ensemble_message(&registry, &ping);
+    let data: Box<[u8]> = packet.into_boxed_slice();
+
+    let peers: Vec<u128> = socket.connected_peers().collect();
+    for peer in peers {
+        socket.send(data.clone(), peer);
+    }
+}
+
+/// When we receive a ping, immediately echo it back as a pong.
+pub(crate) fn respond_to_pings(
+    registry: Res<bevy_ensemble::EnsembleMessageRegistry>,
+    socket: ResMut<crate::EnsembleSocketRes>,
+    mut messages: MessageReader<bevy_ensemble::ReceivedEnsembleMessage<WebrtcPing>>,
+) {
+    for message in messages.read() {
+        let Some(sender) = message.sender else {
+            continue;
+        };
+        let pong = WebrtcPong {
+            timestamp: message.message.timestamp,
+        };
+        let packet = encode_ensemble_message(&registry, &pong);
+        socket.send(packet.into_boxed_slice(), sender);
+    }
+}
+
+/// When we receive a pong, compute RTT and store it.
+///
+/// On the host: updates `PeerRtt` on the `LobbyClient` entity for that peer.
+/// On clients: updates `PeerRtt` on the lobby entity itself.
+pub(crate) fn receive_pongs(
+    mut commands: Commands,
+    mut messages: MessageReader<bevy_ensemble::ReceivedEnsembleMessage<WebrtcPong>>,
+    time: Res<Time>,
+    host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
+    client_lobby: Option<Single<Entity, (With<Lobby>, Without<Host>)>>,
+    lobby_clients: Query<(Entity, &LobbyClientWebrtcUuid, Option<&PeerRtt>), With<LobbyClient>>,
+    client_lobby_rtt: Query<Option<&PeerRtt>, (With<Lobby>, Without<Host>)>,
+) {
+    let now = time.elapsed_secs_f64();
+
+    for message in messages.read() {
+        let rtt = now - message.message.timestamp;
+        if rtt < 0.0 {
+            continue;
+        }
+
+        let Some(sender) = message.sender else {
+            continue;
+        };
+
+        // Host side: find the LobbyClient entity for this sender
+        if host_lobby.is_some() {
+            if let Some((entity, _, existing_rtt)) = lobby_clients
+                .iter()
+                .find(|(_, uuid, _)| uuid.0 == sender)
+            {
+                let smoothed = match existing_rtt {
+                    Some(prev) => 0.8 * prev.0 + 0.2 * rtt,
+                    None => rtt,
+                };
+                commands.entity(entity).insert(PeerRtt(smoothed));
+            }
+        }
+
+        // Client side: store on the lobby entity
+        if let Some(lobby_entity) = client_lobby.as_ref() {
+            let existing = client_lobby_rtt
+                .get(**lobby_entity)
+                .ok()
+                .flatten();
+            let smoothed = match existing {
+                Some(prev) => 0.8 * prev.0 + 0.2 * rtt,
+                None => rtt,
+            };
+            commands.entity(**lobby_entity).insert(PeerRtt(smoothed));
+        }
     }
 }
