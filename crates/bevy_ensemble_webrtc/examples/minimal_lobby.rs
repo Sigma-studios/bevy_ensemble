@@ -1,12 +1,11 @@
 use bevy::prelude::*;
 use bevy_ensemble::{
-    EnsembleAppExt, EnsemblePlugin, Host, Lobby, LobbyClient, LobbyClientPlayerUuid,
-    LobbyMessage, LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId, PeerRtt,
-    PendingLobby, PublicLobbies, ReceivedEnsembleMessage, StartHosting,
+    BroadcastLobbyMessage, EnsembleAppExt, EnsemblePlugin, Host, Lobby, LobbyBroadcastAppExt,
+    LobbyBroadcastPlugin, LobbyClient, LobbyClientPlayerUuid, LobbyMessage, LobbyParticipant,
+    LobbyParticipantOf, LocalMultiplayerPlayerId, PeerRtt, PendingLobby, PublicLobbies,
+    ReceivedEnsembleMessage, StartHosting,
 };
-use bevy_ensemble_webrtc::{
-    BevyEnsembleWebrtcPlugin, JoinWebrtcLobby, RefreshLobbyList,
-};
+use bevy_ensemble_webrtc::{BevyEnsembleWebrtcPlugin, JoinWebrtcLobby, RefreshLobbyList};
 use bevy_immediate::{BevyImmediatePlugin, ImmCtx, ui::CapsUi};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -33,6 +32,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(EnsemblePlugin)
+        .add_plugins(LobbyBroadcastPlugin)
         .add_plugins(BevyEnsembleWebrtcPlugin {
             server_url,
             display_name: "Player".into(),
@@ -48,32 +48,35 @@ struct MinimalLobbyExamplePlugin;
 impl Plugin for MinimalLobbyExamplePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ChatLog>()
-            .register_ensemble_message_type::<HelloIntent>()
-            .register_ensemble_message_type::<DisplayChatMessage>()
+            .register_broadcast_message::<ChatMessage>()
+            .register_ensemble_message_type::<WaveAction>()
             .add_systems(Startup, setup_camera)
             .add_systems(
                 Update,
                 (
                     render_ui,
                     handle_h_key,
+                    handle_t_key,
                     handle_number_keys,
                     handle_r_key,
-                    relay_hello_messages_on_host,
-                    receive_display_chat_messages,
+                    receive_chat_messages,
+                    receive_wave_actions,
                     handle_escape_key,
                 ),
             );
     }
 }
 
+/// A chat message broadcast to all lobby members via [`BroadcastLobbyMessage`].
 #[derive(Message, Clone, Debug, Serialize, Deserialize)]
-struct HelloIntent;
-
-#[derive(Message, Clone, Debug, Serialize, Deserialize)]
-struct DisplayChatMessage {
+struct ChatMessage {
     sender_name: String,
     text: String,
 }
+
+/// A wave action sent through the normal host-relayed [`LobbyMessage`] pipeline.
+#[derive(Message, Clone, Debug, Serialize, Deserialize)]
+struct WaveAction;
 
 #[derive(Resource, Default)]
 struct ChatLog(VecDeque<String>);
@@ -167,9 +170,9 @@ fn render_ui(
     };
 
     let mut lobby_info_text = format!("Players:\n{}", roster_text);
-    lobby_info_text.push_str("\n\nPress H to send hello\nPress Escape to leave lobby");
+    lobby_info_text.push_str("\n\nPress H to send hello (broadcast)\nPress Escape to leave lobby");
     if is_host {
-        lobby_info_text.push_str("\nPress 1-0 to kick a player");
+        lobby_info_text.push_str("\nPress T to wave (host-only action)\nPress 1-0 to kick a player");
     }
     root.ch_id("lobby_info").on_change_insert(true, move || {
         (
@@ -200,43 +203,45 @@ fn handle_h_key(
     keyboard_input: Res<ButtonInput<KeyCode>>,
     local_player: Option<Res<LocalMultiplayerPlayerId>>,
     mut start_hosting: MessageWriter<StartHosting>,
-    host_lobbies: Query<Entity, (With<Lobby>, With<Host>)>,
-    client_lobbies: Query<Entity, (With<Lobby>, Without<Host>)>,
+    lobbies: Query<Entity, With<Lobby>>,
     pending_lobbies: Query<(), With<PendingLobby>>,
-    mut chat_log: ResMut<ChatLog>,
 ) {
     if !keyboard_input.just_pressed(KeyCode::KeyH) {
         return;
     }
 
-    if let Some(host_lobby) = host_lobbies.iter().next() {
+    if let Some(lobby) = lobbies.iter().next() {
         let sender_name = local_player
             .as_ref()
             .map(|p| format!("Player {}", p.0 % 10000))
             .unwrap_or_else(|| "Me".to_string());
-        let message = DisplayChatMessage {
-            sender_name: sender_name.clone(),
-            text: "Hello".to_string(),
-        };
-        push_chat_message(&mut chat_log, &sender_name, "Hello");
         commands
-            .entity(host_lobby)
-            .trigger(move |entity| LobbyMessage::<DisplayChatMessage> { entity, message });
-        return;
-    }
-
-    if let Some(client_lobby) = client_lobbies.iter().next() {
-        commands
-            .entity(client_lobby)
-            .trigger(|entity| LobbyMessage::<HelloIntent> {
-                entity,
-                message: HelloIntent,
-            });
+            .entity(lobby)
+            .trigger(|entity| BroadcastLobbyMessage::new(entity, ChatMessage {
+                sender_name,
+                text: "Hello".to_string(),
+            }));
         return;
     }
 
     if pending_lobbies.is_empty() {
         start_hosting.write(StartHosting);
+    }
+}
+
+fn handle_t_key(
+    mut commands: Commands,
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    lobbies: Query<Entity, (With<Lobby>, With<Host>)>,
+) {
+    if !keyboard_input.just_pressed(KeyCode::KeyT) {
+        return;
+    }
+
+    if let Some(lobby) = lobbies.iter().next() {
+        commands
+            .entity(lobby)
+            .trigger(|entity| LobbyMessage::new(entity, WaveAction));
     }
 }
 
@@ -297,37 +302,8 @@ fn handle_r_key(
     }
 }
 
-fn relay_hello_messages_on_host(
-    mut commands: Commands,
-    host_lobbies: Query<Entity, (With<Lobby>, With<Host>)>,
-    mut messages: MessageReader<ReceivedEnsembleMessage<HelloIntent>>,
-    mut chat_log: ResMut<ChatLog>,
-) {
-    let Some(host_lobby) = host_lobbies.iter().next() else {
-        return;
-    };
-
-    for message in messages.read() {
-        let sender_name = message
-            .sender
-            .map(|uuid| format!("Player {}", uuid % 10000))
-            .unwrap_or_else(|| "Unknown".to_string());
-        let display = DisplayChatMessage {
-            sender_name,
-            text: "Hello".to_string(),
-        };
-        push_chat_message(&mut chat_log, &display.sender_name, &display.text);
-        commands
-            .entity(host_lobby)
-            .trigger(move |entity| LobbyMessage::<DisplayChatMessage> {
-                entity,
-                message: display,
-            });
-    }
-}
-
-fn receive_display_chat_messages(
-    mut messages: MessageReader<ReceivedEnsembleMessage<DisplayChatMessage>>,
+fn receive_chat_messages(
+    mut messages: MessageReader<ReceivedEnsembleMessage<ChatMessage>>,
     mut chat_log: ResMut<ChatLog>,
 ) {
     for message in messages.read() {
@@ -336,6 +312,19 @@ fn receive_display_chat_messages(
             &message.message.sender_name,
             &message.message.text,
         );
+    }
+}
+
+fn receive_wave_actions(
+    mut messages: MessageReader<ReceivedEnsembleMessage<WaveAction>>,
+    mut chat_log: ResMut<ChatLog>,
+) {
+    for message in messages.read() {
+        let sender_name = message
+            .sender
+            .map(|uuid| format!("Player {}", uuid % 10000))
+            .unwrap_or_else(|| "Unknown".to_string());
+        push_chat_message(&mut chat_log, &sender_name, "waves");
     }
 }
 

@@ -405,24 +405,18 @@ fn handle_wasd_input(
         let player_uuid = local_player.0;
         commands
             .entity(host_lobby)
-            .trigger(move |entity| LobbyMessage::<PlayerPosition> {
-                entity,
-                message: PlayerPosition {
-                    player_uuid,
-                    x: pos_x,
-                    y: pos_y,
-                },
-            });
+            .trigger(move |entity| LobbyMessage::new_unreliable(entity, PlayerPosition {
+                player_uuid,
+                x: pos_x,
+                y: pos_y,
+            }));
     } else if let Some(client_lobby) = client_lobbies.iter().next() {
         commands
             .entity(client_lobby)
-            .trigger(move |entity| LobbyMessage::<MoveIntent> {
-                entity,
-                message: MoveIntent {
-                    x: pos_x,
-                    y: pos_y,
-                },
-            });
+            .trigger(move |entity| LobbyMessage::new_unreliable(entity, MoveIntent {
+                x: pos_x,
+                y: pos_y,
+            }));
     }
 }
 
@@ -467,14 +461,11 @@ fn relay_moves_on_host(
 
         commands
             .entity(host_lobby)
-            .trigger(move |entity| LobbyMessage::<PlayerPosition> {
-                entity,
-                message: PlayerPosition {
-                    player_uuid,
-                    x,
-                    y,
-                },
-            });
+            .trigger(move |entity| LobbyMessage::new_unreliable(entity, PlayerPosition {
+                player_uuid,
+                x,
+                y,
+            }));
     }
 }
 

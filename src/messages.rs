@@ -9,7 +9,7 @@ use crate::{PlayerUUID, observers, registry::EnsembleMessageRegistry};
 ///   Use for gameplay-critical messages like chat, state sync, lobby management.
 /// - [`Unreliable`](SendMode::Unreliable): fire-and-forget with no delivery guarantee.
 ///   Use for frequently-updated, loss-tolerant data like position updates.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SendMode {
     #[default]
     Reliable,
@@ -145,10 +145,7 @@ pub struct ReceivedEnsembleMessage<T: EnsembleMessage> {
 /// ```rust,ignore
 /// fn send_chat(mut commands: Commands, lobby: Single<Entity, With<Lobby>>) {
 ///     let message = ChatMessage { text: "Hello!".into() };
-///     commands.entity(*lobby).trigger(move |entity| LobbyMessage {
-///         entity,
-///         message,
-///     });
+///     commands.entity(*lobby).trigger(move |entity| LobbyMessage::new(entity, message));
 /// }
 /// ```
 #[derive(EntityEvent, Debug)]
@@ -156,6 +153,24 @@ pub struct LobbyMessage<T: EnsembleMessage> {
     pub entity: Entity,
     pub message: T,
     pub send_mode: SendMode,
+}
+
+impl<T: EnsembleMessage> LobbyMessage<T> {
+    pub fn new(entity: Entity, message: T) -> Self {
+        Self {
+            entity,
+            message,
+            send_mode: SendMode::Reliable,
+        }
+    }
+
+    pub fn new_unreliable(entity: Entity, message: T) -> Self {
+        Self {
+            entity,
+            message,
+            send_mode: SendMode::Unreliable,
+        }
+    }
 }
 
 /// Entity event to send a serialized message through a specific client connection.
@@ -171,6 +186,24 @@ pub struct LobbyClientMessage<T: EnsembleMessage> {
     pub entity: Entity,
     pub message: T,
     pub send_mode: SendMode,
+}
+
+impl<T: EnsembleMessage> LobbyClientMessage<T> {
+    pub fn new(entity: Entity, message: T) -> Self {
+        Self {
+            entity,
+            message,
+            send_mode: SendMode::Reliable,
+        }
+    }
+
+    pub fn new_unreliable(entity: Entity, message: T) -> Self {
+        Self {
+            entity,
+            message,
+            send_mode: SendMode::Unreliable,
+        }
+    }
 }
 
 /// Entity event carrying a fully serialized network packet.

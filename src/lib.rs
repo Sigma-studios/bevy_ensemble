@@ -76,6 +76,7 @@
 
 use bevy::prelude::*;
 
+mod broadcast;
 mod components;
 mod messages;
 pub(crate) mod observers;
@@ -85,6 +86,7 @@ pub mod registry;
 mod systems;
 mod types;
 
+pub use broadcast::{BroadcastLobbyMessage, LobbyBroadcastAppExt, LobbyBroadcastPlugin};
 pub use components::*;
 pub use messages::*;
 pub use ping::PeerRtt;

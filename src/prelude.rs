@@ -10,7 +10,10 @@
 
 pub use crate::{
     // Plugin
-    EnsemblePlugin,
+    EnsemblePlugin, LobbyBroadcastPlugin,
+
+    // Broadcast
+    BroadcastLobbyMessage, LobbyBroadcastAppExt,
 
     // Identity
     LocalMultiplayerPlayerId, PlayerUUID,
