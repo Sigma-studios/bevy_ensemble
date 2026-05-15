@@ -1,9 +1,8 @@
 use bevy::prelude::*;
 use bevy_ensemble::{
-    EnsembleAppExt, Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyMessage,
-    LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId, PendingLobby,
-    RemoveLobbyParticipant, RequestLobby, SerializedLobbyPacket, decode_ensemble_packet,
-    encode_ensemble_message,
+    EnsembleAppExt, Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipantOf,
+    LocalMultiplayerPlayerId, PendingLobby, RequestLobby, SerializedLobbyPacket,
+    decode_ensemble_packet, encode_ensemble_message,
 };
 pub use bevy_steamworks::LobbyId;
 use bevy_steamworks::{
@@ -252,7 +251,6 @@ fn react_to_events(
         ),
         Or<(With<LobbyClient>, With<PendingSteamLobbyClient>)>,
     >,
-    participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
 ) {
     let local_steam_id = steam_client.user().steam_id();
 
@@ -337,12 +335,10 @@ fn react_to_events(
                                     &client_lobbies,
                                     update.lobby,
                                 );
-                            } else if let Some(ref lobby) = host_lobby {
+                            } else if host_lobby.is_some() {
                                 despawn_lobby_client_for_remote(
                                     &mut commands,
                                     &lobby_clients,
-                                    &participants,
-                                    **lobby,
                                     update.user_changed,
                                 );
                             }
@@ -371,12 +367,10 @@ fn react_to_events(
                         continue;
                     };
 
-                    if let Some(ref lobby) = host_lobby {
+                    if host_lobby.is_some() {
                         despawn_lobby_client_for_remote(
                             &mut commands,
                             &lobby_clients,
-                            &participants,
-                            **lobby,
                             remote,
                         );
                     } else {
@@ -623,34 +617,16 @@ fn despawn_lobby_client_for_remote(
         ),
         Or<(With<LobbyClient>, With<PendingSteamLobbyClient>)>,
     >,
-    participants: &Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
-    host_lobby: Entity,
     remote: SteamId,
 ) {
-    if let Some((client_entity, _, player_uuid, _)) = lobby_clients
+    if let Some((client_entity, _, _, _)) = lobby_clients
         .iter()
         .find(|(_, client_steam_id, _, _)| client_steam_id.0 == remote)
     {
-        commands
-            .entity(host_lobby)
-            .trigger(move |entity| LobbyMessage::<RemoveLobbyParticipant> {
-                entity,
-                message: RemoveLobbyParticipant {
-                    player_uuid: player_uuid.0,
-                },
-            });
-        if let Some((participant_entity, _, _)) =
-            participants
-                .iter()
-                .find(|(_, participant, participant_of)| {
-                    participant_of.0 == host_lobby && participant.player_uuid == player_uuid.0
-                })
-        {
-            commands.entity(participant_entity).try_despawn();
-        }
         commands.entity(client_entity).try_despawn();
     }
 }
+
 
 fn despawn_client_lobby_for_lost_connection(
     commands: &mut Commands,

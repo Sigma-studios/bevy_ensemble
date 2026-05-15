@@ -1,7 +1,8 @@
 use bevy::prelude::*;
 
 use crate::{
-    Host, Lobby, LobbyClient,
+    Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipant, LobbyParticipantOf,
+    RemoveLobbyParticipant,
     components::LobbyParticipants,
     messages::{EnsembleMessage, LobbyClientMessage, LobbyMessage, SerializedLobbyPacket},
     registry::{EnsembleMessageRegistry, encode_ensemble_message},
@@ -47,6 +48,46 @@ pub(crate) fn encode_lobby_message<T: EnsembleMessage>(
             entity,
             message: outgoing,
         });
+}
+
+/// Handles cleanup when a [`LobbyClient`] entity is removed.
+///
+/// On a host lobby, this broadcasts a [`RemoveLobbyParticipant`] message to
+/// remaining clients and despawns the corresponding [`LobbyParticipant`] entity.
+///
+/// This enables kicking a player by simply despawning their `LobbyClient` entity —
+/// the observer handles notifying other clients and cleaning up the participant roster.
+pub(crate) fn on_lobby_client_removed(
+    trigger: On<Remove, LobbyClient>,
+    query: Query<(&LobbyClientPlayerUuid, &LobbyParticipantOf)>,
+    host_lobbies: Query<(), (With<Lobby>, With<Host>)>,
+    participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
+    mut commands: Commands,
+) {
+    let Ok((player_uuid, participant_of)) = query.get(trigger.event_target()) else {
+        return;
+    };
+
+    let lobby = participant_of.0;
+    if host_lobbies.get(lobby).is_err() {
+        return;
+    }
+
+    let player_uuid = player_uuid.0;
+
+    if let Ok(mut lobby_commands) = commands.get_entity(lobby) {
+        lobby_commands.trigger(move |entity| LobbyMessage::<RemoveLobbyParticipant> {
+            entity,
+            message: RemoveLobbyParticipant { player_uuid },
+        });
+    }
+
+    if let Some((participant_entity, _, _)) = participants
+        .iter()
+        .find(|(_, p, pof)| pof.0 == lobby && p.player_uuid == player_uuid)
+    {
+        commands.entity(participant_entity).try_despawn();
+    }
 }
 
 /// Serializes a [`LobbyClientMessage`] into a [`SerializedLobbyPacket`].

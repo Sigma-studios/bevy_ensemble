@@ -189,6 +189,7 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
                 ),
             )
             .add_systems(Update, systems::read_peer_messages)
-            .add_observer(systems::send_serialized_lobby_packet);
+            .add_observer(systems::send_serialized_lobby_packet)
+            .add_observer(systems::on_lobby_client_removed);
     }
 }

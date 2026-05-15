@@ -1,8 +1,8 @@
 use bevy::prelude::*;
 use bevy_ensemble::{
-    Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyMessage, LobbyParticipant,
+    Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipant,
     LobbyParticipantOf, LocalMultiplayerPlayerId, PendingLobby, PublicLobbies, PublicLobbyInfo,
-    RemoveLobbyParticipant, RequestLobby, SerializedLobbyPacket, decode_ensemble_packet,
+    RequestLobby, SerializedLobbyPacket, decode_ensemble_packet,
     encode_ensemble_message,
 };
 use bevy_ensemble_sockets::PeerState;
@@ -116,33 +116,11 @@ pub(crate) fn apply_lobby_events(
                 let player_uuid = *player_uuid;
                 info!("Player left lobby: {player_uuid}");
 
-                // Disconnect the WebRTC peer
-                socket.disconnect_peer(player_uuid);
-
-                if let Some(lobby) = host_lobby.as_ref() {
-                    let host_entity = **lobby;
-
+                if host_lobby.is_some() {
                     if let Some((client_entity, _, _)) = lobby_clients
                         .iter()
                         .find(|(_, _, puuid)| puuid.0 == player_uuid)
                     {
-                        commands
-                            .entity(host_entity)
-                            .trigger(move |entity| LobbyMessage::<RemoveLobbyParticipant> {
-                                entity,
-                                message: RemoveLobbyParticipant {
-                                    player_uuid,
-                                },
-                            });
-
-                        if let Some((participant_entity, _, _)) =
-                            participants.iter().find(|(_, p, pof)| {
-                                pof.0 == host_entity && p.player_uuid == player_uuid
-                            })
-                        {
-                            commands.entity(participant_entity).try_despawn();
-                        }
-
                         commands.entity(client_entity).try_despawn();
                     }
                 }
@@ -261,10 +239,9 @@ pub(crate) fn poll_socket_peers(
     mut socket: ResMut<crate::EnsembleSocketRes>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
     lobby_clients: Query<
-        (Entity, &LobbyClientWebrtcUuid, &LobbyClientPlayerUuid),
+        (Entity, &LobbyClientWebrtcUuid),
         Or<(With<LobbyClient>, With<PendingWebrtcLobbyClient>)>,
     >,
-    participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
 ) {
     for (peer_id, state) in socket.update_peers() {
         match state {
@@ -274,32 +251,14 @@ pub(crate) fn poll_socket_peers(
             PeerState::Disconnected => {
                 info!("Peer disconnected: {peer_id}");
 
-                let Some(lobby) = host_lobby.as_ref() else {
+                if host_lobby.is_none() {
                     continue;
-                };
-                let host_entity = **lobby;
+                }
 
-                if let Some((client_entity, _, player_uuid)) = lobby_clients
+                if let Some((client_entity, _)) = lobby_clients
                     .iter()
-                    .find(|(_, client_uuid, _)| client_uuid.0 == peer_id)
+                    .find(|(_, client_uuid)| client_uuid.0 == peer_id)
                 {
-                    commands
-                        .entity(host_entity)
-                        .trigger(move |entity| LobbyMessage::<RemoveLobbyParticipant> {
-                            entity,
-                            message: RemoveLobbyParticipant {
-                                player_uuid: player_uuid.0,
-                            },
-                        });
-
-                    if let Some((participant_entity, _, _)) =
-                        participants.iter().find(|(_, p, pof)| {
-                            pof.0 == host_entity && p.player_uuid == player_uuid.0
-                        })
-                    {
-                        commands.entity(participant_entity).try_despawn();
-                    }
-
                     commands.entity(client_entity).try_despawn();
                 }
             }
@@ -515,6 +474,21 @@ pub(crate) fn promote_client_lobby_on_host_handshake(
             .remove::<PendingLobby>()
             .insert(Lobby);
     }
+}
+
+/// Disconnects the WebRTC peer when a [`LobbyClient`] entity is removed.
+///
+/// This ensures the transport is cleaned up whether the client disconnected
+/// naturally or was kicked by despawning their entity.
+pub(crate) fn on_lobby_client_removed(
+    trigger: On<Remove, LobbyClient>,
+    query: Query<&LobbyClientWebrtcUuid>,
+    mut socket: ResMut<crate::EnsembleSocketRes>,
+) {
+    let Ok(uuid) = query.get(trigger.event_target()) else {
+        return;
+    };
+    socket.disconnect_peer(uuid.0);
 }
 
 pub(crate) fn promote_host_client_on_client_handshake(

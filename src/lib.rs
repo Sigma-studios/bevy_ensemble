@@ -112,6 +112,7 @@ impl Plugin for EnsemblePlugin {
             .add_message::<StartHosting>()
             .register_ensemble_message_type::<SyncLobbyParticipant>()
             .register_ensemble_message_type::<RemoveLobbyParticipant>()
+            .add_observer(observers::on_lobby_client_removed)
             .add_systems(
                 Update,
                 (
