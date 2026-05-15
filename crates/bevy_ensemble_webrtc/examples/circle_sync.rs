@@ -2,24 +2,14 @@ use bevy::prelude::*;
 use bevy_ensemble::{
     EnsembleAppExt, EnsemblePlugin, Host, Lobby, LobbyClient, LobbyClientPlayerUuid,
     LobbyMessage, LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId, PeerRtt,
-    PendingLobby, PublicLobbies, ReceivedEnsembleMessage, StartHosting,
+    PendingLobby, PlayerData, PlayerDataPlugin, PublicLobbies, ReceivedEnsembleMessage,
+    SetPlayerData, StartHosting,
 };
 use bevy_ensemble_webrtc::{BevyEnsembleWebrtcPlugin, JoinWebrtcLobby, RefreshLobbyList};
 use serde::{Deserialize, Serialize};
 
 const MOVE_SPEED: f32 = 200.0;
 const CIRCLE_RADIUS: f32 = 25.0;
-
-const PLAYER_COLORS: &[Color] = &[
-    Color::srgb(0.2, 0.6, 1.0),
-    Color::srgb(1.0, 0.3, 0.3),
-    Color::srgb(0.3, 1.0, 0.3),
-    Color::srgb(1.0, 0.8, 0.2),
-    Color::srgb(0.8, 0.3, 1.0),
-    Color::srgb(1.0, 0.5, 0.0),
-    Color::srgb(0.0, 1.0, 0.8),
-    Color::srgb(1.0, 0.4, 0.7),
-];
 
 const NUMBER_KEYS: &[KeyCode] = &[
     KeyCode::Digit1,
@@ -34,9 +24,29 @@ const NUMBER_KEYS: &[KeyCode] = &[
     KeyCode::Digit0,
 ];
 
-fn player_color(player_uuid: u128) -> Color {
-    PLAYER_COLORS[(player_uuid % PLAYER_COLORS.len() as u128) as usize]
-}
+const NUMPAD_KEYS: &[KeyCode] = &[
+    KeyCode::Numpad1,
+    KeyCode::Numpad2,
+    KeyCode::Numpad3,
+    KeyCode::Numpad4,
+    KeyCode::Numpad5,
+    KeyCode::Numpad6,
+    KeyCode::Numpad7,
+    KeyCode::Numpad8,
+    KeyCode::Numpad9,
+];
+
+const NUMPAD_COLORS: &[[f32; 3]] = &[
+    [1.0, 0.2, 0.2], // Red
+    [0.2, 1.0, 0.2], // Green
+    [0.2, 0.4, 1.0], // Blue
+    [1.0, 1.0, 0.2], // Yellow
+    [0.8, 0.2, 1.0], // Purple
+    [1.0, 0.5, 0.0], // Orange
+    [0.0, 1.0, 0.8], // Cyan
+    [1.0, 0.4, 0.7], // Pink
+    [1.0, 1.0, 1.0], // White
+];
 
 fn main() {
     let server_url = std::env::var("SIGNALLING_SERVER_URL")
@@ -47,6 +57,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(EnsemblePlugin)
+        .add_plugins(PlayerDataPlugin::<PlayerProfile>::default())
         .add_plugins(BevyEnsembleWebrtcPlugin {
             server_url,
             display_name: "Player".into(),
@@ -68,6 +79,7 @@ impl Plugin for CircleSyncPlugin {
                 (
                     handle_h_key,
                     handle_number_keys,
+                    handle_numpad_color,
                     handle_r_key,
                     handle_escape_key,
                     update_menu_text,
@@ -75,6 +87,7 @@ impl Plugin for CircleSyncPlugin {
                     handle_wasd_input,
                     relay_moves_on_host,
                     receive_player_positions,
+                    apply_player_colors,
                     cleanup_circles_on_lobby_leave,
                     cleanup_disconnected_players,
                 ),
@@ -84,14 +97,12 @@ impl Plugin for CircleSyncPlugin {
 
 // -- Messages --
 
-/// Sent by clients to the host with their current position.
 #[derive(Message, Clone, Debug, Serialize, Deserialize)]
 struct MoveIntent {
     x: f32,
     y: f32,
 }
 
-/// Broadcast by the host to all clients with a player's position.
 #[derive(Message, Clone, Debug, Serialize, Deserialize)]
 struct PlayerPosition {
     player_uuid: u128,
@@ -99,15 +110,23 @@ struct PlayerPosition {
     y: f32,
 }
 
+/// Per-player cosmetic data synchronized via [`PlayerDataPlugin`].
+#[derive(Message, Clone, Debug, Serialize, Deserialize)]
+struct PlayerProfile {
+    color: [f32; 3],
+}
+
 // -- Components --
 
-/// Tags a circle sprite with its owning player's UUID.
 #[derive(Component)]
 struct PlayerCircle(u128);
 
-/// Marker for the menu text entity.
 #[derive(Component)]
 struct MenuText;
+
+/// Marker for dynamically spawned text spans in the roster.
+#[derive(Component)]
+struct RosterSpan;
 
 // -- Setup --
 
@@ -124,80 +143,102 @@ fn setup(mut commands: Commands) {
     ));
 }
 
+fn profile_color(profile: Option<&PlayerData<PlayerProfile>>) -> Color {
+    profile
+        .map(|p| {
+            let [r, g, b] = p.0.color;
+            Color::srgb(r, g, b)
+        })
+        .unwrap_or(Color::WHITE)
+}
+
 // -- Menu / lobby UI --
 
 fn update_menu_text(
-    mut menu: Query<(&mut Text, &mut Visibility), With<MenuText>>,
+    mut commands: Commands,
+    mut menu: Query<(Entity, &mut Text, &mut Visibility), With<MenuText>>,
+    roster_spans: Query<Entity, With<RosterSpan>>,
     pending_lobbies: Query<(), With<PendingLobby>>,
     host_lobbies: Query<(), (With<Lobby>, With<Host>)>,
     client_lobbies: Query<(), (With<Lobby>, Without<Host>)>,
     lobby_list: Option<Res<PublicLobbies>>,
-    participants: Query<(&LobbyParticipant, &LobbyParticipantOf)>,
+    participants: Query<(
+        &LobbyParticipant,
+        &LobbyParticipantOf,
+        Option<&PlayerData<PlayerProfile>>,
+    )>,
     lobby_clients: Query<(&LobbyClientPlayerUuid, Option<&PeerRtt>), With<LobbyClient>>,
     lobby_rtt: Query<Option<&PeerRtt>, (With<Lobby>, Without<Host>)>,
     lobbies: Query<Entity, With<Lobby>>,
 ) {
-    let Ok((mut text, mut vis)) = menu.single_mut() else {
+    let Ok((menu_entity, mut text, mut vis)) = menu.single_mut() else {
         return;
     };
+
+    // Clean up previous roster spans
+    for entity in roster_spans.iter() {
+        commands.entity(entity).try_despawn();
+    }
 
     let is_host = !host_lobbies.is_empty();
     let in_lobby = is_host || !client_lobbies.is_empty();
 
     if in_lobby {
         *vis = Visibility::Visible;
+        // Clear parent text — roster is built from TextSpan children
+        **text = String::new();
+
         let lobby_entity = lobbies.iter().next().unwrap();
-        let mut lines = vec!["Players:".to_string()];
 
-        let mut players: Vec<(u128, bool)> = participants
+        let mut players: Vec<(u128, bool, Option<&PlayerData<PlayerProfile>>)> = participants
             .iter()
-            .filter(|(_, pof)| pof.0 == lobby_entity)
-            .map(|(p, _)| (p.player_uuid, p.is_host))
+            .filter(|(_, pof, _)| pof.0 == lobby_entity)
+            .map(|(p, _, data)| (p.player_uuid, p.is_host, data))
             .collect();
-        players.sort_by_key(|(uuid, _)| *uuid);
+        players.sort_by_key(|(uuid, _, _)| *uuid);
 
-        let mut kick_index = 0usize;
-        for (uuid, participant_is_host) in &players {
-            let mut line = String::from("  ");
+        commands.entity(menu_entity).with_children(|parent| {
+            parent.spawn((RosterSpan, TextSpan::new("Players:\n")));
 
-            if is_host && !participant_is_host {
-                let key = if kick_index < 9 {
-                    kick_index + 1
-                } else {
-                    0
-                };
-                line.push_str(&format!("[{}] ", key));
-                kick_index += 1;
-            }
+            let mut kick_index = 0usize;
+            for (uuid, participant_is_host, profile) in &players {
+                let color = profile_color(*profile);
+                let mut line = String::from("  ");
 
-            line.push_str(&format!("Player {}", uuid % 10000));
-            if *participant_is_host {
-                line.push_str(" (Host)");
-            }
+                if is_host && !participant_is_host {
+                    let key = if kick_index < 9 { kick_index + 1 } else { 0 };
+                    line.push_str(&format!("[{}] ", key));
+                    kick_index += 1;
+                }
 
-            // Show ping
-            if is_host && !participant_is_host {
-                if let Some((_, rtt)) = lobby_clients.iter().find(|(id, _)| id.0 == *uuid) {
-                    if let Some(rtt) = rtt {
+                line.push_str(&format!("Player {}", uuid % 10000));
+                if *participant_is_host {
+                    line.push_str(" (Host)");
+                }
+
+                if is_host && !participant_is_host {
+                    if let Some((_, rtt)) = lobby_clients.iter().find(|(id, _)| id.0 == *uuid) {
+                        if let Some(rtt) = rtt {
+                            line.push_str(&format!(" - {:.0}ms", rtt.0 * 1000.0));
+                        }
+                    }
+                } else if !is_host && *participant_is_host {
+                    if let Ok(Some(rtt)) = lobby_rtt.get(lobby_entity) {
                         line.push_str(&format!(" - {:.0}ms", rtt.0 * 1000.0));
                     }
                 }
-            } else if !is_host && *participant_is_host {
-                if let Ok(Some(rtt)) = lobby_rtt.get(lobby_entity) {
-                    line.push_str(&format!(" - {:.0}ms", rtt.0 * 1000.0));
-                }
+
+                line.push('\n');
+                parent.spawn((RosterSpan, TextSpan::new(line), TextColor(color)));
             }
 
-            lines.push(line);
-        }
-
-        lines.push(String::new());
-        let mut controls = "WASD to move | Escape to leave".to_string();
-        if is_host {
-            controls.push_str(" | 1-0 to kick");
-        }
-        lines.push(controls);
-        **text = lines.join("\n");
+            let mut controls =
+                "\nWASD to move | Numpad 1-9 to change color | Escape to leave".to_string();
+            if is_host {
+                controls.push_str(" | 1-0 to kick");
+            }
+            parent.spawn((RosterSpan, TextSpan::new(controls)));
+        });
         return;
     }
 
@@ -268,7 +309,6 @@ fn handle_number_keys(
         return;
     };
 
-    // In a host lobby: kick the nth non-host participant
     if let Some(host_lobby) = host_lobbies.iter().next() {
         let mut kickable: Vec<u128> = participants
             .iter()
@@ -288,7 +328,6 @@ fn handle_number_keys(
         return;
     }
 
-    // Not in a lobby: join the nth available lobby
     if !existing_lobbies.is_empty() || !pending_lobbies.is_empty() {
         return;
     }
@@ -296,6 +335,29 @@ fn handle_number_keys(
     if let Some(lobby) = lobby_list.0.get(pressed_index) {
         join_writer.write(JoinWebrtcLobby(lobby.lobby_id));
     }
+}
+
+/// Numpad 1-9 changes the local player's color via [`PlayerData`].
+fn handle_numpad_color(
+    mut commands: Commands,
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    lobbies: Query<Entity, With<Lobby>>,
+) {
+    let Some(pressed_index) = NUMPAD_KEYS
+        .iter()
+        .position(|k| keyboard_input.just_pressed(*k))
+    else {
+        return;
+    };
+
+    let Some(lobby) = lobbies.iter().next() else {
+        return;
+    };
+
+    let color = NUMPAD_COLORS[pressed_index];
+    commands
+        .entity(lobby)
+        .trigger(|entity| SetPlayerData::new(entity, PlayerProfile { color }));
 }
 
 fn handle_r_key(
@@ -341,18 +403,14 @@ fn spawn_local_circle(
     if lobbies.is_empty() {
         return;
     }
-    if existing_circles
-        .iter()
-        .any(|c| c.0 == local_player.0)
-    {
+    if existing_circles.iter().any(|c| c.0 == local_player.0) {
         return;
     }
 
-    let color = player_color(local_player.0);
     commands.spawn((
         PlayerCircle(local_player.0),
         Mesh2d(meshes.add(Circle::new(CIRCLE_RADIUS))),
-        MeshMaterial2d(materials.add(ColorMaterial::from_color(color))),
+        MeshMaterial2d(materials.add(ColorMaterial::from_color(Color::WHITE))),
         Transform::from_translation(Vec3::ZERO),
     ));
 }
@@ -389,10 +447,7 @@ fn handle_wasd_input(
     }
     let delta = direction.normalize() * MOVE_SPEED * time.delta_secs();
 
-    let Some((_, mut transform)) = circles
-        .iter_mut()
-        .find(|(c, _)| c.0 == local_player.0)
-    else {
+    let Some((_, mut transform)) = circles.iter_mut().find(|(c, _)| c.0 == local_player.0) else {
         return;
     };
     transform.translation.x += delta.x;
@@ -442,18 +497,14 @@ fn relay_moves_on_host(
         let x = message.message.x;
         let y = message.message.y;
 
-        if let Some((_, mut transform)) = circles
-            .iter_mut()
-            .find(|(c, _)| c.0 == player_uuid)
-        {
+        if let Some((_, mut transform)) = circles.iter_mut().find(|(c, _)| c.0 == player_uuid) {
             transform.translation.x = x;
             transform.translation.y = y;
         } else if !spawned_this_frame.contains(&player_uuid) {
-            let color = player_color(player_uuid);
             commands.spawn((
                 PlayerCircle(player_uuid),
                 Mesh2d(meshes.add(Circle::new(CIRCLE_RADIUS))),
-                MeshMaterial2d(materials.add(ColorMaterial::from_color(color))),
+                MeshMaterial2d(materials.add(ColorMaterial::from_color(Color::WHITE))),
                 Transform::from_translation(Vec3::new(x, y, 0.0)),
             ));
             spawned_this_frame.push(player_uuid);
@@ -488,21 +539,39 @@ fn receive_player_positions(
             }
         }
 
-        if let Some((_, mut transform)) = circles
-            .iter_mut()
-            .find(|(c, _)| c.0 == pos.player_uuid)
+        if let Some((_, mut transform)) = circles.iter_mut().find(|(c, _)| c.0 == pos.player_uuid)
         {
             transform.translation.x = pos.x;
             transform.translation.y = pos.y;
         } else if !spawned_this_frame.contains(&pos.player_uuid) {
-            let color = player_color(pos.player_uuid);
             commands.spawn((
                 PlayerCircle(pos.player_uuid),
                 Mesh2d(meshes.add(Circle::new(CIRCLE_RADIUS))),
-                MeshMaterial2d(materials.add(ColorMaterial::from_color(color))),
+                MeshMaterial2d(materials.add(ColorMaterial::from_color(Color::WHITE))),
                 Transform::from_translation(Vec3::new(pos.x, pos.y, 0.0)),
             ));
             spawned_this_frame.push(pos.player_uuid);
+        }
+    }
+}
+
+/// Updates circle colors when [`PlayerData<PlayerProfile>`] changes on a participant.
+fn apply_player_colors(
+    participants: Query<
+        (&LobbyParticipant, &PlayerData<PlayerProfile>),
+        Changed<PlayerData<PlayerProfile>>,
+    >,
+    circles: Query<(&PlayerCircle, &MeshMaterial2d<ColorMaterial>)>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+) {
+    for (participant, profile) in participants.iter() {
+        let [r, g, b] = profile.0.color;
+        for (circle, material_handle) in circles.iter() {
+            if circle.0 == participant.player_uuid {
+                if let Some(material) = materials.get_mut(&material_handle.0) {
+                    material.color = Color::srgb(r, g, b);
+                }
+            }
         }
     }
 }

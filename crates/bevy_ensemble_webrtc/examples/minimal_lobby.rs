@@ -2,8 +2,8 @@ use bevy::prelude::*;
 use bevy_ensemble::{
     BroadcastLobbyMessage, EnsembleAppExt, EnsemblePlugin, Host, Lobby, LobbyBroadcastAppExt,
     LobbyBroadcastPlugin, LobbyClient, LobbyClientPlayerUuid, LobbyMessage, LobbyParticipant,
-    LobbyParticipantOf, LocalMultiplayerPlayerId, PeerRtt, PendingLobby, PublicLobbies,
-    ReceivedEnsembleMessage, StartHosting,
+    LobbyParticipantOf, LocalMultiplayerPlayerId, PeerRtt, PendingLobby, PlayerData,
+    PlayerDataPlugin, PublicLobbies, ReceivedEnsembleMessage, SetPlayerData, StartHosting,
 };
 use bevy_ensemble_webrtc::{BevyEnsembleWebrtcPlugin, JoinWebrtcLobby, RefreshLobbyList};
 use bevy_immediate::{BevyImmediatePlugin, ImmCtx, ui::CapsUi};
@@ -23,6 +23,36 @@ const NUMBER_KEYS: &[KeyCode] = &[
     KeyCode::Digit0,
 ];
 
+const NUMPAD_KEYS: &[KeyCode] = &[
+    KeyCode::Numpad1,
+    KeyCode::Numpad2,
+    KeyCode::Numpad3,
+    KeyCode::Numpad4,
+    KeyCode::Numpad5,
+    KeyCode::Numpad6,
+    KeyCode::Numpad7,
+    KeyCode::Numpad8,
+    KeyCode::Numpad9,
+];
+
+const NUMPAD_COLORS: &[[f32; 3]] = &[
+    [1.0, 0.2, 0.2], // Red
+    [0.2, 1.0, 0.2], // Green
+    [0.2, 0.4, 1.0], // Blue
+    [1.0, 1.0, 0.2], // Yellow
+    [0.8, 0.2, 1.0], // Purple
+    [1.0, 0.5, 0.0], // Orange
+    [0.0, 1.0, 0.8], // Cyan
+    [1.0, 0.4, 0.7], // Pink
+    [1.0, 1.0, 1.0], // White
+];
+
+/// Per-player cosmetic data synchronized via [`PlayerDataPlugin`].
+#[derive(Message, Clone, Debug, Serialize, Deserialize)]
+struct PlayerProfile {
+    color: [f32; 3],
+}
+
 fn main() {
     let server_url = std::env::var("SIGNALLING_SERVER_URL")
         .ok()
@@ -33,6 +63,7 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .add_plugins(EnsemblePlugin)
         .add_plugins(LobbyBroadcastPlugin)
+        .add_plugins(PlayerDataPlugin::<PlayerProfile>::default())
         .add_plugins(BevyEnsembleWebrtcPlugin {
             server_url,
             display_name: "Player".into(),
@@ -55,9 +86,11 @@ impl Plugin for MinimalLobbyExamplePlugin {
                 Update,
                 (
                     render_ui,
+                    update_roster,
                     handle_h_key,
                     handle_t_key,
                     handle_number_keys,
+                    handle_numpad_color,
                     handle_r_key,
                     receive_chat_messages,
                     receive_wave_actions,
@@ -81,18 +114,133 @@ struct WaveAction;
 #[derive(Resource, Default)]
 struct ChatLog(VecDeque<String>);
 
+/// Root entity for the colored player roster (managed outside bevy_immediate).
+#[derive(Component)]
+struct RosterRoot;
+
+/// Marker for dynamically spawned text spans in the roster.
+#[derive(Component)]
+struct RosterSpan;
+
 fn setup_camera(mut commands: Commands) {
     commands.spawn(Camera2d);
+    commands.spawn((
+        RosterRoot,
+        Text::default(),
+        Node {
+            align_self: AlignSelf::Start,
+            justify_self: JustifySelf::Start,
+            margin: UiRect::axes(px(12.), px(8.)),
+            ..default()
+        },
+        Visibility::Hidden,
+    ));
 }
 
+fn profile_color(profile: Option<&PlayerData<PlayerProfile>>) -> Color {
+    profile
+        .map(|p| {
+            let [r, g, b] = p.0.color;
+            Color::srgb(r, g, b)
+        })
+        .unwrap_or(Color::WHITE)
+}
+
+/// Manages the colored player roster using [`TextSpan`] children.
+fn update_roster(
+    mut commands: Commands,
+    mut roster: Query<(Entity, &mut Visibility), With<RosterRoot>>,
+    roster_spans: Query<Entity, With<RosterSpan>>,
+    host_lobbies: Query<Entity, (With<Lobby>, With<Host>)>,
+    client_lobbies: Query<Entity, (With<Lobby>, Without<Host>)>,
+    participants: Query<(
+        &LobbyParticipant,
+        &LobbyParticipantOf,
+        Option<&PlayerData<PlayerProfile>>,
+    )>,
+    lobby_clients: Query<(&LobbyClientPlayerUuid, Option<&PeerRtt>), With<LobbyClient>>,
+    lobby_rtt: Query<Option<&PeerRtt>, (With<Lobby>, Without<Host>)>,
+) {
+    let Ok((roster_entity, mut vis)) = roster.single_mut() else {
+        return;
+    };
+
+    for entity in roster_spans.iter() {
+        commands.entity(entity).try_despawn();
+    }
+
+    let is_host = !host_lobbies.is_empty();
+    let lobby_entity = host_lobbies
+        .iter()
+        .next()
+        .or_else(|| client_lobbies.iter().next());
+
+    let Some(lobby_entity) = lobby_entity else {
+        *vis = Visibility::Hidden;
+        return;
+    };
+
+    *vis = Visibility::Visible;
+
+    let mut players: Vec<(u128, bool, Option<&PlayerData<PlayerProfile>>)> = participants
+        .iter()
+        .filter(|(_, pof, _)| pof.0 == lobby_entity)
+        .map(|(p, _, data)| (p.player_uuid, p.is_host, data))
+        .collect();
+    players.sort_by_key(|(uuid, _, _)| *uuid);
+
+    commands.entity(roster_entity).with_children(|parent| {
+        parent.spawn((RosterSpan, TextSpan::new("Players:\n")));
+
+        let mut kick_index = 0usize;
+        for (uuid, participant_is_host, profile) in &players {
+            let color = profile_color(*profile);
+            let mut line = String::from("  ");
+
+            if is_host && !participant_is_host {
+                let key = if kick_index < 9 { kick_index + 1 } else { 0 };
+                line.push_str(&format!("[{}] ", key));
+                kick_index += 1;
+            }
+
+            line.push_str(&format!("Player {}", uuid % 10000));
+            if *participant_is_host {
+                line.push_str(" (Host)");
+            }
+
+            if is_host && !participant_is_host {
+                if let Some((_, rtt)) = lobby_clients.iter().find(|(id, _)| id.0 == *uuid) {
+                    if let Some(rtt) = rtt {
+                        line.push_str(&format!(" - {:.0}ms", rtt.0 * 1000.0));
+                    }
+                }
+            } else if !is_host && *participant_is_host {
+                if let Ok(Some(rtt)) = lobby_rtt.get(lobby_entity) {
+                    line.push_str(&format!(" - {:.0}ms", rtt.0 * 1000.0));
+                }
+            }
+
+            line.push('\n');
+            parent.spawn((RosterSpan, TextSpan::new(line), TextColor(color)));
+        }
+
+        let mut controls =
+            "\nPress H to send hello (broadcast)\nNumpad 1-9 to change name color\nPress Escape to leave lobby"
+                .to_string();
+        if is_host {
+            controls.push_str("\nPress T to wave (host-only action)\nPress 1-0 to kick a player");
+        }
+        parent.spawn((RosterSpan, TextSpan::new(controls)));
+    });
+}
+
+/// Handles menu, loading, and chat log display via bevy_immediate.
+/// The roster is handled separately by [`update_roster`].
 fn render_ui(
     ctx: ImmCtx<CapsUi>,
     pending_lobbies: Query<(), With<PendingLobby>>,
     host_lobbies: Query<Entity, (With<Lobby>, With<Host>)>,
     client_lobbies: Query<Entity, (With<Lobby>, Without<Host>)>,
-    participants: Query<(&LobbyParticipant, &LobbyParticipantOf)>,
-    lobby_clients: Query<(&LobbyClientPlayerUuid, Option<&PeerRtt>), With<LobbyClient>>,
-    lobby_rtt: Query<Option<&PeerRtt>, (With<Lobby>, Without<Host>)>,
     lobby_list: Option<Res<PublicLobbies>>,
     chat_log: Res<ChatLog>,
 ) {
@@ -112,88 +260,62 @@ fn render_ui(
         return;
     }
 
-    let ready_lobby = host_lobbies
-        .iter()
-        .next()
-        .or_else(|| client_lobbies.iter().next());
+    let in_lobby = host_lobbies.iter().next().is_some() || client_lobbies.iter().next().is_some();
 
-    let Some(lobby_entity) = ready_lobby else {
-        let mut menu_text =
-            "Host: Press H\nRefresh lobbies: Press R\nJoin lobby: Press 1-0".to_string();
-
-        if let Some(lobby_list) = &lobby_list {
-            if lobby_list.0.is_empty() {
-                menu_text.push_str("\n\nNo lobbies available");
-            } else {
-                menu_text.push_str("\n\nAvailable lobbies:");
-                for (i, lobby) in lobby_list.0.iter().enumerate() {
-                    let key = if i < 9 { i + 1 } else { 0 };
-                    menu_text.push_str(&format!(
-                        "\n  [{}] {} - {}/{} players (id: {})",
-                        key, lobby.host_name, lobby.player_count, lobby.max_players, lobby.lobby_id,
-                    ));
-                    if i >= 9 {
-                        break;
-                    }
-                }
-            }
-        }
-
-        root.ch_id("menu").on_change_insert(true, move || {
+    if in_lobby {
+        // Roster + controls are handled by update_roster; just show messages here
+        let messages_text = if chat_log.0.is_empty() {
+            "Messages:\n".to_string()
+        } else {
+            format!(
+                "Messages:\n{}",
+                chat_log.0.iter().cloned().collect::<Vec<_>>().join("\n")
+            )
+        };
+        root.ch_id("messages").on_change_insert(true, move || {
             (
                 Node {
-                    align_self: AlignSelf::Center,
-                    justify_self: JustifySelf::Center,
+                    align_self: AlignSelf::End,
+                    justify_self: JustifySelf::Start,
+                    margin: UiRect::axes(px(12.), px(8.)),
                     ..default()
                 },
-                Text::new(menu_text),
+                Text::new(messages_text),
             )
         });
         return;
-    };
-
-    let is_host = host_lobbies.get(lobby_entity).is_ok();
-    let roster_text = build_roster_text(
-        lobby_entity,
-        is_host,
-        &participants,
-        &lobby_clients,
-        &lobby_rtt,
-    );
-    let messages_text = if chat_log.0.is_empty() {
-        "Messages:\n".to_string()
-    } else {
-        format!(
-            "Messages:\n{}",
-            chat_log.0.iter().cloned().collect::<Vec<_>>().join("\n")
-        )
-    };
-
-    let mut lobby_info_text = format!("Players:\n{}", roster_text);
-    lobby_info_text.push_str("\n\nPress H to send hello (broadcast)\nPress Escape to leave lobby");
-    if is_host {
-        lobby_info_text.push_str("\nPress T to wave (host-only action)\nPress 1-0 to kick a player");
     }
-    root.ch_id("lobby_info").on_change_insert(true, move || {
+
+    // Main menu
+    let mut menu_text =
+        "Host: Press H\nRefresh lobbies: Press R\nJoin lobby: Press 1-0".to_string();
+
+    if let Some(lobby_list) = &lobby_list {
+        if lobby_list.0.is_empty() {
+            menu_text.push_str("\n\nNo lobbies available");
+        } else {
+            menu_text.push_str("\n\nAvailable lobbies:");
+            for (i, lobby) in lobby_list.0.iter().enumerate() {
+                let key = if i < 9 { i + 1 } else { 0 };
+                menu_text.push_str(&format!(
+                    "\n  [{}] {} - {}/{} players (id: {})",
+                    key, lobby.host_name, lobby.player_count, lobby.max_players, lobby.lobby_id,
+                ));
+                if i >= 9 {
+                    break;
+                }
+            }
+        }
+    }
+
+    root.ch_id("menu").on_change_insert(true, move || {
         (
             Node {
-                align_self: AlignSelf::Start,
-                justify_self: JustifySelf::Start,
-                margin: UiRect::axes(px(12.), px(8.)),
+                align_self: AlignSelf::Center,
+                justify_self: JustifySelf::Center,
                 ..default()
             },
-            Text::new(lobby_info_text),
-        )
-    });
-    root.ch_id("messages").on_change_insert(true, move || {
-        (
-            Node {
-                align_self: AlignSelf::End,
-                justify_self: JustifySelf::Start,
-                margin: UiRect::axes(px(12.), px(8.)),
-                ..default()
-            },
-            Text::new(messages_text),
+            Text::new(menu_text),
         )
     });
 }
@@ -263,7 +385,6 @@ fn handle_number_keys(
         return;
     };
 
-    // In a host lobby: kick the nth non-host participant
     if let Some(host_lobby) = host_lobbies.iter().next() {
         let mut kickable: Vec<u128> = participants
             .iter()
@@ -283,7 +404,6 @@ fn handle_number_keys(
         return;
     }
 
-    // Not in a lobby: join the nth available lobby
     if !existing_lobbies.is_empty() || !pending_lobbies.is_empty() {
         return;
     }
@@ -291,6 +411,29 @@ fn handle_number_keys(
     if let Some(lobby) = lobby_list.0.get(pressed_index) {
         join_writer.write(JoinWebrtcLobby(lobby.lobby_id));
     }
+}
+
+/// Numpad 1-9 changes the local player's name color via [`PlayerData`].
+fn handle_numpad_color(
+    mut commands: Commands,
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    lobbies: Query<Entity, With<Lobby>>,
+) {
+    let Some(pressed_index) = NUMPAD_KEYS
+        .iter()
+        .position(|k| keyboard_input.just_pressed(*k))
+    else {
+        return;
+    };
+
+    let Some(lobby) = lobbies.iter().next() else {
+        return;
+    };
+
+    let color = NUMPAD_COLORS[pressed_index];
+    commands
+        .entity(lobby)
+        .trigger(|entity| SetPlayerData::new(entity, PlayerProfile { color }));
 }
 
 fn handle_r_key(
@@ -344,67 +487,6 @@ fn handle_escape_key(
 
     commands.remove_resource::<LocalMultiplayerPlayerId>();
     chat_log.0.clear();
-}
-
-fn build_roster_text(
-    lobby_entity: Entity,
-    is_host: bool,
-    participants: &Query<(&LobbyParticipant, &LobbyParticipantOf)>,
-    lobby_clients: &Query<(&LobbyClientPlayerUuid, Option<&PeerRtt>), With<LobbyClient>>,
-    lobby_rtt: &Query<Option<&PeerRtt>, (With<Lobby>, Without<Host>)>,
-) -> String {
-    let mut players: Vec<(u128, bool)> = participants
-        .iter()
-        .filter(|(_, pof)| pof.0 == lobby_entity)
-        .map(|(p, _)| (p.player_uuid, p.is_host))
-        .collect();
-    players.sort_by_key(|(uuid, _)| *uuid);
-
-    if players.is_empty() {
-        return "(No players)".to_string();
-    }
-
-    let mut lines = Vec::new();
-    let mut kick_index = 0usize;
-
-    for (uuid, participant_is_host) in &players {
-        let mut line = String::new();
-
-        // Show kick index for non-host participants (only when we are the host)
-        if is_host && !participant_is_host {
-            let key = if kick_index < 9 {
-                kick_index + 1
-            } else {
-                0
-            };
-            line.push_str(&format!("[{}] ", key));
-            kick_index += 1;
-        }
-
-        line.push_str(&format!("Player {}", uuid % 10000));
-        if *participant_is_host {
-            line.push_str(" (Host)");
-        }
-
-        // Show ping
-        if is_host && !participant_is_host {
-            // Host: look up RTT on the LobbyClient entity for this peer
-            if let Some((_, rtt)) = lobby_clients.iter().find(|(id, _)| id.0 == *uuid) {
-                if let Some(rtt) = rtt {
-                    line.push_str(&format!(" - {:.0}ms", rtt.0 * 1000.0));
-                }
-            }
-        } else if !is_host && *participant_is_host {
-            // Client: show our ping to the host on the host's line
-            if let Ok(Some(rtt)) = lobby_rtt.get(lobby_entity) {
-                line.push_str(&format!(" - {:.0}ms", rtt.0 * 1000.0));
-            }
-        }
-
-        lines.push(line);
-    }
-
-    lines.join("\n")
 }
 
 fn push_chat_message(chat_log: &mut ChatLog, sender_name: &str, text: &str) {

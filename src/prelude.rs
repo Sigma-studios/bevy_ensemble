@@ -15,6 +15,9 @@ pub use crate::{
     // Broadcast
     BroadcastLobbyMessage, LobbyBroadcastAppExt,
 
+    // Player data
+    PlayerData, PlayerDataPlugin, SetPlayerData,
+
     // Identity
     LocalMultiplayerPlayerId, PlayerUUID,
 

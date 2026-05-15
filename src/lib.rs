@@ -81,6 +81,7 @@ mod components;
 mod messages;
 pub(crate) mod observers;
 mod ping;
+mod player_data;
 pub mod prelude;
 pub mod registry;
 mod systems;
@@ -90,6 +91,7 @@ pub use broadcast::{BroadcastLobbyMessage, LobbyBroadcastAppExt, LobbyBroadcastP
 pub use components::*;
 pub use messages::*;
 pub use ping::PeerRtt;
+pub use player_data::{PlayerData, PlayerDataPlugin, SetPlayerData};
 pub use registry::{EnsembleMessageRegistry, decode_ensemble_packet, encode_ensemble_message};
 pub use types::*;
 
