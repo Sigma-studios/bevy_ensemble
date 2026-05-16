@@ -134,6 +134,7 @@ fn handle_set_player_data<T: EnsembleMessage>(
     event: On<SetPlayerData<T>>,
     mut commands: Commands,
     local_player: Option<Res<LocalMultiplayerPlayerId>>,
+    mut pending: ResMut<PendingPlayerData<T>>,
     host_lobbies: Query<(), (With<Lobby>, With<Host>)>,
     participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
 ) {
@@ -151,6 +152,12 @@ fn handle_set_player_data<T: EnsembleMessage>(
             .find(|(_, p, pof)| pof.0 == lobby_entity && p.player_uuid == local_player.0)
         {
             commands.entity(participant_entity).insert(PlayerData(data));
+        } else {
+            // Participant not created yet — buffer for retry
+            pending.pending.push(SyncPlayerData {
+                player_uuid: local_player.0,
+                data,
+            });
         }
     } else {
         // Client: send request to host
