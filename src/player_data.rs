@@ -76,6 +76,20 @@ pub(crate) struct SyncPlayerData<T> {
     pub data: T,
 }
 
+/// Buffer for player data messages that arrived before their participant entity existed.
+#[derive(Resource)]
+struct PendingPlayerData<T: EnsembleMessage> {
+    pending: Vec<SyncPlayerData<T>>,
+}
+
+impl<T: EnsembleMessage> Default for PendingPlayerData<T> {
+    fn default() -> Self {
+        Self {
+            pending: Vec::new(),
+        }
+    }
+}
+
 /// Plugin that enables per-player data synchronization for a specific type.
 ///
 /// Each data type you want to synchronize needs its own plugin instance.
@@ -97,7 +111,8 @@ impl<T: EnsembleMessage> Default for PlayerDataPlugin<T> {
 
 impl<T: EnsembleMessage> Plugin for PlayerDataPlugin<T> {
     fn build(&self, app: &mut App) {
-        app.register_ensemble_message_type::<SyncPlayerData<T>>()
+        app.init_resource::<PendingPlayerData<T>>()
+            .register_ensemble_message_type::<SyncPlayerData<T>>()
             .add_observer(handle_set_player_data::<T>)
             .add_systems(
                 Update,
@@ -213,17 +228,25 @@ fn sync_existing_player_data_to_new_clients<T: EnsembleMessage>(
 /// - On the **host**: treats incoming messages as client requests — applies
 ///   the data to the participant entity, which triggers broadcast via change detection.
 /// - On a **client**: applies data from host broadcasts to the local participant entity.
+///
+/// Messages that arrive before their target participant entity exists are buffered
+/// and retried on subsequent frames.
 fn apply_received_player_data<T: EnsembleMessage>(
     mut commands: Commands,
     mut messages: MessageReader<ReceivedEnsembleMessage<SyncPlayerData<T>>>,
+    mut pending: ResMut<PendingPlayerData<T>>,
     host_lobbies: Query<Entity, (With<Lobby>, With<Host>)>,
     client_lobby: Option<Single<Entity, (With<Lobby>, Without<Host>)>>,
     pending_client_lobby: Option<Single<Entity, (With<PendingLobby>, Without<Host>)>>,
     participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
 ) {
-    for message in messages.read() {
-        let player_uuid = message.message.player_uuid;
-        let data = message.message.data.clone();
+    let buffered = std::mem::take(&mut pending.pending);
+    let all_messages = buffered
+        .into_iter()
+        .chain(messages.read().map(|m| m.message.clone()));
+
+    for sync_msg in all_messages {
+        let player_uuid = sync_msg.player_uuid;
 
         // Host: a client is requesting to set their data
         if let Some(host_lobby) = host_lobbies.iter().next() {
@@ -231,7 +254,11 @@ fn apply_received_player_data<T: EnsembleMessage>(
                 .iter()
                 .find(|(_, p, pof)| pof.0 == host_lobby && p.player_uuid == player_uuid)
             {
-                commands.entity(participant_entity).insert(PlayerData(data));
+                commands
+                    .entity(participant_entity)
+                    .insert(PlayerData(sync_msg.data));
+            } else {
+                pending.pending.push(sync_msg);
             }
             continue;
         }
@@ -242,6 +269,7 @@ fn apply_received_player_data<T: EnsembleMessage>(
             .map(|s| **s)
             .or_else(|| pending_client_lobby.as_ref().map(|s| **s))
         else {
+            pending.pending.push(sync_msg);
             continue;
         };
 
@@ -249,7 +277,11 @@ fn apply_received_player_data<T: EnsembleMessage>(
             .iter()
             .find(|(_, p, pof)| pof.0 == lobby && p.player_uuid == player_uuid)
         {
-            commands.entity(participant_entity).insert(PlayerData(data));
+            commands
+                .entity(participant_entity)
+                .insert(PlayerData(sync_msg.data));
+        } else {
+            pending.pending.push(sync_msg);
         }
     }
 }
