@@ -90,7 +90,7 @@ mod types;
 pub use broadcast::{BroadcastLobbyMessage, LobbyBroadcastAppExt, LobbyBroadcastPlugin};
 pub use components::*;
 pub use messages::*;
-pub use ping::PeerRtt;
+pub use ping::{PeerLastPong, PeerRtt};
 pub use player_data::{PlayerData, PlayerDataPlugin, SetPlayerData};
 pub use registry::{EnsembleMessageRegistry, decode_ensemble_packet, encode_ensemble_message};
 pub use types::*;
@@ -137,6 +137,7 @@ impl Plugin for EnsemblePlugin {
                     ping::send_pings,
                     ping::respond_to_pings,
                     ping::receive_pongs,
+                    ping::tick_last_pong,
                 ),
             );
     }

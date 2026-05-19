@@ -28,6 +28,15 @@ pub(crate) struct EnsemblePong {
 #[derive(Component, Debug, Clone, Copy)]
 pub struct PeerRtt(pub f64);
 
+/// Seconds elapsed since the last pong was received from a peer.
+///
+/// Added alongside [`PeerRtt`] on `LobbyClient` entities (host) and the
+/// lobby entity (client). Starts at `0.0` when a pong arrives and ticks up
+/// every frame. If this value exceeds several seconds the connection is
+/// likely degraded or dead.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct PeerLastPong(pub f64);
+
 /// Both host and client send pings to all connected peers every 1 second.
 ///
 /// Uses the standard [`LobbyMessage`] pipeline so pings are routed through
@@ -51,7 +60,7 @@ pub(crate) fn send_pings(
             .trigger(move |entity| LobbyMessage {
                 entity,
                 message: EnsemblePing { timestamp },
-                send_mode: SendMode::Reliable,
+                send_mode: SendMode::Unreliable,
             });
     }
 }
@@ -87,7 +96,7 @@ pub(crate) fn respond_to_pings(
                     .trigger(move |entity| LobbyClientMessage {
                         entity,
                         message: pong,
-                        send_mode: SendMode::Reliable,
+                        send_mode: SendMode::Unreliable,
                     });
             }
         } else if let Some(lobby) = client_lobby.as_ref() {
@@ -97,7 +106,7 @@ pub(crate) fn respond_to_pings(
                 .trigger(move |entity| LobbyMessage {
                     entity,
                     message: pong,
-                    send_mode: SendMode::Reliable,
+                    send_mode: SendMode::Unreliable,
                 });
         }
     }
@@ -138,7 +147,9 @@ pub(crate) fn receive_pongs(
                     Some(prev) => 0.8 * prev.0 + 0.2 * rtt,
                     None => rtt,
                 };
-                commands.entity(entity).insert(PeerRtt(smoothed));
+                commands
+                    .entity(entity)
+                    .insert((PeerRtt(smoothed), PeerLastPong(0.0)));
             }
         }
 
@@ -149,7 +160,17 @@ pub(crate) fn receive_pongs(
                 Some(prev) => 0.8 * prev.0 + 0.2 * rtt,
                 None => rtt,
             };
-            commands.entity(**lobby_entity).insert(PeerRtt(smoothed));
+            commands
+                .entity(**lobby_entity)
+                .insert((PeerRtt(smoothed), PeerLastPong(0.0)));
         }
+    }
+}
+
+/// Increments [`PeerLastPong`] every frame so consumers can detect stale connections.
+pub(crate) fn tick_last_pong(time: Res<Time>, mut peers: Query<&mut PeerLastPong>) {
+    let dt = time.delta_secs_f64();
+    for mut last_pong in peers.iter_mut() {
+        last_pong.0 += dt;
     }
 }
