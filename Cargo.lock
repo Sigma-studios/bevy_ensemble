@@ -576,8 +576,7 @@ dependencies = [
 [[package]]
 name = "bevy-steamworks"
 version = "0.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd37df0eb6c8d94191ec467e6f600fae51ebf013290bf3eb4b1fc5d8c0645325"
+source = "git+https://github.com/Sigma-studios/bevy_steamworks?branch=chore%2Fsteamworks-rs-0.13.1#573ddfb0e09b27eba526665ca7f84fc98a752748"
 dependencies = [
  "bevy_app",
  "bevy_ecs",
@@ -6282,9 +6281,9 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "steamworks"
-version = "0.12.2"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "722f54c70818b8debdc25b18618b77a0a69fa280012c29e7904d32f9136299fc"
+checksum = "5ff29921f6a7e8c85b0c971ec3c42002b9f535e3b8f4358cb22911d43709739a"
 dependencies = [
  "bitflags 2.11.1",
  "paste",
@@ -6294,9 +6293,9 @@ dependencies = [
 
 [[package]]
 name = "steamworks-sys"
-version = "0.12.2"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42862065c9e685d08cc3d9f6c609d4b46bd9684ec7e9420688eb979213469582"
+checksum = "ae139f051204a4af015d4f0ed3a1f7a51020d03a44c7cf249168c543d88131e9"
 
 [[package]]
 name = "strict-num"

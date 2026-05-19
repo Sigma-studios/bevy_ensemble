@@ -6,6 +6,8 @@ pub mod server;
 #[cfg(feature = "client")]
 mod connection;
 #[cfg(feature = "client")]
+mod handshake;
+#[cfg(feature = "client")]
 mod systems;
 
 
@@ -13,6 +15,8 @@ mod systems;
 use bevy::prelude::*;
 #[cfg(feature = "client")]
 use bevy_ensemble::EnsembleAppExt;
+#[cfg(feature = "client")]
+pub use bevy_ensemble::PeerRtt;
 
 /// Bevy plugin for WebRTC P2P networking via a signaling server.
 ///
@@ -72,12 +76,6 @@ pub struct JoinWebrtcLobbyByCode(pub String);
 #[derive(Component)]
 pub struct LobbyWebrtcCode(pub String);
 
-/// Internal handshake message exchanged over data channels to confirm readiness.
-#[cfg(feature = "client")]
-#[derive(Message, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct WebrtcReadyHandshake {
-    pub from_host: bool,
-}
 
 /// Newtype wrapper around [`bevy_ensemble_sockets::EnsembleSocket`] so it can be used as a Bevy Resource.
 #[cfg(feature = "client")]
@@ -163,7 +161,7 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
             .add_message::<JoinWebrtcLobby>()
             .add_message::<JoinWebrtcLobbyByCode>()
             .add_message::<RefreshLobbyList>()
-            .register_ensemble_message_type::<WebrtcReadyHandshake>()
+            .register_ensemble_message_type::<handshake::WebrtcReadyHandshake>()
             .add_systems(
                 Update,
                 (
@@ -181,14 +179,15 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
                     systems::refresh_lobby_list,
                     systems::poll_socket_peers,
                     systems::pump_socket_signals,
-                    systems::send_client_handshakes,
-                    systems::send_host_handshakes,
-                    systems::promote_client_lobby_on_host_handshake,
-                    systems::promote_host_client_on_client_handshake,
+                    handshake::send_client_handshakes,
+                    handshake::send_host_handshakes,
+                    handshake::promote_client_lobby_on_host_handshake,
+                    handshake::promote_host_client_on_client_handshake,
                     systems::detect_lobby_leave,
                 ),
             )
             .add_systems(Update, systems::read_peer_messages)
-            .add_observer(systems::send_serialized_lobby_packet);
+            .add_observer(systems::send_serialized_lobby_packet)
+            .add_observer(systems::disconnect_removed_lobby_client);
     }
 }

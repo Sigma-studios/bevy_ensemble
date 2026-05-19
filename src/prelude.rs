@@ -10,7 +10,13 @@
 
 pub use crate::{
     // Plugin
-    EnsemblePlugin,
+    EnsemblePlugin, LobbyBroadcastPlugin,
+
+    // Broadcast
+    BroadcastLobbyMessage, LobbyBroadcastAppExt,
+
+    // Player data
+    PlayerData, PlayerDataPlugin, SetPlayerData,
 
     // Identity
     LocalMultiplayerPlayerId, PlayerUUID,
@@ -27,6 +33,9 @@ pub use crate::{
     // Ownership
     PlayerOwned, PlayerOwnedEntities,
 
+    // Ping
+    PeerRtt,
+
     // Messages & events
-    EnsembleAppExt, LobbyMessage, ReceivedEnsembleMessage, StartHosting,
+    EnsembleAppExt, LobbyMessage, ReceivedEnsembleMessage, SendMode, StartHosting,
 };

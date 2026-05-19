@@ -1,17 +1,17 @@
 use bevy::prelude::*;
 use bevy_ensemble::{
-    Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyMessage, LobbyParticipant,
-    LobbyParticipantOf, LocalMultiplayerPlayerId, PendingLobby, PublicLobbies, PublicLobbyInfo,
-    RemoveLobbyParticipant, RequestLobby, SerializedLobbyPacket, decode_ensemble_packet,
-    encode_ensemble_message,
+    Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipant, LobbyParticipantOf,
+    LocalMultiplayerPlayerId, PendingLobby, PublicLobbies, PublicLobbyInfo, RemoveLobbyParticipant,
+    RequestLobby, SerializedLobbyPacket, decode_ensemble_packet, encode_ensemble_message,
 };
 use bevy_ensemble_sockets::PeerState;
 
 use crate::connection::{LobbyConnection, LobbyEvent};
 use crate::protocol::ClientMessage;
+
 use crate::{
     JoinWebrtcLobby, JoinWebrtcLobbyByCode, LobbyClientWebrtcUuid, LobbyWebrtcCode, LobbyWebrtcId,
-    PendingWebrtcLobbyClient, RefreshLobbyList, WebrtcReadyHandshake,
+    PendingWebrtcLobbyClient, RefreshLobbyList,
 };
 
 pub(crate) fn flush_lobby_events(
@@ -60,7 +60,11 @@ pub(crate) fn apply_lobby_events(
                     commands
                         .entity(entity)
                         .remove::<(PendingLobby, RequestLobby)>()
-                        .insert((Lobby, LobbyWebrtcId(*lobby_id), LobbyWebrtcCode(code.clone())));
+                        .insert((
+                            Lobby,
+                            LobbyWebrtcId(*lobby_id),
+                            LobbyWebrtcCode(code.clone()),
+                        ));
                 }
             }
 
@@ -116,33 +120,11 @@ pub(crate) fn apply_lobby_events(
                 let player_uuid = *player_uuid;
                 info!("Player left lobby: {player_uuid}");
 
-                // Disconnect the WebRTC peer
-                socket.disconnect_peer(player_uuid);
-
-                if let Some(lobby) = host_lobby.as_ref() {
-                    let host_entity = **lobby;
-
+                if host_lobby.is_some() {
                     if let Some((client_entity, _, _)) = lobby_clients
                         .iter()
                         .find(|(_, _, puuid)| puuid.0 == player_uuid)
                     {
-                        commands
-                            .entity(host_entity)
-                            .trigger(move |entity| LobbyMessage::<RemoveLobbyParticipant> {
-                                entity,
-                                message: RemoveLobbyParticipant {
-                                    player_uuid,
-                                },
-                            });
-
-                        if let Some((participant_entity, _, _)) =
-                            participants.iter().find(|(_, p, pof)| {
-                                pof.0 == host_entity && p.player_uuid == player_uuid
-                            })
-                        {
-                            commands.entity(participant_entity).try_despawn();
-                        }
-
                         commands.entity(client_entity).try_despawn();
                     }
                 }
@@ -214,11 +196,9 @@ pub(crate) fn join_requested_lobbies(
 
     commands.spawn(PendingLobby);
 
-    let _ = lobby_conn
-        .command_tx
-        .send(ClientMessage::JoinLobby {
-            lobby_id: join_request.0,
-        });
+    let _ = lobby_conn.command_tx.send(ClientMessage::JoinLobby {
+        lobby_id: join_request.0,
+    });
 }
 
 pub(crate) fn join_requested_lobbies_by_code(
@@ -238,11 +218,9 @@ pub(crate) fn join_requested_lobbies_by_code(
 
     commands.spawn(PendingLobby);
 
-    let _ = lobby_conn
-        .command_tx
-        .send(ClientMessage::JoinLobbyByCode {
-            code: join_request.0,
-        });
+    let _ = lobby_conn.command_tx.send(ClientMessage::JoinLobbyByCode {
+        code: join_request.0,
+    });
 }
 
 pub(crate) fn refresh_lobby_list(
@@ -255,16 +233,19 @@ pub(crate) fn refresh_lobby_list(
 }
 
 /// Poll the EnsembleSocket for peer connect/disconnect events.
-/// Despawns lobby client entities when a peer disconnects.
+///
+/// - On the **host**: despawns lobby client entities when a peer disconnects.
+/// - On a **client**: despawns the lobby entity when the host peer disconnects
+///   (e.g. kicked or host left), which triggers the full leave/cleanup flow.
 pub(crate) fn poll_socket_peers(
     mut commands: Commands,
     mut socket: ResMut<crate::EnsembleSocketRes>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
+    client_lobbies: Query<Entity, (Or<(With<Lobby>, With<PendingLobby>)>, Without<Host>)>,
     lobby_clients: Query<
-        (Entity, &LobbyClientWebrtcUuid, &LobbyClientPlayerUuid),
+        (Entity, &LobbyClientWebrtcUuid),
         Or<(With<LobbyClient>, With<PendingWebrtcLobbyClient>)>,
     >,
-    participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
 ) {
     for (peer_id, state) in socket.update_peers() {
         match state {
@@ -274,34 +255,22 @@ pub(crate) fn poll_socket_peers(
             PeerState::Disconnected => {
                 info!("Peer disconnected: {peer_id}");
 
-                let Some(lobby) = host_lobby.as_ref() else {
-                    continue;
-                };
-                let host_entity = **lobby;
-
-                if let Some((client_entity, _, player_uuid)) = lobby_clients
-                    .iter()
-                    .find(|(_, client_uuid, _)| client_uuid.0 == peer_id)
-                {
-                    commands
-                        .entity(host_entity)
-                        .trigger(move |entity| LobbyMessage::<RemoveLobbyParticipant> {
-                            entity,
-                            message: RemoveLobbyParticipant {
-                                player_uuid: player_uuid.0,
-                            },
-                        });
-
-                    if let Some((participant_entity, _, _)) =
-                        participants.iter().find(|(_, p, pof)| {
-                            pof.0 == host_entity && p.player_uuid == player_uuid.0
-                        })
+                // Host side: despawn the lobby client for this peer
+                if host_lobby.is_some() {
+                    if let Some((client_entity, _)) = lobby_clients
+                        .iter()
+                        .find(|(_, client_uuid)| client_uuid.0 == peer_id)
                     {
-                        commands.entity(participant_entity).try_despawn();
+                        commands.entity(client_entity).try_despawn();
                     }
-
-                    commands.entity(client_entity).try_despawn();
+                    continue;
                 }
+
+                // Client side: the host disconnected us — leave the lobby
+                for entity in client_lobbies.iter() {
+                    commands.entity(entity).try_despawn();
+                }
+                commands.remove_resource::<LocalMultiplayerPlayerId>();
             }
         }
     }
@@ -321,8 +290,7 @@ pub(crate) fn pump_socket_signals(
     }
 
     for outgoing in socket.drain_signals() {
-        let data = serde_json::to_string(&outgoing.signal)
-            .expect("Failed to serialize PeerSignal");
+        let data = serde_json::to_string(&outgoing.signal).expect("Failed to serialize PeerSignal");
         let _ = lobby_conn.command_tx.send(ClientMessage::Signal {
             receiver_uuid: outgoing.peer,
             data,
@@ -367,6 +335,7 @@ pub(crate) fn send_serialized_lobby_packet(
     >,
     lobby_client_query: Query<&LobbyClientWebrtcUuid>,
 ) {
+    let reliable = packet.send_mode == bevy_ensemble::SendMode::Reliable;
     let data: Box<[u8]> = packet.packet.clone().into_boxed_slice();
 
     // Triggered on a lobby entity (active)
@@ -375,12 +344,12 @@ pub(crate) fn send_serialized_lobby_packet(
         match host {
             Some(_) => {
                 for peer in peers {
-                    socket.send(data.clone(), peer);
+                    socket.send_with_mode(data.clone(), peer, reliable);
                 }
             }
             None => {
                 if let Some(&peer) = peers.first() {
-                    socket.send(data, peer);
+                    socket.send_with_mode(data, peer, reliable);
                 }
             }
         }
@@ -393,12 +362,12 @@ pub(crate) fn send_serialized_lobby_packet(
         match host {
             Some(_) => {
                 for peer in peers {
-                    socket.send(data.clone(), peer);
+                    socket.send_with_mode(data.clone(), peer, reliable);
                 }
             }
             None => {
                 if let Some(&peer) = peers.first() {
-                    socket.send(data, peer);
+                    socket.send_with_mode(data, peer, reliable);
                 }
             }
         }
@@ -407,7 +376,7 @@ pub(crate) fn send_serialized_lobby_packet(
 
     // Triggered on a LobbyClient entity (targeted send)
     if let Ok(client_uuid) = lobby_client_query.get(packet.entity) {
-        socket.send(data, client_uuid.0);
+        socket.send_with_mode(data, client_uuid.0, reliable);
         return;
     }
 
@@ -434,124 +403,34 @@ pub(crate) fn read_peer_messages(world: &mut World) {
     }
 }
 
-/// Sends client handshakes to the host peer.
+/// Sends a removal notification and disconnects the WebRTC peer when a
+/// [`LobbyClient`] is removed.
 ///
-/// IMPORTANT: This must keep sending even after the client lobby is promoted from
-/// `PendingLobby` to `Lobby`. The host creates its `PendingWebrtcLobbyClient` entity
-/// from the `PlayerJoined` signaling event, which can arrive AFTER the host's own
-/// handshake has already promoted the client. If we stop sending here, the host may
-/// never receive a client handshake to promote with.
-pub(crate) fn send_client_handshakes(
+/// The removal packet must be sent directly here (not via deferred commands)
+/// because observer ordering is non-deterministic and `disconnect_peer` severs
+/// the connection immediately — any deferred message would arrive too late.
+pub(crate) fn disconnect_removed_lobby_client(
+    trigger: On<Remove, LobbyClient>,
+    query: Query<(&LobbyClientWebrtcUuid, &LobbyClientPlayerUuid)>,
     registry: Res<bevy_ensemble::EnsembleMessageRegistry>,
-    socket: ResMut<crate::EnsembleSocketRes>,
-    client_lobbies: Query<
-        &LobbyWebrtcId,
-        (Without<Host>, Or<(With<PendingLobby>, With<Lobby>)>),
-    >,
-    time: Res<Time>,
-    mut cooldown: Local<f32>,
+    mut socket: ResMut<crate::EnsembleSocketRes>,
 ) {
-    *cooldown -= time.delta_secs();
-    if *cooldown > 0.0 {
-        return;
-    }
-    *cooldown = 0.5;
-
-    if client_lobbies.is_empty() {
-        return;
-    }
-
-    let packet = encode_ensemble_message(&registry, &WebrtcReadyHandshake { from_host: false });
-    let data: Box<[u8]> = packet.into_boxed_slice();
-
-    let peers: Vec<u128> = socket.connected_peers().collect();
-    for peer in peers {
-        socket.send(data.clone(), peer);
-    }
-}
-
-pub(crate) fn send_host_handshakes(
-    registry: Res<bevy_ensemble::EnsembleMessageRegistry>,
-    socket: ResMut<crate::EnsembleSocketRes>,
-    host_lobbies: Query<&LobbyWebrtcId, (With<Lobby>, With<Host>)>,
-    time: Res<Time>,
-    mut cooldown: Local<f32>,
-) {
-    *cooldown -= time.delta_secs();
-    if *cooldown > 0.0 {
-        return;
-    }
-    *cooldown = 0.5;
-
-    if host_lobbies.is_empty() {
-        return;
-    }
-
-    let packet = encode_ensemble_message(&registry, &WebrtcReadyHandshake { from_host: true });
-    let data: Box<[u8]> = packet.into_boxed_slice();
-
-    let peers: Vec<u128> = socket.connected_peers().collect();
-    for peer in peers {
-        socket.send(data.clone(), peer);
-    }
-}
-
-pub(crate) fn promote_client_lobby_on_host_handshake(
-    mut commands: Commands,
-    mut messages: MessageReader<bevy_ensemble::ReceivedEnsembleMessage<WebrtcReadyHandshake>>,
-    pending_client_lobbies: Query<Entity, (With<PendingLobby>, Without<Lobby>, Without<Host>)>,
-) {
-    for message in messages.read() {
-        if !message.message.from_host {
-            continue;
-        }
-
-        let Some(entity) = pending_client_lobbies.iter().next() else {
-            continue;
-        };
-
-        commands
-            .entity(entity)
-            .remove::<PendingLobby>()
-            .insert(Lobby);
-    }
-}
-
-pub(crate) fn promote_host_client_on_client_handshake(
-    mut commands: Commands,
-    host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
-    mut messages: MessageReader<bevy_ensemble::ReceivedEnsembleMessage<WebrtcReadyHandshake>>,
-    pending_clients: Query<
-        (Entity, &LobbyClientPlayerUuid, &LobbyParticipantOf),
-        (With<PendingWebrtcLobbyClient>, With<LobbyClientWebrtcUuid>),
-    >,
-) {
-    let Some(host_lobby) = host_lobby else {
+    let Ok((webrtc_uuid, player_uuid)) = query.get(trigger.event_target()) else {
         return;
     };
 
-    for message in messages.read() {
-        if message.message.from_host {
-            continue;
-        }
-
-        let Some(sender) = message.sender else {
-            continue;
-        };
-
-        let Some((entity, _, _)) =
-            pending_clients
-                .iter()
-                .find(|(_, player_uuid, participant_of)| {
-                    participant_of.0 == *host_lobby && player_uuid.0 == sender
-                })
-        else {
-            continue;
-        };
-
-        commands
-            .entity(entity)
-            .remove::<PendingWebrtcLobbyClient>()
-            .insert(LobbyClient);
-    }
+    // We send the removal packet manually here because Bevy does not
+    // guarantee observer execution order. If this observer runs before the
+    // core `on_lobby_client_removed`, the peer will be disconnected before
+    // the deferred LobbyClientMessage ever flushes, so the kicked client
+    // would never learn it was removed.
+    // TODO: fix this once observer ordering lands (bevyengine/bevy#14890)
+    let packet = encode_ensemble_message(
+        &registry,
+        &RemoveLobbyParticipant {
+            player_uuid: player_uuid.0,
+        },
+    );
+    socket.send(packet.into_boxed_slice(), webrtc_uuid.0);
+    socket.disconnect_peer(webrtc_uuid.0);
 }

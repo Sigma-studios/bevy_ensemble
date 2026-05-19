@@ -3,6 +3,19 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{PlayerUUID, observers, registry::EnsembleMessageRegistry};
 
+/// Controls how a message is delivered over the network.
+///
+/// - [`Reliable`](SendMode::Reliable): guaranteed delivery and ordering (default).
+///   Use for gameplay-critical messages like chat, state sync, lobby management.
+/// - [`Unreliable`](SendMode::Unreliable): fire-and-forget with no delivery guarantee.
+///   Use for frequently-updated, loss-tolerant data like position updates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SendMode {
+    #[default]
+    Reliable,
+    Unreliable,
+}
+
 /// Marker trait for types that can be sent over the network as ensemble messages.
 ///
 /// Automatically implemented for any type that satisfies all bounds. You don't need
@@ -132,16 +145,32 @@ pub struct ReceivedEnsembleMessage<T: EnsembleMessage> {
 /// ```rust,ignore
 /// fn send_chat(mut commands: Commands, lobby: Single<Entity, With<Lobby>>) {
 ///     let message = ChatMessage { text: "Hello!".into() };
-///     commands.entity(*lobby).trigger(move |entity| LobbyMessage {
-///         entity,
-///         message,
-///     });
+///     commands.entity(*lobby).trigger(move |entity| LobbyMessage::new(entity, message));
 /// }
 /// ```
 #[derive(EntityEvent, Debug)]
 pub struct LobbyMessage<T: EnsembleMessage> {
     pub entity: Entity,
     pub message: T,
+    pub send_mode: SendMode,
+}
+
+impl<T: EnsembleMessage> LobbyMessage<T> {
+    pub fn new(entity: Entity, message: T) -> Self {
+        Self {
+            entity,
+            message,
+            send_mode: SendMode::Reliable,
+        }
+    }
+
+    pub fn new_unreliable(entity: Entity, message: T) -> Self {
+        Self {
+            entity,
+            message,
+            send_mode: SendMode::Unreliable,
+        }
+    }
 }
 
 /// Entity event to send a serialized message through a specific client connection.
@@ -156,6 +185,25 @@ pub struct LobbyMessage<T: EnsembleMessage> {
 pub struct LobbyClientMessage<T: EnsembleMessage> {
     pub entity: Entity,
     pub message: T,
+    pub send_mode: SendMode,
+}
+
+impl<T: EnsembleMessage> LobbyClientMessage<T> {
+    pub fn new(entity: Entity, message: T) -> Self {
+        Self {
+            entity,
+            message,
+            send_mode: SendMode::Reliable,
+        }
+    }
+
+    pub fn new_unreliable(entity: Entity, message: T) -> Self {
+        Self {
+            entity,
+            message,
+            send_mode: SendMode::Unreliable,
+        }
+    }
 }
 
 /// Entity event carrying a fully serialized network packet.
@@ -176,4 +224,5 @@ pub struct LobbyClientMessage<T: EnsembleMessage> {
 pub struct SerializedLobbyPacket {
     pub entity: Entity,
     pub packet: Vec<u8>,
+    pub send_mode: SendMode,
 }

@@ -2,7 +2,7 @@ use bevy::prelude::*;
 
 use crate::{
     Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipant, LobbyParticipantOf,
-    LocalMultiplayerPlayerId, PendingLobby, RequestLobby,
+    LocalMultiplayerPlayerId, PendingLobby, RequestLobby, SendMode,
     messages::{
         LobbyClientMessage, LobbyMessage, ReceivedEnsembleMessage, RemoveLobbyParticipant,
         StartHosting, SyncLobbyParticipant,
@@ -133,6 +133,7 @@ pub(crate) fn sync_existing_participants_to_new_lobby_clients(
                 .trigger(move |entity| LobbyClientMessage::<SyncLobbyParticipant> {
                     entity,
                     message,
+                    send_mode: SendMode::Reliable,
                 });
         }
     }
@@ -198,7 +199,7 @@ pub(crate) fn broadcast_changed_lobby_participants(
         };
         commands
             .entity(participant_of.0)
-            .trigger(move |entity| LobbyMessage::<SyncLobbyParticipant> { entity, message });
+            .trigger(move |entity| LobbyMessage::<SyncLobbyParticipant> { entity, message, send_mode: SendMode::Reliable });
     }
 }
 
@@ -251,10 +252,13 @@ pub(crate) fn apply_received_lobby_participants(
 /// Removes participant entities when a removal message is received.
 ///
 /// When a client receives a [`ReceivedEnsembleMessage<RemoveLobbyParticipant>`],
-/// this system despawns the matching participant entity.
+/// this system despawns the matching participant entity. If the removed
+/// participant is the local player (i.e. we were kicked), the lobby entity
+/// is despawned to trigger the full leave/cleanup flow.
 pub(crate) fn apply_removed_lobby_participants(
     mut commands: Commands,
     mut messages: MessageReader<ReceivedEnsembleMessage<RemoveLobbyParticipant>>,
+    local_player: Option<Res<LocalMultiplayerPlayerId>>,
     client_lobby: Option<Single<Entity, (With<Lobby>, Without<Host>)>>,
     pending_client_lobby: Option<Single<Entity, (With<PendingLobby>, Without<Host>)>>,
     existing_participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
@@ -267,6 +271,15 @@ pub(crate) fn apply_removed_lobby_participants(
     };
 
     for message in messages.read() {
+        // If we were kicked, tear down the lobby
+        if let Some(ref local_player) = local_player {
+            if message.message.player_uuid == local_player.0 {
+                commands.entity(client_lobby).try_despawn();
+                commands.remove_resource::<LocalMultiplayerPlayerId>();
+                return;
+            }
+        }
+
         if let Some((participant_entity, _, _)) =
             existing_participants
                 .iter()

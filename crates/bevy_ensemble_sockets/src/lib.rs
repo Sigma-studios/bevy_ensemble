@@ -200,13 +200,21 @@ impl EnsembleSocket {
             .map(|(&id, _)| id)
     }
 
-    /// Send binary data to a peer.
+    /// Send binary data to a peer over the reliable (ordered, guaranteed) channel.
     pub fn send(&self, data: Box<[u8]>, peer: u128) {
+        self.send_with_mode(data, peer, true);
+    }
+
+    /// Send binary data to a peer, choosing reliable or unreliable delivery.
+    ///
+    /// - `reliable = true`: ordered, guaranteed delivery.
+    /// - `reliable = false`: unordered, fire-and-forget (no retransmits).
+    pub fn send_with_mode(&self, data: Box<[u8]>, peer: u128, reliable: bool) {
         if let Some(pc) = self.peers.get(&peer) {
             #[cfg(not(target_arch = "wasm32"))]
-            native::send_message(pc, data);
+            native::send_message(pc, data, reliable);
             #[cfg(target_arch = "wasm32")]
-            wasm::send_message(pc, &data);
+            wasm::send_message(pc, &data, reliable);
         }
     }
 
