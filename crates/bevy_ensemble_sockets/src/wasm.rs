@@ -13,7 +13,8 @@ use crate::{OutgoingSignal, PeerSignal, PeerState};
 
 pub(crate) struct WasmPeerConnection {
     pub connection: RtcPeerConnection,
-    pub data_channel: RtcDataChannel,
+    pub reliable_channel: RtcDataChannel,
+    pub unreliable_channel: RtcDataChannel,
     /// ICE candidates received before remote description is set.
     pending_candidates: Arc<Mutex<Vec<String>>>,
     remote_desc_set: Arc<Mutex<bool>>,
@@ -61,43 +62,65 @@ pub(crate) fn create_peer_connection(
     conn.set_onicecandidate(Some(onicecandidate.as_ref().unchecked_ref()));
     onicecandidate.forget();
 
-    // Create negotiated data channel.
-    let dc_config = RtcDataChannelInit::new();
-    dc_config.set_ordered(true);
-    dc_config.set_negotiated(true);
-    dc_config.set_id(0);
-    let dc = conn.create_data_channel_with_data_channel_dict("ensemble_0", &dc_config);
-    dc.set_binary_type(RtcDataChannelType::Arraybuffer);
+    // Create negotiated reliable data channel (ordered, reliable).
+    let reliable_config = RtcDataChannelInit::new();
+    reliable_config.set_ordered(true);
+    reliable_config.set_negotiated(true);
+    reliable_config.set_id(0);
+    let reliable_dc = conn.create_data_channel_with_data_channel_dict("ensemble_reliable", &reliable_config);
+    reliable_dc.set_binary_type(RtcDataChannelType::Arraybuffer);
 
-    // Data channel events.
+    // Create negotiated unreliable data channel (unordered, no retransmits).
+    let unreliable_config = RtcDataChannelInit::new();
+    unreliable_config.set_ordered(false);
+    unreliable_config.set_max_retransmits(0);
+    unreliable_config.set_negotiated(true);
+    unreliable_config.set_id(1);
+    let unreliable_dc = conn.create_data_channel_with_data_channel_dict("ensemble_unreliable", &unreliable_config);
+    unreliable_dc.set_binary_type(RtcDataChannelType::Arraybuffer);
+
+    // Use the reliable channel for connection state signaling.
     let ps_tx = peer_state_tx.clone();
     let onopen: Closure<dyn FnMut(JsValue)> = Closure::wrap(Box::new(move |_: JsValue| {
         let _ = ps_tx.send((peer_id, PeerState::Connected));
     }));
-    dc.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+    reliable_dc.set_onopen(Some(onopen.as_ref().unchecked_ref()));
     onopen.forget();
 
     let ps_tx = peer_state_tx;
     let onclose: Closure<dyn FnMut(JsValue)> = Closure::wrap(Box::new(move |_: JsValue| {
         let _ = ps_tx.send((peer_id, PeerState::Disconnected));
     }));
-    dc.set_onclose(Some(onclose.as_ref().unchecked_ref()));
+    reliable_dc.set_onclose(Some(onclose.as_ref().unchecked_ref()));
     onclose.forget();
 
-    let msg_tx = message_tx;
-    let onmessage: Closure<dyn FnMut(MessageEvent)> =
+    // Both channels feed into the same message receiver.
+    let msg_tx_reliable = message_tx.clone();
+    let onmessage_reliable: Closure<dyn FnMut(MessageEvent)> =
         Closure::wrap(Box::new(move |event: MessageEvent| {
             if let Ok(buf) = event.data().dyn_into::<js_sys::ArrayBuffer>() {
                 let arr = js_sys::Uint8Array::new(&buf);
-                let _ = msg_tx.send((peer_id, arr.to_vec().into_boxed_slice()));
+                let _ = msg_tx_reliable.send((peer_id, arr.to_vec().into_boxed_slice()));
             }
         }));
-    dc.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-    onmessage.forget();
+    reliable_dc.set_onmessage(Some(onmessage_reliable.as_ref().unchecked_ref()));
+    onmessage_reliable.forget();
+
+    let msg_tx_unreliable = message_tx;
+    let onmessage_unreliable: Closure<dyn FnMut(MessageEvent)> =
+        Closure::wrap(Box::new(move |event: MessageEvent| {
+            if let Ok(buf) = event.data().dyn_into::<js_sys::ArrayBuffer>() {
+                let arr = js_sys::Uint8Array::new(&buf);
+                let _ = msg_tx_unreliable.send((peer_id, arr.to_vec().into_boxed_slice()));
+            }
+        }));
+    unreliable_dc.set_onmessage(Some(onmessage_unreliable.as_ref().unchecked_ref()));
+    onmessage_unreliable.forget();
 
     WasmPeerConnection {
         connection: conn,
-        data_channel: dc,
+        reliable_channel: reliable_dc,
+        unreliable_channel: unreliable_dc,
         pending_candidates: Arc::new(Mutex::new(Vec::new())),
         remote_desc_set: Arc::new(Mutex::new(false)),
     }
@@ -226,6 +249,11 @@ async fn apply_ice_candidate(conn: &RtcPeerConnection, json: &str) {
     .await;
 }
 
-pub(crate) fn send_message(pc: &WasmPeerConnection, data: &[u8]) {
-    let _ = pc.data_channel.send_with_u8_array(&mut data.to_vec());
+pub(crate) fn send_message(pc: &WasmPeerConnection, data: &[u8], reliable: bool) {
+    let dc = if reliable {
+        &pc.reliable_channel
+    } else {
+        &pc.unreliable_channel
+    };
+    let _ = dc.send_with_u8_array(&mut data.to_vec());
 }

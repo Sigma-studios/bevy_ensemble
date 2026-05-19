@@ -76,16 +76,22 @@
 
 use bevy::prelude::*;
 
+mod broadcast;
 mod components;
 mod messages;
 pub(crate) mod observers;
+mod ping;
+mod player_data;
 pub mod prelude;
 pub mod registry;
 mod systems;
 mod types;
 
+pub use broadcast::{BroadcastLobbyMessage, LobbyBroadcastAppExt, LobbyBroadcastPlugin};
 pub use components::*;
 pub use messages::*;
+pub use ping::PeerRtt;
+pub use player_data::{PlayerData, PlayerDataPlugin, SetPlayerData};
 pub use registry::{EnsembleMessageRegistry, decode_ensemble_packet, encode_ensemble_message};
 pub use types::*;
 
@@ -112,6 +118,9 @@ impl Plugin for EnsemblePlugin {
             .add_message::<StartHosting>()
             .register_ensemble_message_type::<SyncLobbyParticipant>()
             .register_ensemble_message_type::<RemoveLobbyParticipant>()
+            .register_ensemble_message_type::<ping::EnsemblePing>()
+            .register_ensemble_message_type::<ping::EnsemblePong>()
+            .add_observer(observers::on_lobby_client_removed)
             .add_systems(
                 Update,
                 (
@@ -125,6 +134,9 @@ impl Plugin for EnsemblePlugin {
                         .after(systems::add_remote_lobby_participants),
                     systems::apply_received_lobby_participants,
                     systems::apply_removed_lobby_participants,
+                    ping::send_pings,
+                    ping::respond_to_pings,
+                    ping::receive_pongs,
                 ),
             );
     }

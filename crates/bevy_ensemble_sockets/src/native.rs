@@ -19,7 +19,8 @@ const STUN_URLS: &[&str] = &[
 
 pub(crate) struct NativePeerConnection {
     pub connection: Arc<RTCPeerConnection>,
-    pub data_channel: Arc<RTCDataChannel>,
+    pub reliable_channel: Arc<RTCDataChannel>,
+    pub unreliable_channel: Arc<RTCDataChannel>,
     runtime_handle: tokio::runtime::Handle,
 }
 
@@ -65,22 +66,37 @@ pub(crate) fn create_peer_connection(
         }));
     }
 
-    // Create negotiated data channel.
-    let dc_config = RTCDataChannelInit {
+    // Create negotiated reliable data channel (ordered, reliable).
+    let reliable_config = RTCDataChannelInit {
         ordered: Some(true),
         negotiated: Some(0),
         ..Default::default()
     };
-    let data_channel = handle.block_on(async {
+    let reliable_channel = handle.block_on(async {
         connection
-            .create_data_channel("ensemble_0", Some(dc_config))
+            .create_data_channel("ensemble_reliable", Some(reliable_config))
             .await
             .unwrap()
     });
 
+    // Create negotiated unreliable data channel (unordered, no retransmits).
+    let unreliable_config = RTCDataChannelInit {
+        ordered: Some(false),
+        max_retransmits: Some(0),
+        negotiated: Some(1),
+        ..Default::default()
+    };
+    let unreliable_channel = handle.block_on(async {
+        connection
+            .create_data_channel("ensemble_unreliable", Some(unreliable_config))
+            .await
+            .unwrap()
+    });
+
+    // Use the reliable channel for connection state signaling.
     {
         let ps_tx = peer_state_tx.clone();
-        data_channel.on_open(Box::new(move || {
+        reliable_channel.on_open(Box::new(move || {
             let _ = ps_tx.send((peer_id, PeerState::Connected));
             Box::pin(async {})
         }));
@@ -88,15 +104,24 @@ pub(crate) fn create_peer_connection(
 
     {
         let ps_tx = peer_state_tx;
-        data_channel.on_close(Box::new(move || {
+        reliable_channel.on_close(Box::new(move || {
             let _ = ps_tx.send((peer_id, PeerState::Disconnected));
+            Box::pin(async {})
+        }));
+    }
+
+    // Both channels feed into the same message receiver.
+    {
+        let msg_tx = message_tx.clone();
+        reliable_channel.on_message(Box::new(move |msg| {
+            let _ = msg_tx.send((peer_id, msg.data.to_vec().into_boxed_slice()));
             Box::pin(async {})
         }));
     }
 
     {
         let msg_tx = message_tx;
-        data_channel.on_message(Box::new(move |msg| {
+        unreliable_channel.on_message(Box::new(move |msg| {
             let _ = msg_tx.send((peer_id, msg.data.to_vec().into_boxed_slice()));
             Box::pin(async {})
         }));
@@ -104,7 +129,8 @@ pub(crate) fn create_peer_connection(
 
     NativePeerConnection {
         connection,
-        data_channel,
+        reliable_channel,
+        unreliable_channel,
         runtime_handle: handle,
     }
 }
@@ -180,8 +206,12 @@ pub(crate) fn add_ice_candidate(
     });
 }
 
-pub(crate) fn send_message(pc: &NativePeerConnection, data: Box<[u8]>) {
-    let dc = pc.data_channel.clone();
+pub(crate) fn send_message(pc: &NativePeerConnection, data: Box<[u8]>, reliable: bool) {
+    let dc = if reliable {
+        pc.reliable_channel.clone()
+    } else {
+        pc.unreliable_channel.clone()
+    };
     let bytes = bytes::Bytes::from(data.into_vec());
     pc.runtime_handle.spawn(async move {
         let _ = dc.send(&bytes).await;
