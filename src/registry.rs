@@ -86,17 +86,14 @@ pub fn encode_ensemble_message<T: EnsembleMessage>(
             type_name::<T>()
         )
     });
-    let payload = postcard::to_allocvec(message).unwrap_or_else(|error| {
+
+    let packet = Vec::from(index.to_le_bytes().as_slice());
+    postcard::to_extend(message, packet).unwrap_or_else(|error| {
         panic!(
             "Failed to serialize ensemble message type `{}`: {error}",
             type_name::<T>()
         )
-    });
-
-    let mut packet = Vec::with_capacity(MESSAGE_TYPE_INDEX_BYTES + payload.len());
-    packet.extend_from_slice(&index.to_le_bytes());
-    packet.extend_from_slice(&payload);
-    packet
+    })
 }
 
 /// Deserializes a network packet and dispatches it as a [`ReceivedEnsembleMessage`].

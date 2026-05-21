@@ -162,16 +162,9 @@ fn relay_broadcast_envelopes(world: &mut World) {
         return;
     }
 
-    let is_host = {
-        let mut query = world.query_filtered::<(), (With<Lobby>, With<Host>)>();
-        query.iter(world).next().is_some()
-    };
-
-    let host_entity = if is_host {
+    let host_entity = {
         let mut query = world.query_filtered::<Entity, (With<Lobby>, With<Host>)>();
         query.iter(world).next()
-    } else {
-        None
     };
 
     for envelope in &envelopes {

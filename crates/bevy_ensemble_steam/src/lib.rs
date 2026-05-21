@@ -399,22 +399,19 @@ fn react_to_events(
 }
 
 fn read_messages(world: &mut World) {
-    let packets: Vec<_> = {
+    let messages = {
         let steam_client = world.resource::<Client>();
         steam_client
             .networking_messages()
             .receive_messages_on_channel(0, 64)
-            .into_iter()
-            .filter_map(|msg| {
-                let steam_id = msg.identity_peer().steam_id()?;
-                Some((steam_id, msg.data().to_vec()))
-            })
-            .collect()
     };
 
-    for (steam_id, packet) in packets {
+    for msg in &messages {
+        let Some(steam_id) = msg.identity_peer().steam_id() else {
+            continue;
+        };
         ensure_pending_lobby_client_for_remote_world(world, steam_id);
-        decode_ensemble_packet(world, Some(u128::from(steam_id.raw())), &packet);
+        decode_ensemble_packet(world, Some(u128::from(steam_id.raw())), msg.data());
     }
 }
 
