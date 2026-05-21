@@ -111,7 +111,7 @@ pub(crate) fn on_lobby_client_removed(
 /// Serializes a [`LobbyClientMessage`] into a [`SerializedLobbyPacket`].
 ///
 /// Uses the [`EnsembleMessageRegistry`] to encode the message with its type index
-/// and CBOR payload, then triggers a [`SerializedLobbyPacket`] on the same entity
+/// and postcard payload, then triggers a [`SerializedLobbyPacket`] on the same entity
 /// for the platform backend to transmit.
 pub(crate) fn encode_lobby_client_message<T: EnsembleMessage>(
     message: On<LobbyClientMessage<T>>,

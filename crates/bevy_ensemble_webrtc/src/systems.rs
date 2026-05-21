@@ -336,46 +336,30 @@ pub(crate) fn send_serialized_lobby_packet(
     lobby_client_query: Query<&LobbyClientWebrtcUuid>,
 ) {
     let reliable = packet.send_mode == bevy_ensemble::SendMode::Reliable;
-    let data: Box<[u8]> = packet.packet.clone().into_boxed_slice();
 
-    // Triggered on a lobby entity (active)
-    if let Ok((host, _)) = lobby_query.get(packet.entity) {
-        let peers: Vec<u128> = socket.connected_peers().collect();
-        match host {
-            Some(_) => {
-                for peer in peers {
-                    socket.send_with_mode(data.clone(), peer, reliable);
-                }
-            }
-            None => {
-                if let Some(&peer) = peers.first() {
-                    socket.send_with_mode(data, peer, reliable);
-                }
-            }
-        }
-        return;
-    }
+    // Resolve the target: active lobby, pending lobby, or a specific client entity.
+    let host = lobby_query
+        .get(packet.entity)
+        .or_else(|_| pending_lobby_query.get(packet.entity))
+        .ok()
+        .map(|(host, _)| host);
 
-    // Triggered on a pending lobby entity
-    if let Ok((host, _)) = pending_lobby_query.get(packet.entity) {
+    if let Some(host) = host {
+        let data: Box<[u8]> = packet.packet.clone().into_boxed_slice();
         let peers: Vec<u128> = socket.connected_peers().collect();
-        match host {
-            Some(_) => {
-                for peer in peers {
-                    socket.send_with_mode(data.clone(), peer, reliable);
-                }
+        if host.is_some() {
+            for peer in peers {
+                socket.send_with_mode(data.clone(), peer, reliable);
             }
-            None => {
-                if let Some(&peer) = peers.first() {
-                    socket.send_with_mode(data, peer, reliable);
-                }
-            }
+        } else if let Some(&peer) = peers.first() {
+            socket.send_with_mode(data, peer, reliable);
         }
         return;
     }
 
     // Triggered on a LobbyClient entity (targeted send)
     if let Ok(client_uuid) = lobby_client_query.get(packet.entity) {
+        let data: Box<[u8]> = packet.packet.clone().into_boxed_slice();
         socket.send_with_mode(data, client_uuid.0, reliable);
         return;
     }
@@ -387,14 +371,10 @@ pub(crate) fn send_serialized_lobby_packet(
 }
 
 pub(crate) fn read_peer_messages(world: &mut World) {
-    let mut packets = Vec::new();
-
-    {
+    let packets = {
         let mut socket = world.resource_mut::<crate::EnsembleSocketRes>();
-        for (sender_uuid, packet) in socket.receive() {
-            packets.push((sender_uuid, packet.to_vec()));
-        }
-    }
+        socket.receive()
+    };
 
     for (sender_uuid, payload) in packets {
         if !decode_ensemble_packet(world, Some(sender_uuid), &payload) {
