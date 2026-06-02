@@ -982,6 +982,7 @@ dependencies = [
  "bevy_ensemble",
  "bevy_immediate",
  "serde",
+ "steamworks-sys",
 ]
 
 [[package]]
