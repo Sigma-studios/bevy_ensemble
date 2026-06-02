@@ -6,11 +6,11 @@ use bevy_ensemble::{
 };
 pub use bevy_steamworks::LobbyId;
 use bevy_steamworks::{
-    CallbackResult, ChatMemberStateChange, ChatRoomEnterResponse, Client, FriendFlags, LobbyType,
-    SteamId, SteamworksEvent, SteamworksPlugin,
+    CallbackResult, ChatMemberStateChange, ChatRoomEnterResponse, Client, FriendFlags,
+    LobbyDataUpdate, LobbyType, SteamId, SteamworksEvent, SteamworksPlugin,
     networking_types::{NetworkingIdentity, SendFlags},
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub const DEFAULT_STEAM_APP_ID: u32 = 480;
 /// TODO: this is EResult::k_EResultOK, swap it out for the proper type once exposed by steamworks-rs
@@ -35,6 +35,19 @@ pub struct SteamFriendLobbySummary {
 
 #[derive(Resource, Clone, Debug, Default)]
 pub struct SteamFriendLobbies(pub Vec<SteamFriendLobbySummary>);
+
+#[derive(Resource, Debug)]
+struct PendingSteamFriendLobbies {
+    lobbies: HashMap<u64, SteamFriendLobbySummary>,
+}
+
+fn request_lobby_data(lobby_id: LobbyId) -> bool {
+    unsafe {
+        // TODO: remove steamworks_sys dependency when steamworks-rs 0.13.2 or 0.14 releases
+        let mm = steamworks_sys::SteamAPI_SteamMatchmaking_v009();
+        steamworks_sys::SteamAPI_ISteamMatchmaking_RequestLobbyData(mm, lobby_id.raw())
+    }
+}
 
 #[derive(Message, Clone, Copy, Debug)]
 pub struct JoinSteamLobby(pub LobbyId);
@@ -184,14 +197,15 @@ fn populate_friend_lobbies(
     mut commands: Commands,
     steam_client: Res<Client>,
     existing_list: Option<Res<SteamFriendLobbies>>,
+    pending_list: Option<Res<PendingSteamFriendLobbies>>,
 ) {
-    if existing_list.is_some() {
+    if existing_list.is_some() || pending_list.is_some() {
         return;
     }
 
     let current_app_id = steam_client.utils().app_id();
     let mut seen_lobbies = HashSet::new();
-    let mut lobbies = Vec::new();
+    let mut lobbies = HashMap::new();
 
     for friend in steam_client.friends().get_friends(FriendFlags::IMMEDIATE) {
         let Some(friend_game) = friend.game_played() else {
@@ -206,14 +220,47 @@ fn populate_friend_lobbies(
             continue;
         }
 
-        lobbies.push(SteamFriendLobbySummary {
-            lobby_id,
-            host_name: friend.name(),
-            member_count: steam_client.matchmaking().lobby_member_count(lobby_id),
-        });
+        request_lobby_data(lobby_id);
+
+        lobbies.insert(
+            lobby_id.raw(),
+            SteamFriendLobbySummary {
+                lobby_id,
+                host_name: friend.name(),
+                member_count: 0,
+            },
+        );
     }
 
-    commands.insert_resource(SteamFriendLobbies(lobbies));
+    if lobbies.is_empty() {
+        commands.insert_resource(SteamFriendLobbies::default());
+    } else {
+        commands.insert_resource(PendingSteamFriendLobbies { lobbies });
+    }
+}
+
+fn hydrate_friend_lobbies(
+    commands: &mut Commands,
+    steam_client: &Client,
+    pending: &mut PendingSteamFriendLobbies,
+    data: &LobbyDataUpdate,
+) {
+    if !data.success {
+        pending.lobbies.remove(&data.lobby.raw());
+    } else if let Some(summary) = pending.lobbies.get_mut(&data.lobby.raw()) {
+        summary.member_count = steam_client.matchmaking().lobby_member_count(data.lobby);
+    }
+
+    let all_hydrated = pending
+        .lobbies
+        .values()
+        .all(|summary| summary.member_count > 0);
+
+    if all_hydrated {
+        let lobbies: Vec<_> = pending.lobbies.drain().map(|(_, v)| v).collect();
+        commands.remove_resource::<PendingSteamFriendLobbies>();
+        commands.insert_resource(SteamFriendLobbies(lobbies));
+    }
 }
 
 fn join_requested_lobbies(
@@ -257,6 +304,7 @@ fn react_to_events(
         ),
         Or<(With<LobbyClient>, With<PendingSteamLobbyClient>)>,
     >,
+    mut pending_friend_lobbies: Option<ResMut<PendingSteamFriendLobbies>>,
 ) {
     let local_steam_id = steam_client.user().steam_id();
 
@@ -324,6 +372,9 @@ fn react_to_events(
                         "Lobby member count: {:?}",
                         steam_client.matchmaking().lobby_member_count(data.lobby)
                     );
+                    if let Some(pending) = pending_friend_lobbies.as_deref_mut() {
+                        hydrate_friend_lobbies(&mut commands, &steam_client, pending, data);
+                    }
                 }
                 CallbackResult::LobbyChatUpdate(update) => {
                     debug!("Lobby chat updated: {:?}", update);
@@ -374,11 +425,7 @@ fn react_to_events(
                     };
 
                     if host_lobby.is_some() {
-                        despawn_lobby_client_for_remote(
-                            &mut commands,
-                            &lobby_clients,
-                            remote,
-                        );
+                        despawn_lobby_client_for_remote(&mut commands, &lobby_clients, remote);
                     } else {
                         despawn_client_lobby_for_remote_owner(
                             &mut commands,
@@ -399,22 +446,35 @@ fn react_to_events(
 }
 
 fn read_messages(world: &mut World) {
-    let messages = {
-        let steam_client = world.resource::<Client>();
-        steam_client
-            .networking_messages()
-            .receive_messages_on_channel(0, 64)
-    };
+    const BATCH_SIZE: usize = 64;
 
-    for msg in &messages {
-        let Some(steam_id) = msg.identity_peer().steam_id() else {
-            continue;
+    loop {
+        let messages = {
+            let steam_client = world.resource::<Client>();
+            steam_client
+                .networking_messages()
+                .receive_messages_on_channel(0, BATCH_SIZE)
         };
-        ensure_pending_lobby_client_for_remote_world(world, steam_id);
-        decode_ensemble_packet(world, Some(u128::from(steam_id.raw())), msg.data());
+
+        let count = messages.len();
+
+        for msg in &messages {
+            let Some(steam_id) = msg.identity_peer().steam_id() else {
+                continue;
+            };
+            ensure_pending_lobby_client_for_remote_world(world, steam_id);
+            decode_ensemble_packet(world, Some(u128::from(steam_id.raw())), msg.data());
+        }
+
+        if count < BATCH_SIZE {
+            break;
+        }
     }
 }
 
+// Retries every 500ms because the peer's `PendingLobby` / `PendingSteamLobbyClient`
+// entity may not exist yet when the first handshake arrives. Messages are sent
+// reliably so loss isn't the concern — only the entity-readiness race.
 fn send_client_handshakes(
     steam_client: Res<Client>,
     registry: Res<bevy_ensemble::EnsembleMessageRegistry>,
@@ -629,7 +689,6 @@ fn despawn_lobby_client_for_remote(
         commands.entity(client_entity).try_despawn();
     }
 }
-
 
 fn despawn_client_lobby_for_lost_connection(
     commands: &mut Commands,
