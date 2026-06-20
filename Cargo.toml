@@ -11,6 +11,6 @@ members = [
 ]
 
 [dependencies]
-bevy = { version = "0.18", features = ["serialize"] }
+bevy = { version = "0.19", features = ["serialize"] }
 postcard = { version = "1", features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
