@@ -104,7 +104,47 @@ pub fn encode_ensemble_message<T: EnsembleMessage>(
 ///
 /// Returns `true` if the packet was successfully decoded and dispatched, `false` otherwise.
 /// Malformed packets are logged as warnings and skipped rather than panicking.
+///
+/// When the `netmetrics`/`netdebug` features are enabled this is the inbound
+/// measurement + simulation seam: bytes are counted, and (under `netdebug`) the
+/// packet may be dropped or delayed by the network simulator before it is decoded.
+/// See [`crate::netsim`]. With those features off, this is a direct call into the
+/// decode path with no added cost.
 pub fn decode_ensemble_packet(world: &mut World, sender: Option<PlayerUUID>, packet: &[u8]) -> bool {
+    #[cfg(feature = "netmetrics")]
+    if let Some(mut metrics) = world.get_resource_mut::<crate::netmetrics::NetMetrics>() {
+        metrics.rx_bytes += packet.len() as u64;
+        metrics.rx_packets += 1;
+    }
+
+    #[cfg(feature = "netdebug")]
+    match crate::netsim::offer_inbound(world, sender, packet) {
+        crate::netsim::SimVerdict::PassThrough => {}
+        crate::netsim::SimVerdict::Dropped => {
+            if let Some(mut metrics) = world.get_resource_mut::<crate::netmetrics::NetMetrics>() {
+                metrics.sim_dropped += 1;
+            }
+            return false;
+        }
+        crate::netsim::SimVerdict::Delayed { duplicated } => {
+            if let Some(mut metrics) = world.get_resource_mut::<crate::netmetrics::NetMetrics>() {
+                metrics.sim_duplicated += duplicated as u64;
+            }
+            // Packet is queued; it will be decoded later by `drain_netsim`.
+            return true;
+        }
+    }
+
+    decode_ensemble_packet_now(world, sender, packet)
+}
+
+/// The actual decode path, with no metrics or simulation. Called directly when the
+/// simulator is inactive, and by `drain_netsim` when a delayed packet comes due.
+pub(crate) fn decode_ensemble_packet_now(
+    world: &mut World,
+    sender: Option<PlayerUUID>,
+    packet: &[u8],
+) -> bool {
     if packet.len() < MESSAGE_TYPE_INDEX_BYTES {
         warn!("Received ensemble packet too short to contain a type index ({} bytes)", packet.len());
         return false;
