@@ -79,6 +79,12 @@ use bevy::prelude::*;
 mod broadcast;
 mod components;
 mod messages;
+#[cfg(feature = "netdebug")]
+mod netdebug;
+#[cfg(feature = "netmetrics")]
+mod netmetrics;
+#[cfg(feature = "netdebug")]
+pub mod netsim;
 pub(crate) mod observers;
 mod ping;
 mod player_data;
@@ -90,6 +96,12 @@ mod types;
 pub use broadcast::{BroadcastLobbyMessage, LobbyBroadcastAppExt, LobbyBroadcastPlugin};
 pub use components::*;
 pub use messages::*;
+#[cfg(feature = "netdebug")]
+pub use netdebug::{NetDebugConfig, NetDebugPlugin};
+#[cfg(feature = "netmetrics")]
+pub use netmetrics::NetMetrics;
+#[cfg(feature = "netdebug")]
+pub use netsim::{NetPreset, NetSim, NetSimConfig};
 pub use ping::{PeerLastPong, PeerRtt};
 pub use player_data::{PlayerData, PlayerDataPlugin, SetPlayerData};
 pub use registry::{EnsembleMessageRegistry, decode_ensemble_packet, encode_ensemble_message};
@@ -140,5 +152,14 @@ impl Plugin for EnsemblePlugin {
                     ping::tick_last_pong,
                 ),
             );
+
+        // Network measurement (bytes/packets in & out, sampled rates). Cheap enough
+        // to leave on in dev; compiled out entirely without the feature. Auto-added so
+        // metrics are always collected when the feature is on.
+        //
+        // The interactive overlay + network-condition simulator is a separate, opt-in
+        // plugin the game adds and configures itself — see [`netdebug::NetDebugPlugin`].
+        #[cfg(feature = "netmetrics")]
+        app.add_plugins(netmetrics::NetMetricsPlugin);
     }
 }

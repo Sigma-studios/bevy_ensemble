@@ -39,3 +39,11 @@ pub use crate::{
     // Messages & events
     EnsembleAppExt, LobbyMessage, ReceivedEnsembleMessage, SendMode, StartHosting,
 };
+
+// Network metrics (feature `netmetrics`).
+#[cfg(feature = "netmetrics")]
+pub use crate::NetMetrics;
+
+// Interactive network debug overlay + condition simulator (feature `netdebug`).
+#[cfg(feature = "netdebug")]
+pub use crate::{NetDebugConfig, NetDebugPlugin, NetPreset, NetSim, NetSimConfig};

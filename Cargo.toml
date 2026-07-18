@@ -14,3 +14,12 @@ members = [
 bevy = { version = "0.19", features = ["serialize"] }
 postcard = { version = "1", features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
+
+[features]
+# Lightweight network counters (bytes/packets in & out, sampled rates).
+# A handful of integer adds at the packet boundary — safe to leave on in dev.
+netmetrics = []
+# Interactive dev overlay: live metrics window + toggleable network-condition
+# simulation (delay / jitter / loss / duplication). Implies `netmetrics`.
+# Compiled entirely out of release builds — no window, no shim, no cost.
+netdebug = ["netmetrics"]
