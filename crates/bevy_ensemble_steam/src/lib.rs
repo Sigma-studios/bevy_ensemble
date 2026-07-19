@@ -93,8 +93,13 @@ impl Plugin for BevyEnsembleSteamPlugin {
                 send_host_handshakes,
                 promote_client_lobby_on_host_handshake,
                 promote_host_client_on_client_handshake,
-                read_messages,
             ),
+        )
+        // Drain messages in PreUpdate so every Update reader (core and game) sees this
+        // frame's packets the same frame they arrived.
+        .add_systems(
+            PreUpdate,
+            read_messages.in_set(bevy_ensemble::EnsembleSet::ReceivePackets),
         )
         .add_observer(send_serialized_lobby_packet);
     }

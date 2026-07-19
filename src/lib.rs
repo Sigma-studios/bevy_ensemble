@@ -124,6 +124,19 @@ pub use types::*;
 /// ```
 pub struct EnsemblePlugin;
 
+/// System sets exposed by [`EnsemblePlugin`] so backends and games can order work around
+/// the packet-receive boundary.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EnsembleSet {
+    /// The backend system that pulls bytes off the socket and dispatches them as
+    /// [`ReceivedEnsembleMessage`](crate::ReceivedEnsembleMessage)s. Each transport backend
+    /// puts its receive system in this set and runs it in [`PreUpdate`], so every
+    /// [`Update`] reader — core handlers and game systems alike — sees a packet the same
+    /// frame it arrives rather than a frame later. Order a system relative to this set to
+    /// tighten it further if needed.
+    ReceivePackets,
+}
+
 impl Plugin for EnsemblePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<EnsembleMessageRegistry>()
@@ -147,6 +160,8 @@ impl Plugin for EnsemblePlugin {
                     systems::apply_received_lobby_participants,
                     systems::apply_removed_lobby_participants,
                     ping::send_pings,
+                    // Packets are drained in PreUpdate (see `EnsembleSet::ReceivePackets`),
+                    // so these Update handlers already see this frame's pings/pongs.
                     ping::respond_to_pings,
                     ping::receive_pongs,
                     ping::tick_last_pong,
