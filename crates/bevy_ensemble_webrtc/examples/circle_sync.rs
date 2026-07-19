@@ -568,7 +568,7 @@ fn apply_player_colors(
         let [r, g, b] = profile.0.color;
         for (circle, material_handle) in circles.iter() {
             if circle.0 == participant.player_uuid {
-                if let Some(material) = materials.get_mut(&material_handle.0) {
+                if let Some(mut material) = materials.get_mut(&material_handle.0) {
                     material.color = Color::srgb(r, g, b);
                 }
             }
