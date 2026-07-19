@@ -1,4 +1,6 @@
 use bevy::prelude::*;
+use bevy::window::{PresentMode, PrimaryWindow};
+use bevy::winit::WinitSettings;
 use bevy_ensemble::{
     BroadcastLobbyMessage, EnsembleAppExt, EnsemblePlugin, Host, Lobby, LobbyBroadcastAppExt,
     LobbyBroadcastPlugin, LobbyClient, LobbyClientPlayerUuid, LobbyMessage, LobbyParticipant,
@@ -79,6 +81,7 @@ struct MinimalLobbyExamplePlugin;
 impl Plugin for MinimalLobbyExamplePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ChatLog>()
+            .init_resource::<FastLoop>()
             .register_broadcast_message::<ChatMessage>()
             .register_ensemble_message_type::<WaveAction>()
             .add_systems(Startup, setup_camera)
@@ -95,6 +98,8 @@ impl Plugin for MinimalLobbyExamplePlugin {
                     receive_chat_messages,
                     receive_wave_actions,
                     handle_escape_key,
+                    handle_fast_loop_toggle,
+                    update_fast_loop_hint,
                 ),
             );
     }
@@ -134,6 +139,24 @@ fn setup_camera(mut commands: Commands) {
             ..default()
         },
         Visibility::Hidden,
+    ));
+
+    // Always-visible corner hint explaining the fast-loop toggle (see below).
+    commands.spawn((
+        FastLoopHint,
+        Text::default(),
+        TextFont {
+            font_size: FontSize::Px(13.0),
+            ..default()
+        },
+        TextColor(Color::srgb(0.7, 0.8, 0.9)),
+        Node {
+            position_type: PositionType::Absolute,
+            top: px(8.),
+            right: px(8.),
+            max_width: px(360.),
+            ..default()
+        },
     ));
 }
 
@@ -487,6 +510,71 @@ fn handle_escape_key(
 
     commands.remove_resource::<LocalMultiplayerPlayerId>();
     chat_log.0.clear();
+}
+
+/// Runtime state of the fast-loop toggle (see [`handle_fast_loop_toggle`]).
+#[derive(Resource, Default)]
+struct FastLoop(bool);
+
+/// Marker for the corner hint text that explains the fast-loop toggle.
+#[derive(Component)]
+struct FastLoopHint;
+
+/// Press **F** to toggle a "fast loop" mode that makes the app run as fast as possible.
+///
+/// It flips two Bevy defaults at once:
+/// - [`WinitSettings::continuous`] — stop throttling the window when it loses focus. By
+///   default ([`WinitSettings::game`]) an unfocused window drops to a 60Hz low-power loop.
+///   That matters when you run two instances on one PC: only one has focus, so the
+///   background one wakes ~60×/sec and adds latency to everything it handles.
+/// - [`PresentMode::AutoNoVsync`] — remove the vsync frame cap (the default is vsync, which
+///   pins updates to the monitor refresh — e.g. 144Hz is one update every ~6.9ms).
+///
+/// Why it matters for the ping readout: on localhost a packet spends ~no time on the wire,
+/// so the RTT you see is almost entirely frame quantization — each hop waits for the next
+/// frame on each side. Turning this on shrinks the frames toward zero, so the `rtt`/`wire`
+/// numbers collapse toward the true (~sub-ms) transit time. It's a diagnostic switch, not
+/// something a shipping game would leave on (it spins the CPU at 100%).
+fn handle_fast_loop_toggle(
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    mut fast: ResMut<FastLoop>,
+    mut winit: ResMut<WinitSettings>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+) {
+    if !keyboard_input.just_pressed(KeyCode::KeyF) {
+        return;
+    }
+    fast.0 = !fast.0;
+
+    *winit = if fast.0 {
+        WinitSettings::continuous()
+    } else {
+        WinitSettings::game()
+    };
+    let present_mode = if fast.0 {
+        PresentMode::AutoNoVsync
+    } else {
+        PresentMode::AutoVsync
+    };
+    for mut window in windows.iter_mut() {
+        window.present_mode = present_mode;
+    }
+}
+
+/// Keep the corner hint text in sync with the [`FastLoop`] state.
+fn update_fast_loop_hint(fast: Res<FastLoop>, mut hint: Single<&mut Text, With<FastLoopHint>>) {
+    if !fast.is_changed() {
+        return;
+    }
+    ***hint = if fast.0 {
+        "[F] Fast loop: ON\nUncapped update + no vsync. Frame quantization is gone, so \
+         localhost rtt/wire collapse toward true transit (~sub-ms). Spins the CPU — \
+         diagnostic only."
+    } else {
+        "[F] Fast loop: OFF\nVsync on, and an unfocused window is throttled to 60Hz. On \
+         localhost the ping is mostly frame time, not network. Press F to see real latency."
+    }
+    .to_string();
 }
 
 fn push_chat_message(chat_log: &mut ChatLog, sender_name: &str, text: &str) {
