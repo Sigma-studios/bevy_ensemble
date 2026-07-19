@@ -10,15 +10,21 @@ const PING_INTERVAL_SECS: f32 = 1.0;
 /// Internal ping message sent over data channels to measure RTT.
 #[derive(Message, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct EnsemblePing {
-    /// Monotonic timestamp (seconds) on the sender's clock when the ping was sent.
-    pub timestamp: f64,
+    /// `t1`: sender's [`Time`] elapsed (seconds) when the ping was created.
+    pub t1: f64,
 }
 
-/// Internal pong response echoing back the original ping timestamp.
+/// Internal pong response, echoing the ping timestamp plus how long the responder held
+/// the packet. Together with the local send/receive times this gives the four
+/// timestamps (t1..t4) needed to separate wire time from in-app dwell.
 #[derive(Message, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct EnsemblePong {
-    /// The original timestamp from the ping, echoed back unchanged.
-    pub timestamp: f64,
+    /// The original `t1` from the ping, echoed back unchanged (on the *sender's* clock).
+    pub t1: f64,
+    /// `t3 - t2`: seconds the responder spent between receiving the ping at its socket
+    /// seam and emitting this pong, measured on the responder's clock. Subtracting this
+    /// from the round trip cancels the responder's clock offset and its in-app time.
+    pub peer_dwell: f64,
 }
 
 /// Round-trip time to a connected peer, in seconds.
@@ -27,6 +33,18 @@ pub(crate) struct EnsemblePong {
 /// lobby entity on clients (single connection to the host).
 #[derive(Component, Debug, Clone, Copy)]
 pub struct PeerRtt(pub f64);
+
+/// Estimated round-trip **wire time** to a peer, in seconds: the full RTT minus the time
+/// the peer spent holding the ping (its [`EnsemblePong::peer_dwell`]).
+///
+/// This isolates and removes the remote's in-app processing. What remains is the network
+/// transit plus each side's socket-poll latency and local send/receive pipeline — the app
+/// cannot observe packets below the socket poll, so on a loopback/localhost connection
+/// this is dominated by frame/poll alignment rather than literal cable time, and shrinks
+/// toward ~0 with an uncapped frame loop. On a real remote peer it converges to the
+/// genuine network RTT. Added alongside [`PeerRtt`].
+#[derive(Component, Debug, Clone, Copy)]
+pub struct PeerWireRtt(pub f64);
 
 /// Seconds elapsed since the last pong was received from a peer.
 ///
@@ -53,13 +71,13 @@ pub(crate) fn send_pings(
     }
     *cooldown = PING_INTERVAL_SECS;
 
-    let timestamp = time.elapsed_secs_f64();
+    let t1 = time.elapsed_secs_f64();
     for lobby in lobbies.iter() {
         commands
             .entity(lobby)
             .trigger(move |entity| LobbyMessage {
                 entity,
-                message: EnsemblePing { timestamp },
+                message: EnsemblePing { t1 },
                 send_mode: SendMode::Unreliable,
             });
     }
@@ -73,6 +91,7 @@ pub(crate) fn send_pings(
 pub(crate) fn respond_to_pings(
     mut commands: Commands,
     mut messages: MessageReader<ReceivedEnsembleMessage<EnsemblePing>>,
+    time: Res<Time>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
     client_lobby: Option<Single<Entity, (With<Lobby>, Without<Host>)>>,
     lobby_clients: Query<(Entity, &LobbyClientPlayerUuid), With<LobbyClient>>,
@@ -81,8 +100,12 @@ pub(crate) fn respond_to_pings(
         let Some(sender) = message.sender else {
             continue;
         };
+        // t2 = when the ping came off our socket; t3 = now (as we emit the pong).
+        let t2 = message.received_at.as_secs_f64();
+        let t3 = time.elapsed_secs_f64();
         let pong = EnsemblePong {
-            timestamp: message.message.timestamp,
+            t1: message.message.t1,
+            peer_dwell: (t3 - t2).max(0.0),
         };
 
         if host_lobby.is_some() {
@@ -90,7 +113,6 @@ pub(crate) fn respond_to_pings(
             if let Some((client_entity, _)) =
                 lobby_clients.iter().find(|(_, uuid)| uuid.0 == sender)
             {
-                let pong = pong;
                 commands
                     .entity(client_entity)
                     .trigger(move |entity| LobbyClientMessage {
@@ -112,26 +134,43 @@ pub(crate) fn respond_to_pings(
     }
 }
 
-/// When we receive a pong, compute RTT and store it.
+/// Exponential smoothing factor for RTT samples (weight given to the new sample).
+const RTT_SMOOTHING: f64 = 0.2;
+
+/// Blend a new sample into the previous smoothed value (or seed it on the first sample).
+fn smooth(previous: Option<f64>, sample: f64) -> f64 {
+    match previous {
+        Some(prev) => (1.0 - RTT_SMOOTHING) * prev + RTT_SMOOTHING * sample,
+        None => sample,
+    }
+}
+
+/// When we receive a pong, compute the round trip and store both the full end-to-end RTT
+/// ([`PeerRtt`]) and the wire estimate ([`PeerWireRtt`], the RTT minus the peer's dwell).
 ///
-/// On the host: updates `PeerRtt` on the `LobbyClient` entity for that peer.
-/// On clients: updates `PeerRtt` on the lobby entity itself.
+/// On the host: updates the components on the `LobbyClient` entity for that peer.
+/// On clients: updates them on the lobby entity itself.
 pub(crate) fn receive_pongs(
     mut commands: Commands,
     mut messages: MessageReader<ReceivedEnsembleMessage<EnsemblePong>>,
-    time: Res<Time>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
     client_lobby: Option<Single<Entity, (With<Lobby>, Without<Host>)>>,
-    lobby_clients: Query<(Entity, &LobbyClientPlayerUuid, Option<&PeerRtt>), With<LobbyClient>>,
-    client_lobby_rtt: Query<Option<&PeerRtt>, (With<Lobby>, Without<Host>)>,
+    lobby_clients: Query<
+        (Entity, &LobbyClientPlayerUuid, Option<&PeerRtt>, Option<&PeerWireRtt>),
+        With<LobbyClient>,
+    >,
+    client_lobby_rtt: Query<(Option<&PeerRtt>, Option<&PeerWireRtt>), (With<Lobby>, Without<Host>)>,
 ) {
-    let now = time.elapsed_secs_f64();
-
     for message in messages.read() {
-        let rtt = now - message.message.timestamp;
-        if rtt < 0.0 {
+        let pong = message.message;
+        // Four-timestamp method: t1 = our send, t4 = seam receive of the pong (both on our
+        // clock); peer_dwell = t3 - t2 on the peer's clock (its offset cancels out).
+        let t4 = message.received_at.as_secs_f64();
+        let e2e = t4 - pong.t1;
+        if e2e < 0.0 {
             continue;
         }
+        let wire = (e2e - pong.peer_dwell).max(0.0);
 
         let Some(sender) = message.sender else {
             continue;
@@ -139,30 +178,27 @@ pub(crate) fn receive_pongs(
 
         // Host side: find the LobbyClient entity for this sender
         if host_lobby.is_some() {
-            if let Some((entity, _, existing_rtt)) = lobby_clients
-                .iter()
-                .find(|(_, uuid, _)| uuid.0 == sender)
+            if let Some((entity, _, prev_rtt, prev_wire)) =
+                lobby_clients.iter().find(|(_, uuid, _, _)| uuid.0 == sender)
             {
-                let smoothed = match existing_rtt {
-                    Some(prev) => 0.8 * prev.0 + 0.2 * rtt,
-                    None => rtt,
-                };
-                commands
-                    .entity(entity)
-                    .insert((PeerRtt(smoothed), PeerLastPong(0.0)));
+                commands.entity(entity).insert((
+                    PeerRtt(smooth(prev_rtt.map(|p| p.0), e2e)),
+                    PeerWireRtt(smooth(prev_wire.map(|p| p.0), wire)),
+                    PeerLastPong(0.0),
+                ));
             }
         }
 
         // Client side: store on the lobby entity
         if let Some(lobby_entity) = client_lobby.as_ref() {
-            let existing = client_lobby_rtt.get(**lobby_entity).ok().flatten();
-            let smoothed = match existing {
-                Some(prev) => 0.8 * prev.0 + 0.2 * rtt,
-                None => rtt,
-            };
-            commands
-                .entity(**lobby_entity)
-                .insert((PeerRtt(smoothed), PeerLastPong(0.0)));
+            let (prev_rtt, prev_wire) = client_lobby_rtt
+                .get(**lobby_entity)
+                .unwrap_or((None, None));
+            commands.entity(**lobby_entity).insert((
+                PeerRtt(smooth(prev_rtt.map(|p| p.0), e2e)),
+                PeerWireRtt(smooth(prev_wire.map(|p| p.0), wire)),
+                PeerLastPong(0.0),
+            ));
         }
     }
 }

@@ -28,7 +28,7 @@
 use bevy::prelude::*;
 
 use crate::{
-    PeerLastPong, PeerRtt,
+    PeerLastPong, PeerRtt, PeerWireRtt,
     netmetrics::NetMetrics,
     netsim::{NetPreset, NetSim, drain_netsim},
 };
@@ -295,20 +295,23 @@ fn fmt_rate(bytes_per_sec: f64) -> String {
 fn update_overlay_text(
     metrics: Res<NetMetrics>,
     sim: Res<NetSim>,
-    peers: Query<(&PeerRtt, &PeerLastPong)>,
+    peers: Query<(&PeerRtt, &PeerLastPong, Option<&PeerWireRtt>)>,
     mut text: Single<&mut Text, With<NetOverlayText>>,
 ) {
     let peer_count = peers.iter().count();
-    let (avg_rtt_ms, worst_silence) = if peer_count > 0 {
+    let (avg_rtt_ms, avg_wire_ms, worst_silence) = if peer_count > 0 {
         let mut rtt_sum = 0.0;
+        let mut wire_sum = 0.0;
         let mut worst = 0.0_f64;
-        for (rtt, last_pong) in peers.iter() {
+        for (rtt, last_pong, wire) in peers.iter() {
             rtt_sum += rtt.0;
+            wire_sum += wire.map(|w| w.0).unwrap_or(0.0);
             worst = worst.max(last_pong.0);
         }
-        (rtt_sum / peer_count as f64 * 1000.0, worst)
+        let n = peer_count as f64;
+        (rtt_sum / n * 1000.0, wire_sum / n * 1000.0, worst)
     } else {
-        (0.0, 0.0)
+        (0.0, 0.0, 0.0)
     };
 
     let cfg = sim.config();
@@ -325,7 +328,7 @@ fn update_overlay_text(
     }
     out.push('\n');
     out.push_str(&format!(
-        "peers: {peer_count}   rtt: {avg_rtt_ms:.0}ms   silence: {worst_silence:.1}s\n"
+        "peers: {peer_count}   rtt: {avg_rtt_ms:.0}ms (wire {avg_wire_ms:.0}ms)   silence: {worst_silence:.1}s\n"
     ));
     out.push_str(&format!(
         "rx: {}  {:.0} pkt/s\n",
