@@ -186,7 +186,12 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
                     systems::detect_lobby_leave,
                 ),
             )
-            .add_systems(Update, systems::read_peer_messages)
+            // Drain the socket in PreUpdate so every Update reader (core and game) sees
+            // this frame's packets the same frame they arrived.
+            .add_systems(
+                PreUpdate,
+                systems::read_peer_messages.in_set(bevy_ensemble::EnsembleSet::ReceivePackets),
+            )
             .add_observer(systems::send_serialized_lobby_packet)
             .add_observer(systems::disconnect_removed_lobby_client);
     }

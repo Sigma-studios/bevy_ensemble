@@ -120,10 +120,15 @@ impl Plugin for NetDebugPlugin {
         })
         .init_resource::<NetSim>()
         .add_systems(Startup, (apply_initial_preset, spawn_overlay))
+        // Replays delayed packets — another inbound seam, so it joins the backend receive
+        // systems in PreUpdate.
+        .add_systems(
+            PreUpdate,
+            drain_netsim.in_set(crate::EnsembleSet::ReceivePackets),
+        )
         .add_systems(
             Update,
             (
-                drain_netsim,
                 toggle_overlay,
                 update_overlay_text,
                 handle_preset_buttons,

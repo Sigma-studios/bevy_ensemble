@@ -103,8 +103,14 @@ pub struct LobbyBroadcastPlugin;
 
 impl Plugin for LobbyBroadcastPlugin {
     fn build(&self, app: &mut App) {
+        // Second receive stage: decode broadcast envelopes into their inner messages. Runs
+        // in PreUpdate right after the socket drain so the inner `ReceivedEnsembleMessage`s
+        // reach Update readers the same frame — matching direct (non-broadcast) messages.
         app.register_ensemble_message_type::<LobbyBroadcastEnvelope>()
-            .add_systems(Update, relay_broadcast_envelopes);
+            .add_systems(
+                PreUpdate,
+                relay_broadcast_envelopes.after(crate::EnsembleSet::ReceivePackets),
+            );
     }
 }
 
