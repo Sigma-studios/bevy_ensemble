@@ -300,9 +300,24 @@ fn fmt_rate(bytes_per_sec: f64) -> String {
 fn update_overlay_text(
     metrics: Res<NetMetrics>,
     sim: Res<NetSim>,
+    time: Res<Time>,
     peers: Query<(&PeerRtt, &PeerLastPong, Option<&PeerWireRtt>)>,
     mut text: Single<&mut Text, With<NetOverlayText>>,
+    // Lightly smoothed frame time so the fps readout doesn't flicker.
+    mut smoothed_dt: Local<f64>,
 ) {
+    let dt = time.delta_secs_f64();
+    *smoothed_dt = if *smoothed_dt <= 0.0 {
+        dt
+    } else {
+        0.9 * *smoothed_dt + 0.1 * dt
+    };
+    let (fps, frame_ms) = if *smoothed_dt > 0.0 {
+        (1.0 / *smoothed_dt, *smoothed_dt * 1000.0)
+    } else {
+        (0.0, 0.0)
+    };
+
     let peer_count = peers.iter().count();
     let (avg_rtt_ms, avg_wire_ms, worst_silence) = if peer_count > 0 {
         let mut rtt_sum = 0.0;
@@ -332,6 +347,7 @@ fn update_overlay_text(
         ));
     }
     out.push('\n');
+    out.push_str(&format!("fps: {fps:.0}  ({frame_ms:.1}ms/frame)\n"));
     out.push_str(&format!(
         "peers: {peer_count}   rtt: {avg_rtt_ms:.0}ms (wire {avg_wire_ms:.0}ms)   silence: {worst_silence:.1}s\n"
     ));
