@@ -1,3 +1,9 @@
+// TODO(sans-io): migrate this native backend off tokio + the async `webrtc`
+// crate onto the sans-IO webrtc-rs stack (`rtc` core, or `webrtc` 0.20 once it
+// reaches beta). Goal: drive I/O/timers ourselves from a Bevy system (poll each
+// frame) and drop the tokio runtime dependency entirely. Wait for the sans-IO
+// line to hit beta / stabilize interop before committing; str0m is the
+// lower-risk alternative if we want to move sooner.
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
