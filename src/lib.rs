@@ -99,7 +99,7 @@ pub use messages::*;
 #[cfg(feature = "netdebug")]
 pub use netdebug::{NetDebugConfig, NetDebugPlugin};
 #[cfg(feature = "netmetrics")]
-pub use netmetrics::NetMetrics;
+pub use netmetrics::{NetMetrics, NetMetricsPlugin};
 #[cfg(feature = "netdebug")]
 pub use netsim::{NetPreset, NetSim, NetSimConfig};
 pub use ping::{PeerLastPong, PeerRtt};
@@ -153,13 +153,19 @@ impl Plugin for EnsemblePlugin {
                 ),
             );
 
-        // Network measurement (bytes/packets in & out, sampled rates). Cheap enough
-        // to leave on in dev; compiled out entirely without the feature. Auto-added so
-        // metrics are always collected when the feature is on.
+        // The network debug overlay (+ its condition simulator and metrics) is opt-OUT:
+        // installed automatically since the `netdebug` feature is on by default (release
+        // included). It starts closed — press the toggle key (F3) to open it — and the
+        // simulator sits on `NetPreset::Off` until you pick a profile in the panel, so it
+        // does nothing until asked. To customize (key, starting preset, start visible),
+        // add your own `NetDebugPlugin` *before* `EnsemblePlugin`; the guard below then
+        // steps aside. To drop it entirely, build with `default-features = false`.
         //
-        // The interactive overlay + network-condition simulator is a separate, opt-in
-        // plugin the game adds and configures itself — see [`netdebug::NetDebugPlugin`].
-        #[cfg(feature = "netmetrics")]
-        app.add_plugins(netmetrics::NetMetricsPlugin);
+        // (Metrics-only builds — `netmetrics` without `netdebug` — stay opt-in: add
+        // `NetMetricsPlugin` yourself. `NetDebugPlugin` pulls the metrics in on its own.)
+        #[cfg(feature = "netdebug")]
+        if !app.is_plugin_added::<netdebug::NetDebugPlugin>() {
+            app.add_plugins(netdebug::NetDebugPlugin::default());
+        }
     }
 }

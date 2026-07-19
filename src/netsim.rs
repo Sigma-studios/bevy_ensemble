@@ -1,13 +1,17 @@
 //! Backend-agnostic network-condition simulation ("netsim").
 //!
-//! Enabled by the `netdebug` feature. The simulator impairs the **inbound** packet
-//! path — the single point [`decode_ensemble_packet`](crate::decode_ensemble_packet)
+//! Gated by the `netdebug` feature (on by default). The simulator impairs the **inbound**
+//! packet path — the single point [`decode_ensemble_packet`](crate::decode_ensemble_packet)
 //! that every backend calls when bytes arrive. Delaying, dropping, jittering and
 //! duplicating inbound packets on each peer reproduces a symmetric bad link: when
 //! both ends impair their inbound path, a one-way `delay_ms` shows up as roughly
 //! `2 * delay_ms` of round-trip time in the existing ping/RTT machinery, packet loss
 //! is bidirectional, and so on. Impairing one direction at one clearly-defined seam
-//! keeps this free of any backend cooperation and impossible to leave on in release.
+//! keeps this free of any backend cooperation.
+//!
+//! It stays completely inert until [`NetDebugPlugin`](crate::NetDebugPlugin) installs the
+//! [`NetSim`] resource *and* a non-[`Off`](NetPreset::Off) preset is selected, so shipping
+//! it in a release build costs nothing until someone deliberately turns it on.
 //!
 //! Timing uses Bevy's [`Time`] clock (works natively and on WASM); randomness uses a
 //! small seeded xorshift PRNG so a given preset produces a repeatable trace — the

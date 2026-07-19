@@ -19,8 +19,14 @@ use bevy::prelude::*;
 use crate::SerializedLobbyPacket;
 
 /// Installs the [`NetMetrics`] resource, the outbound-packet observer and the rate
-/// sampler. Added by `EnsemblePlugin` when the `netmetrics` feature is on (which the
-/// `netdebug` feature implies).
+/// sampler.
+///
+/// Opt-in: the game adds this itself for standalone counters. [`NetDebugPlugin`] pulls
+/// it in automatically, so add only one of the two. Available whenever the `netmetrics`
+/// feature is on — which it is by default, release included (the `netdebug` feature
+/// implies it).
+///
+/// [`NetDebugPlugin`]: crate::NetDebugPlugin
 pub struct NetMetricsPlugin;
 
 impl Plugin for NetMetricsPlugin {
