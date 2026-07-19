@@ -12,6 +12,10 @@ tokio = { version = "1", features = ["sync", "rt"] }
 webrtc = { version = "0.17", default-features = false }
 bytes = "1"
 
+# For the `loopback_rtt` benchmark example (needs a real runtime + timers).
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1", features = ["sync"] }
 wasm-bindgen = "0.2"
