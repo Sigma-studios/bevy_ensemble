@@ -42,7 +42,7 @@ pub use crate::{
 
 // Network metrics (feature `netmetrics`).
 #[cfg(feature = "netmetrics")]
-pub use crate::NetMetrics;
+pub use crate::{NetMetrics, NetMetricsPlugin};
 
 // Interactive network debug overlay + condition simulator (feature `netdebug`).
 #[cfg(feature = "netdebug")]

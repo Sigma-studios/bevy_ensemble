@@ -1,25 +1,27 @@
 //! Interactive dev overlay: live network metrics + clickable netsim preset toggles.
 //!
-//! Enabled by the `netdebug` feature only, so it — along with the whole [`crate::netsim`]
-//! simulator — is compiled out of release builds entirely. Built on plain Bevy UI so it
-//! needs no extra dependency and renders in any game that already has a camera, native or
-//! WASM, on either transport backend.
+//! Gated by the `netdebug` feature, which is on by default — so this and the whole
+//! [`crate::netsim`] simulator ship at runtime in release too. It is **opt-out**:
+//! [`EnsemblePlugin`](crate::EnsemblePlugin) installs [`NetDebugPlugin::default`] for you.
+//! The panel **starts closed** (press the toggle key — F3 by default — to open it) and the
+//! simulator sits on [`NetPreset::Off`] until you pick a profile in the panel, so it does
+//! nothing until asked. Built on plain Bevy UI so it needs no extra dependency and renders
+//! in any game that already has a camera, native or WASM, on either transport backend.
 //!
-//! Unlike the (cheap, always-on) metrics counters, this overlay is an **opt-in plugin**
-//! you add and configure yourself:
+//! To **customize** it (toggle key, starting preset, start open), add your own
+//! `NetDebugPlugin` *before* `EnsemblePlugin` — the auto-install then steps aside:
 //!
 //! ```rust,ignore
 //! # #[cfg(feature = "netdebug")]
 //! app.add_plugins(
 //!     NetDebugPlugin::default()
-//!         .toggle_key(KeyCode::F3)        // press to show/hide (default F3)
+//!         .toggle_key(KeyCode::F3)          // press to show/hide (default F3)
 //!         .default_preset(NetPreset::FourG) // start the shim on this preset
-//!         .hidden(),                        // start with the panel hidden
+//!         .visible(),                       // start with the panel open (default: closed)
 //! );
 //! ```
 //!
-//! Because the plugin type only exists under the feature, add it behind the same
-//! `#[cfg(feature = "...")]` your game uses to turn the feature on. The optional
+//! To **turn it off entirely**, build with `default-features = false`. The optional
 //! `ENSEMBLE_NETSIM=4g` environment variable overrides [`default_preset`](NetDebugPlugin::default_preset)
 //! at startup (handy for headless / CI runs that never touch the window).
 
@@ -31,11 +33,14 @@ use crate::{
     netsim::{NetPreset, NetSim, drain_netsim},
 };
 
-/// Opt-in plugin: installs the network simulator and its interactive overlay.
+/// Installs the network simulator, its interactive overlay, and the metrics layer the
+/// overlay displays.
 ///
-/// Construct with [`NetDebugPlugin::default`] and tweak via the builder methods. The
-/// metrics counters themselves come from the always-on `netmetrics` layer (which the
-/// `netdebug` feature implies), so this plugin only owns the shim and the window.
+/// Opt-out: [`EnsemblePlugin`](crate::EnsemblePlugin) adds [`NetDebugPlugin::default`]
+/// automatically. Add your own configured instance *before* `EnsemblePlugin` to override
+/// the defaults; the auto-install detects it and steps aside. It also adds
+/// [`NetMetricsPlugin`](crate::NetMetricsPlugin) for you (skipping it if already present),
+/// so you never add both.
 #[derive(Clone)]
 pub struct NetDebugPlugin {
     /// Key that shows/hides the panel. `None` disables the hotkey entirely.
@@ -52,7 +57,9 @@ impl Default for NetDebugPlugin {
     fn default() -> Self {
         Self {
             toggle_key: Some(KeyCode::F3),
-            start_visible: true,
+            // Starts closed: `EnsemblePlugin` installs this automatically, so it must not
+            // cover the game's UI until the developer asks for it with the toggle key.
+            start_visible: false,
             default_preset: NetPreset::Off,
             env_override: true,
         }
@@ -72,9 +79,15 @@ impl NetDebugPlugin {
         self
     }
 
-    /// Start with the panel hidden (toggle it on with the hotkey).
+    /// Start with the panel hidden (toggle it on with the hotkey). This is the default.
     pub fn hidden(mut self) -> Self {
         self.start_visible = false;
+        self
+    }
+
+    /// Start with the panel already open instead of closed.
+    pub fn visible(mut self) -> Self {
+        self.start_visible = true;
         self
     }
 
@@ -93,6 +106,12 @@ impl NetDebugPlugin {
 
 impl Plugin for NetDebugPlugin {
     fn build(&self, app: &mut App) {
+        // The overlay reads `NetMetrics`, so ensure the metrics layer is present. Guard
+        // against a double-add in case the game also added `NetMetricsPlugin` itself.
+        if !app.is_plugin_added::<crate::netmetrics::NetMetricsPlugin>() {
+            app.add_plugins(crate::netmetrics::NetMetricsPlugin);
+        }
+
         app.insert_resource(NetDebugConfig {
             toggle_key: self.toggle_key,
             start_visible: self.start_visible,
@@ -241,11 +260,13 @@ fn spawn_overlay(mut commands: Commands, config: Res<NetDebugConfig>) {
 
 /// Show/hide the panel when the configured toggle key is pressed.
 fn toggle_overlay(
-    keys: Res<ButtonInput<KeyCode>>,
+    // `Option` so the auto-installed overlay is safe in headless/server apps that never
+    // add an input backend — there the resource is absent and we simply do nothing.
+    keys: Option<Res<ButtonInput<KeyCode>>>,
     config: Res<NetDebugConfig>,
     mut root: Query<&mut Visibility, With<NetOverlayRoot>>,
 ) {
-    let Some(key) = config.toggle_key else {
+    let (Some(key), Some(keys)) = (config.toggle_key, keys) else {
         return;
     };
     if !keys.just_pressed(key) {

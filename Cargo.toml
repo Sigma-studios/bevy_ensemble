@@ -15,11 +15,17 @@ bevy = { version = "0.19", features = ["serialize"] }
 postcard = { version = "1", features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 
+# Both network features are on by default (release included) so the tooling is
+# always available at runtime. Nothing runs until the game opts in by adding the
+# relevant plugin — the compiled-in code is inert without it. Strip it entirely
+# with `default-features = false` (e.g. for a minimal shipping build).
 [features]
+default = ["netmetrics", "netdebug"]
+
 # Lightweight network counters (bytes/packets in & out, sampled rates).
-# A handful of integer adds at the packet boundary — safe to leave on in dev.
+# A handful of integer adds at the packet boundary once `NetMetricsPlugin` is added.
 netmetrics = []
-# Interactive dev overlay: live metrics window + toggleable network-condition
+# Interactive overlay: live metrics window + toggleable network-condition
 # simulation (delay / jitter / loss / duplication). Implies `netmetrics`.
-# Compiled entirely out of release builds — no window, no shim, no cost.
+# Inert until the game adds `NetDebugPlugin`, so it costs nothing when unused.
 netdebug = ["netmetrics"]
