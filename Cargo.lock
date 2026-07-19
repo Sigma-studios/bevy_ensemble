@@ -586,7 +586,7 @@ dependencies = [
 [[package]]
 name = "bevy-steamworks"
 version = "0.17.0"
-source = "git+https://github.com/Sigma-studios/bevy_steamworks?branch=chore%2Fupgraded#399cb9bbdc43f29f02a71a2a8db047db8b78f2a2"
+source = "git+https://github.com/HouraiTeahouse/bevy_steamworks?branch=main#649838f9fec757703a817b08d6fdfd66ad88cb3c"
 dependencies = [
  "bevy_app",
  "bevy_ecs",
@@ -1632,7 +1632,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-time",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3162,7 +3162,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4648,7 +4648,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5905,7 +5905,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6408,8 +6408,7 @@ dependencies = [
 [[package]]
 name = "steamworks-sys"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae139f051204a4af015d4f0ed3a1f7a51020d03a44c7cf249168c543d88131e9"
+source = "git+https://github.com/Noxime/steamworks-rs?rev=ee85258d2b9965f5d29082e7c104b183d8fda7c9#ee85258d2b9965f5d29082e7c104b183d8fda7c9"
 
 [[package]]
 name = "strict-num"
@@ -7711,7 +7710,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
