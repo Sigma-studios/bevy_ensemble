@@ -29,3 +29,14 @@ netmetrics = []
 # simulation (delay / jitter / loss / duplication). Implies `netmetrics`.
 # Inert until the game adds `NetDebugPlugin`, so it costs nothing when unused.
 netdebug = ["netmetrics"]
+
+# bevy-steamworks pulls the safe `steamworks` wrapper, which transitively depends
+# on the crates.io `steamworks-sys`. bevy_ensemble_steam also depends on
+# `steamworks-sys` directly (for one raw FFI call the safe wrapper doesn't expose
+# yet — see crates/bevy_ensemble_steam/Cargo.toml). Without this patch, cargo
+# could resolve two different `steamworks-sys` builds and link the Steam SDK
+# twice; the patch forces every `steamworks-sys` in the tree onto the one git
+# source. Remove this alongside the direct dep once the safe wrapper ships
+# `Matchmaking::request_lobby_data`.
+[patch.crates-io]
+steamworks-sys = { git = "https://github.com/Noxime/steamworks-rs", rev = "ee85258d2b9965f5d29082e7c104b183d8fda7c9" }

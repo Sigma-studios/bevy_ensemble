@@ -43,7 +43,11 @@ struct PendingSteamFriendLobbies {
 
 fn request_lobby_data(lobby_id: LobbyId) -> bool {
     unsafe {
-        // TODO: remove steamworks_sys dependency when steamworks-rs 0.13.2 or 0.14 releases
+        // The safe `steamworks` wrapper doesn't expose RequestLobbyData yet (it's
+        // on steamworks-rs `master`, unreleased), so drop to raw FFI. Once a
+        // `steamworks` release adds `Matchmaking::request_lobby_data`, replace
+        // this with the safe call and remove the `steamworks-sys` dep + the
+        // workspace `[patch.crates-io]` for it.
         let mm = steamworks_sys::SteamAPI_SteamMatchmaking_v009();
         steamworks_sys::SteamAPI_ISteamMatchmaking_RequestLobbyData(mm, lobby_id.raw())
     }

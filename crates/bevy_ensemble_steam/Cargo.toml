@@ -5,10 +5,19 @@ edition = "2024"
 
 [dependencies]
 bevy = "0.19"
-bevy-steamworks = { git = "https://github.com/Sigma-studios/bevy_steamworks", branch = "chore/upgraded" }
+# bevy-steamworks re-exports the *safe* `steamworks` wrapper (currently the
+# published 0.13.1). We use it for everything except one call — see below.
+bevy-steamworks = { git = "https://github.com/HouraiTeahouse/bevy_steamworks", branch = "main" }
 bevy_ensemble = { path = "../.." }
 serde = { version = "1", features = ["derive"] }
-steamworks-sys = "0.13.0"
+# Raw Steamworks FFI. Needed because the published safe `steamworks` crate does
+# not yet expose `Matchmaking::request_lobby_data` (it exists on steamworks-rs
+# `master` but is unreleased), so we call `SteamAPI_ISteamMatchmaking_RequestLobbyData`
+# directly in src/lib.rs. Sourced from git so it stays lockstep with the safe
+# wrapper's SDK version; the workspace `[patch.crates-io]` unifies both onto the
+# same crate so the Steam SDK is only linked once. Drop this dep (and the patch)
+# once a `steamworks` release ships `request_lobby_data`.
+steamworks-sys = { git = "https://github.com/Noxime/steamworks-rs", rev = "ee85258d2b9965f5d29082e7c104b183d8fda7c9" }
 
 [dev-dependencies]
 bevy_immediate = "0.7"
