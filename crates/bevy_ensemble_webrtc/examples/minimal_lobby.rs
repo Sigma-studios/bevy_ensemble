@@ -567,12 +567,14 @@ fn update_fast_loop_hint(fast: Res<FastLoop>, mut hint: Single<&mut Text, With<F
         return;
     }
     ***hint = if fast.0 {
-        "[F] Fast loop: ON\nUncapped update + no vsync. Frame quantization is gone, so \
-         localhost rtt/wire collapse toward true transit (~sub-ms). Spins the CPU — \
-         diagnostic only."
+        "[F] Fast loop: ON\nUncapped update + no vsync. Enable it in BOTH instances (the \
+         round trip is gated by the slower one), then give the smoothed rtt a few seconds \
+         to settle — it'll collapse toward true transit (~sub-ms). Spins the CPU: diagnostic \
+         only."
     } else {
-        "[F] Fast loop: OFF\nVsync on, and an unfocused window is throttled to 60Hz. On \
-         localhost the ping is mostly frame time, not network. Press F to see real latency."
+        "[F] Fast loop: OFF\nVsync on, and an unfocused window is throttled to 60Hz — so on \
+         localhost the ping is mostly frame time, not network. Press F in BOTH instances \
+         (alt-tab to each; an unfocused window can't receive the keypress) to see real latency."
     }
     .to_string();
 }
