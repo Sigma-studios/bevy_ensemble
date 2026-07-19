@@ -132,6 +132,11 @@ pub struct RemoveLobbyParticipant {
 pub struct ReceivedEnsembleMessage<T: EnsembleMessage> {
     pub sender: Option<PlayerUUID>,
     pub message: T,
+    /// Local [`Time`](bevy::time::Time) elapsed when this packet came off the socket
+    /// (i.e. at the inbound decode seam). This is the earliest moment the app can observe
+    /// the packet — used by the ping/RTT machinery to measure how long a peer held a
+    /// message before replying. `Duration::ZERO` for locally self-delivered messages.
+    pub received_at: std::time::Duration,
 }
 
 /// Entity event to broadcast a message from a lobby.

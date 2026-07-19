@@ -127,9 +127,12 @@ fn encode_broadcast_message<T: EnsembleMessage>(
     let is_host = host_lobbies.get(message.entity).is_ok();
 
     if is_host {
+        // Locally self-delivered (never touched the socket), so there is no wire receive
+        // time to record.
         local_writer.write(ReceivedEnsembleMessage {
             sender: Some(sender),
             message: message.message.clone(),
+            received_at: std::time::Duration::ZERO,
         });
     }
 

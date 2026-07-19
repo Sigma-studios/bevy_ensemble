@@ -179,8 +179,15 @@ fn dispatch_message<T: EnsembleMessage>(
         }
     };
 
+    // Stamp the receive time at the seam: this is the first frame the app can see the
+    // packet. `Time` is frame-granular, which is exactly the resolution that matters here.
+    let received_at = world
+        .get_resource::<Time>()
+        .map(|time| time.elapsed())
+        .unwrap_or_default();
+
     if world
-        .write_message(ReceivedEnsembleMessage::<T> { sender, message })
+        .write_message(ReceivedEnsembleMessage::<T> { sender, message, received_at })
         .is_none()
     {
         warn!(
