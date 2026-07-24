@@ -119,6 +119,7 @@ impl Plugin for NetDebugPlugin {
             env_override: self.env_override,
         })
         .init_resource::<NetSim>()
+        .init_resource::<NetDebugExtras>()
         .add_systems(Startup, (apply_initial_preset, spawn_overlay))
         // Replays delayed packets — another inbound seam, so it joins the backend receive
         // systems in PreUpdate.
@@ -135,6 +136,33 @@ impl Plugin for NetDebugPlugin {
                 tint_preset_buttons,
             ),
         );
+    }
+}
+
+/// Extra overlay lines contributed by the game (or other crates), appended below
+/// the built-in metrics in the F3 panel.
+///
+/// Keyed so multiple contributors don't clobber each other and the ordering stays
+/// stable. Set your line each frame (or whenever it changes) and remove the key to
+/// drop it — e.g. from a game system:
+///
+/// ```rust,ignore
+/// fn report(mut extras: ResMut<NetDebugExtras>, buffer: Res<ClientTickBuffer>) {
+///     extras.set("prediction", format!("prediction: {} ticks", buffer.target_ticks));
+/// }
+/// ```
+#[derive(Resource, Default)]
+pub struct NetDebugExtras(bevy::platform::collections::HashMap<&'static str, String>);
+
+impl NetDebugExtras {
+    /// Set (or replace) the overlay line shown under `key`.
+    pub fn set(&mut self, key: &'static str, line: impl Into<String>) {
+        self.0.insert(key, line.into());
+    }
+
+    /// Remove a previously-set line.
+    pub fn remove(&mut self, key: &'static str) {
+        self.0.remove(key);
     }
 }
 
@@ -302,6 +330,7 @@ fn update_overlay_text(
     sim: Res<NetSim>,
     time: Res<Time>,
     peers: Query<(&PeerRtt, &PeerLastPong, Option<&PeerWireRtt>)>,
+    extras: Res<NetDebugExtras>,
     mut text: Single<&mut Text, With<NetOverlayText>>,
     // Lightly smoothed frame time so the fps readout doesn't flicker.
     mut smoothed_dt: Local<f64>,
@@ -365,6 +394,14 @@ fn update_overlay_text(
         "sim dropped: {}   duplicated: {}",
         metrics.sim_dropped, metrics.sim_duplicated,
     ));
+
+    // Game-contributed lines, appended in stable key order.
+    let mut keys: Vec<&'static str> = extras.0.keys().copied().collect();
+    keys.sort_unstable();
+    for key in keys {
+        out.push('\n');
+        out.push_str(&extras.0[key]);
+    }
 
     ***text = out;
 }
