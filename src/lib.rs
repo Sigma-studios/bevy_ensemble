@@ -97,7 +97,7 @@ pub use broadcast::{BroadcastLobbyMessage, LobbyBroadcastAppExt, LobbyBroadcastP
 pub use components::*;
 pub use messages::*;
 #[cfg(feature = "netdebug")]
-pub use netdebug::{NetDebugConfig, NetDebugPlugin};
+pub use netdebug::{NetDebugConfig, NetDebugExtras, NetDebugPlugin};
 #[cfg(feature = "netmetrics")]
 pub use netmetrics::{NetMetrics, NetMetricsPlugin};
 #[cfg(feature = "netdebug")]
