@@ -6,6 +6,11 @@ use bevy_ensemble::{
 
 use crate::{EnsembleSocketRes, LobbyClientWebrtcUuid, LobbyWebrtcId, PendingWebrtcLobbyClient};
 
+/// How often a peer restates its readiness handshake, in seconds.
+///
+/// Only the *repeat* rate. The first one goes out on the frame a lobby appears.
+const HANDSHAKE_INTERVAL: f32 = 0.5;
+
 /// Internal handshake message exchanged over data channels to confirm readiness.
 #[derive(Message, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct WebrtcReadyHandshake {
@@ -29,15 +34,20 @@ pub(crate) fn send_client_handshakes(
     time: Res<Time>,
     mut cooldown: Local<f32>,
 ) {
+    // Emptiness first, cooldown second. The other way round spends the timer while
+    // there is nothing to send, so on the frame a lobby finally appears the timer is
+    // mid-cycle and the first handshake waits for up to a full period. That period is
+    // exactly the window in which the data channel is up but the lobby is not yet
+    // promoted -- so every "am I in a session yet" test written against `With<Lobby>`
+    // is false while game traffic is already flowing.
+    if client_lobbies.is_empty() {
+        return;
+    }
     *cooldown -= time.delta_secs();
     if *cooldown > 0.0 {
         return;
     }
-    *cooldown = 0.5;
-
-    if client_lobbies.is_empty() {
-        return;
-    }
+    *cooldown = HANDSHAKE_INTERVAL;
 
     let packet = encode_ensemble_message(&registry, &WebrtcReadyHandshake { from_host: false });
     let data: Box<[u8]> = packet.into_boxed_slice();
@@ -55,15 +65,20 @@ pub(crate) fn send_host_handshakes(
     time: Res<Time>,
     mut cooldown: Local<f32>,
 ) {
+    // Emptiness first, cooldown second. The other way round spends the timer while
+    // there is nothing to send, so on the frame a lobby finally appears the timer is
+    // mid-cycle and the first handshake waits for up to a full period. That period is
+    // exactly the window in which the data channel is up but the lobby is not yet
+    // promoted -- so every "am I in a session yet" test written against `With<Lobby>`
+    // is false while game traffic is already flowing.
+    if host_lobbies.is_empty() {
+        return;
+    }
     *cooldown -= time.delta_secs();
     if *cooldown > 0.0 {
         return;
     }
-    *cooldown = 0.5;
-
-    if host_lobbies.is_empty() {
-        return;
-    }
+    *cooldown = HANDSHAKE_INTERVAL;
 
     let packet = encode_ensemble_message(&registry, &WebrtcReadyHandshake { from_host: true });
     let data: Box<[u8]> = packet.into_boxed_slice();

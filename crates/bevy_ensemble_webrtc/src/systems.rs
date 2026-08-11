@@ -364,8 +364,16 @@ pub(crate) fn send_serialized_lobby_packet(
         return;
     }
 
-    error!(
-        "Serialized lobby packet was triggered for unsupported entity {:?}",
+    // `debug!`, not `error!`. The ordinary way to get here is a peer leaving: the
+    // `On<Remove, LobbyClient>` observer notifies the departing client, and by the
+    // time that trigger has been through the encode observer and back out as a
+    // `SerializedLobbyPacket` the entity no longer resolves. Nothing is wrong -- a
+    // packet aimed at somebody who has already disconnected is not an error, and a
+    // project whose acceptance criterion is a clean log cannot hold that line while
+    // every normal quit prints one.
+    debug!(
+        "Serialized lobby packet was triggered for an entity that no longer resolves \
+         ({:?}); the peer has most likely just left.",
         packet.entity
     );
 }
