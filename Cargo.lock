@@ -1000,6 +1000,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "js-sys",
+ "log",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",

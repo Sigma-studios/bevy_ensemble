@@ -137,13 +137,7 @@ impl EnsembleSocket {
                         self.message_tx.clone(),
                         self.runtime_handle.clone(),
                     );
-                    native::accept_offer(
-                        &pc,
-                        sender,
-                        &sdp,
-                        self.signal_tx.clone(),
-                        &self.runtime_handle,
-                    );
+                    native::accept_offer(&pc, &sdp);
                     self.peers.insert(sender, pc);
                 }
 
@@ -162,7 +156,7 @@ impl EnsembleSocket {
             PeerSignal::Answer(sdp) => {
                 if let Some(pc) = self.peers.get(&sender) {
                     #[cfg(not(target_arch = "wasm32"))]
-                    native::set_remote_answer(pc, &sdp, &self.runtime_handle);
+                    native::set_remote_answer(pc, &sdp);
                     #[cfg(target_arch = "wasm32")]
                     wasm::set_remote_answer(pc, &sdp);
                 }
@@ -170,7 +164,7 @@ impl EnsembleSocket {
             PeerSignal::IceCandidate(candidate) => {
                 if let Some(pc) = self.peers.get(&sender) {
                     #[cfg(not(target_arch = "wasm32"))]
-                    native::add_ice_candidate(pc, &candidate, &self.runtime_handle);
+                    native::add_ice_candidate(pc, &candidate);
                     #[cfg(target_arch = "wasm32")]
                     wasm::add_ice_candidate(pc, &candidate);
                 }
