@@ -1,0 +1,10 @@
+[package]
+name = "bevy_ensemble_loopback"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.19", features = ["serialize"] }
+# `netdebug` carries netsim, which `use_netsim` drives. It is on by default upstream;
+# naming it here means a game that strips it from its own build does not break this crate.
+bevy_ensemble = { path = "../..", features = ["netdebug"] }

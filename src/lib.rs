@@ -69,10 +69,18 @@
 //! # Guides
 //!
 //! For detailed usage guides, see the `docs/` directory:
-//! - [Lobbies](https://github.com/TODO/bevy_ensemble/blob/main/docs/lobbies.md) — creating, joining, and leaving lobbies
-//! - [Participants](https://github.com/TODO/bevy_ensemble/blob/main/docs/participants.md) — player roster and ownership
-//! - [Messaging](https://github.com/TODO/bevy_ensemble/blob/main/docs/messaging.md) — sending and receiving custom messages
-//! - [Writing a Backend](https://github.com/TODO/bevy_ensemble/blob/main/docs/backends.md) — implementing a platform backend
+//! - [Lobbies](https://github.com/Sigma-studios/bevy_ensemble/blob/master/docs/lobbies.md) — creating, joining, and leaving lobbies
+//! - [Participants](https://github.com/Sigma-studios/bevy_ensemble/blob/master/docs/participants.md) — player roster and ownership
+//! - [Messaging](https://github.com/Sigma-studios/bevy_ensemble/blob/master/docs/messaging.md) — sending and receiving custom messages
+//! - [Writing a Backend](https://github.com/Sigma-studios/bevy_ensemble/blob/master/docs/backends.md) — implementing a platform backend
+//!
+//! # Testing a session
+//!
+//! `bevy_ensemble_loopback` is an in-process backend: N apps in one process on a clock you
+//! control, over a link whose latency, jitter and loss are parameters. It is a real backend
+//! rather than a mock — messages are encoded, routed by entity and decoded through the registry
+//! exactly as they are on a socket — so netcode can have ordinary automated tests instead of two
+//! windows and a stopwatch.
 
 use bevy::prelude::*;
 

@@ -995,6 +995,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_ensemble_loopback"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "bevy_ensemble",
+]
+
+[[package]]
 name = "bevy_ensemble_sockets"
 version = "0.1.0"
 dependencies = [
