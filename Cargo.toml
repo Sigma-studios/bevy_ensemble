@@ -8,6 +8,7 @@ members = [
     "crates/bevy_ensemble_steam",
     "crates/bevy_ensemble_sockets",
     "crates/bevy_ensemble_webrtc",
+    "crates/bevy_ensemble_loopback",
 ]
 
 [dependencies]
