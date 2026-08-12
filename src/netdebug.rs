@@ -30,7 +30,7 @@ use bevy::prelude::*;
 use crate::{
     PeerLastPong, PeerRtt, PeerWireRtt,
     netmetrics::NetMetrics,
-    netsim::{NetPreset, NetSim, drain_netsim},
+    netsim::{NetPreset, NetSim},
 };
 
 /// Installs the network simulator, its interactive overlay, and the metrics layer the
@@ -112,21 +112,20 @@ impl Plugin for NetDebugPlugin {
             app.add_plugins(crate::netmetrics::NetMetricsPlugin);
         }
 
+        // The simulator itself is a separate, UI-free plugin; a game may already have
+        // added it to impair without the overlay.
+        if !app.is_plugin_added::<crate::netsim::NetSimPlugin>() {
+            app.add_plugins(crate::netsim::NetSimPlugin);
+        }
+
         app.insert_resource(NetDebugConfig {
             toggle_key: self.toggle_key,
             start_visible: self.start_visible,
             default_preset: self.default_preset,
             env_override: self.env_override,
         })
-        .init_resource::<NetSim>()
         .init_resource::<NetDebugExtras>()
         .add_systems(Startup, (apply_initial_preset, spawn_overlay))
-        // Replays delayed packets — another inbound seam, so it joins the backend receive
-        // systems in PreUpdate.
-        .add_systems(
-            PreUpdate,
-            drain_netsim.in_set(crate::EnsembleSet::ReceivePackets),
-        )
         .add_systems(
             Update,
             (

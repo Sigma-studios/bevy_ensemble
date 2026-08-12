@@ -46,4 +46,7 @@ pub use crate::{NetMetrics, NetMetricsPlugin};
 
 // Interactive network debug overlay + condition simulator (feature `netdebug`).
 #[cfg(feature = "netdebug")]
-pub use crate::{NetDebugConfig, NetDebugExtras, NetDebugPlugin, NetPreset, NetSim, NetSimConfig};
+pub use crate::{
+    ChannelModel, NetDebugConfig, NetDebugExtras, NetDebugPlugin, NetPreset, NetSim, NetSimClock,
+    NetSimConfig, NetSimPlugin,
+};
