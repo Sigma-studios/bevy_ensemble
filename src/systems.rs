@@ -207,6 +207,19 @@ pub(crate) fn broadcast_changed_lobby_participants(
 ///
 /// When a client receives a [`ReceivedEnsembleMessage<SyncLobbyParticipant>`],
 /// this system either updates an existing participant or spawns a new one.
+///
+/// A player is announced to a joining client twice — once by
+/// [`sync_existing_participants_to_new_lobby_clients`], once by
+/// [`broadcast_changed_lobby_participants`] — and both can be read here in the
+/// same run. `existing_participants` cannot see a spawn this run has already
+/// queued, because `Commands` are not applied until the end of the schedule, so
+/// matching on the query alone spawns a second entity for that player. Hence
+/// `spawned_now`: what this run has decided, on top of what the world already
+/// holds.
+///
+/// The duplicate is not cosmetic. A client's roster is what its game walks to
+/// decide who to spawn and what to draw, so it ends up with two of somebody
+/// nobody else has.
 pub(crate) fn apply_received_lobby_participants(
     mut commands: Commands,
     mut messages: MessageReader<ReceivedEnsembleMessage<SyncLobbyParticipant>>,
@@ -221,31 +234,41 @@ pub(crate) fn apply_received_lobby_participants(
         return;
     };
 
+    let mut spawned_now: Vec<(u128, Entity)> = Vec::new();
+
     for message in messages.read() {
+        let participant = LobbyParticipant {
+            player_uuid: message.message.player_uuid,
+            is_host: message.message.is_host,
+        };
+
         if let Some((participant_entity, _, _)) =
             existing_participants
                 .iter()
-                .find(|(_, participant, participant_of)| {
+                .find(|(_, existing, participant_of)| {
                     participant_of.0 == client_lobby
-                        && participant.player_uuid == message.message.player_uuid
+                        && existing.player_uuid == message.message.player_uuid
                 })
         {
-            commands
-                .entity(participant_entity)
-                .insert(LobbyParticipant {
-                    player_uuid: message.message.player_uuid,
-                    is_host: message.message.is_host,
-                });
+            commands.entity(participant_entity).insert(participant);
             continue;
         }
 
-        commands.spawn((
-            LobbyParticipant {
-                player_uuid: message.message.player_uuid,
-                is_host: message.message.is_host,
-            },
-            LobbyParticipantOf(client_lobby),
-        ));
+        // Spawned by an earlier message in this same run, so not yet visible to
+        // the query above. Updated rather than skipped, so that a later message
+        // still has the last word on whoever it describes.
+        if let Some((_, participant_entity)) = spawned_now
+            .iter()
+            .find(|(player_uuid, _)| *player_uuid == message.message.player_uuid)
+        {
+            commands.entity(*participant_entity).insert(participant);
+            continue;
+        }
+
+        let participant_entity = commands
+            .spawn((participant, LobbyParticipantOf(client_lobby)))
+            .id();
+        spawned_now.push((message.message.player_uuid, participant_entity));
     }
 }
 
