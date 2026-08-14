@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 /// Messages sent from client to the signaling server.
+///
+/// **Append only.** Postcard encodes an enum by variant index, so inserting a variant renumbers
+/// every one after it, and a server built from a different commit then reads `JoinLobby` as
+/// `LeaveLobby` with no error of any kind.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
     /// First message after WebSocket connect. Server responds with `Welcome`.
@@ -19,6 +23,16 @@ pub enum ClientMessage {
     Signal { receiver_uuid: u128, data: String },
     /// Keep-alive heartbeat.
     KeepAlive,
+    /// Change the name this connection is known by, after `Authenticate`.
+    ///
+    /// The name given at authentication is fixed when the socket is built, which for most
+    /// consumers is process start — so a name typed into a menu could never reach the lobby list,
+    /// and a host was advertised under whatever `--name` said at launch. This is what makes it
+    /// live.
+    ///
+    /// Also updates the lobby listing when this connection hosts a lobby: `host_name` is copied
+    /// at creation and would otherwise keep the name the host had then.
+    SetDisplayName { display_name: String },
 }
 
 /// Messages sent from the signaling server to a client.

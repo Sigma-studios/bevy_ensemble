@@ -11,8 +11,35 @@ use crate::protocol::ClientMessage;
 
 use crate::{
     JoinWebrtcLobby, JoinWebrtcLobbyByCode, LobbyClientWebrtcUuid, LobbyWebrtcCode, LobbyWebrtcId,
-    PendingWebrtcLobbyClient, RefreshLobbyList,
+    PendingWebrtcLobbyClient, RefreshLobbyList, SignallingDisplayName,
 };
+
+/// Send the display name to the signalling server whenever it changes.
+///
+/// On an edge rather than every frame, and skipping the first — the name the plugin was built with
+/// already went out in `Authenticate`, so re-sending it at startup would be a redundant frame for
+/// every peer that never touches its name.
+///
+/// There is no retry, and the reason is the channel rather than optimism: this is the WebSocket to
+/// the signalling server, which is TCP. If it is up the message arrives; if it is not, this peer
+/// has no listing to be wrong in.
+pub(crate) fn publish_display_name(
+    name: Res<SignallingDisplayName>,
+    lobby_conn: Res<LobbyConnection>,
+    mut sent: Local<Option<String>>,
+) {
+    if sent.is_none() {
+        *sent = Some(name.0.clone());
+        return;
+    }
+    if sent.as_deref() == Some(name.0.as_str()) {
+        return;
+    }
+    let _ = lobby_conn.command_tx.send(ClientMessage::SetDisplayName {
+        display_name: name.0.clone(),
+    });
+    *sent = Some(name.0.clone());
+}
 
 pub(crate) fn flush_lobby_events(
     lobby_conn: Res<LobbyConnection>,
