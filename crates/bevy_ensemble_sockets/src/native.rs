@@ -16,12 +16,7 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
-use crate::{OutgoingSignal, PeerSignal, PeerState};
-
-const STUN_URLS: &[&str] = &[
-    "stun:stun.l.google.com:19302",
-    "stun:stun1.l.google.com:19302",
-];
+use crate::{IceServers, OutgoingSignal, PeerSignal, PeerState};
 
 pub(crate) struct NativePeerConnection {
     pub connection: Arc<RTCPeerConnection>,
@@ -56,15 +51,22 @@ pub(crate) fn create_peer_connection(
     signal_tx: mpsc::UnboundedSender<OutgoingSignal>,
     peer_state_tx: mpsc::UnboundedSender<(u128, PeerState)>,
     message_tx: mpsc::UnboundedSender<(u128, Box<[u8]>)>,
+    ice_servers: &IceServers,
     handle: tokio::runtime::Handle,
 ) -> NativePeerConnection {
     let api = APIBuilder::new().build();
 
     let config = RTCConfiguration {
-        ice_servers: vec![RTCIceServer {
-            urls: STUN_URLS.iter().map(|s| s.to_string()).collect(),
-            ..Default::default()
-        }],
+        ice_servers: ice_servers
+            .0
+            .iter()
+            .map(|server| RTCIceServer {
+                urls: server.urls.clone(),
+                username: server.username.clone(),
+                credential: server.credential.clone(),
+                ..Default::default()
+            })
+            .collect(),
         ..Default::default()
     };
 

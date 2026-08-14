@@ -67,6 +67,33 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                 let _ = tx.send(ServerMessage::Welcome { player_uuid: uuid });
             }
 
+            ClientMessage::SetDisplayName { display_name } => {
+                let Some(uuid) = player_uuid else {
+                    let _ = tx.send(ServerMessage::LobbyError {
+                        reason: "Not authenticated".into(),
+                    });
+                    continue;
+                };
+
+                let hosted = match state.connections.get_mut(&uuid) {
+                    Some(mut conn) => {
+                        conn.display_name = display_name.clone();
+                        conn.lobby_id
+                    }
+                    None => None,
+                };
+
+                // The listing keeps its own copy, taken when the lobby was created. Without this
+                // the name changes everywhere except the one place it is read from.
+                if let Some(lobby_id) = hosted {
+                    if let Some(mut lobby) = state.lobbies.get_mut(&lobby_id) {
+                        if lobby.host_uuid == uuid {
+                            lobby.host_name = display_name;
+                        }
+                    }
+                }
+            }
+
             ClientMessage::CreateLobby { max_players } => {
                 let Some(uuid) = player_uuid else {
                     let _ = tx.send(ServerMessage::LobbyError {

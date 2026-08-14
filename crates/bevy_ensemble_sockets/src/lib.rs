@@ -28,6 +28,57 @@ pub struct OutgoingSignal {
     pub signal: PeerSignal,
 }
 
+/// One ICE server a peer connection may gather candidates from.
+///
+/// `username` and `credential` are only read for TURN; leave them empty for STUN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IceServer {
+    pub urls: Vec<String>,
+    pub username: String,
+    pub credential: String,
+}
+
+impl IceServer {
+    /// A credential-less server, which is every STUN server.
+    pub fn stun(url: impl Into<String>) -> Self {
+        Self {
+            urls: vec![url.into()],
+            username: String::new(),
+            credential: String::new(),
+        }
+    }
+}
+
+/// The ICE servers peer connections gather candidates from.
+///
+/// The default is the pair of public Google STUN servers this crate used to hardcode with no way
+/// to override them. That default is right for two peers on different networks and pure cost for
+/// two on the same machine: gathering waits on servers whose answer is not needed, which makes
+/// every local run slower — and, while trickled candidates were still being dropped, made the
+/// resulting failure slow as well as total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IceServers(pub Vec<IceServer>);
+
+impl Default for IceServers {
+    fn default() -> Self {
+        Self(vec![IceServer {
+            urls: vec![
+                "stun:stun.l.google.com:19302".into(),
+                "stun:stun1.l.google.com:19302".into(),
+            ],
+            username: String::new(),
+            credential: String::new(),
+        }])
+    }
+}
+
+impl IceServers {
+    /// Gather host candidates only. Correct for loopback and a LAN, and for tests.
+    pub fn none() -> Self {
+        Self(Vec::new())
+    }
+}
+
 /// A cross-platform WebRTC socket that manages peer connections and data channels.
 ///
 /// Call [`EnsembleSocket::new`] to create one, then use:
@@ -48,6 +99,7 @@ pub struct EnsembleSocket {
     #[cfg(target_arch = "wasm32")]
     peers: HashMap<u128, wasm::WasmPeerConnection>,
     connected: HashMap<u128, bool>,
+    ice_servers: IceServers,
     #[cfg(not(target_arch = "wasm32"))]
     runtime_handle: tokio::runtime::Handle,
 }
@@ -67,6 +119,7 @@ impl EnsembleSocket {
             message_rx,
             peers: HashMap::new(),
             connected: HashMap::new(),
+            ice_servers: IceServers::default(),
             runtime_handle,
         }
     }
@@ -85,7 +138,17 @@ impl EnsembleSocket {
             message_rx,
             peers: HashMap::new(),
             connected: HashMap::new(),
+            ice_servers: IceServers::default(),
         }
+    }
+
+    /// Gather candidates from these ICE servers rather than the default public STUN pair.
+    ///
+    /// Takes effect for connections opened after it, which in practice is all of them: the socket
+    /// is rebuilt each time a lobby is left.
+    pub fn with_ice_servers(mut self, ice_servers: IceServers) -> Self {
+        self.ice_servers = ice_servers;
+        self
     }
 
     /// Initiate a WebRTC connection to a peer (we create the offer).
@@ -101,6 +164,7 @@ impl EnsembleSocket {
                 self.signal_tx.clone(),
                 self.peer_state_tx.clone(),
                 self.message_tx.clone(),
+                &self.ice_servers,
                 self.runtime_handle.clone(),
             );
             native::create_offer(&pc, peer_id, self.signal_tx.clone(), &self.runtime_handle);
@@ -114,6 +178,7 @@ impl EnsembleSocket {
                 self.signal_tx.clone(),
                 self.peer_state_tx.clone(),
                 self.message_tx.clone(),
+                &self.ice_servers,
             );
             wasm::create_offer(&pc, peer_id, self.signal_tx.clone());
             self.peers.insert(peer_id, pc);
@@ -135,6 +200,7 @@ impl EnsembleSocket {
                         self.signal_tx.clone(),
                         self.peer_state_tx.clone(),
                         self.message_tx.clone(),
+                        &self.ice_servers,
                         self.runtime_handle.clone(),
                     );
                     native::accept_offer(&pc, &sdp);
@@ -148,6 +214,7 @@ impl EnsembleSocket {
                         self.signal_tx.clone(),
                         self.peer_state_tx.clone(),
                         self.message_tx.clone(),
+                        &self.ice_servers,
                     );
                     wasm::accept_offer(&pc, sender, &sdp, self.signal_tx.clone());
                     self.peers.insert(sender, pc);

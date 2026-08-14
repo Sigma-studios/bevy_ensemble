@@ -9,7 +9,7 @@ use web_sys::{
     RtcSessionDescriptionInit,
 };
 
-use crate::{OutgoingSignal, PeerSignal, PeerState};
+use crate::{IceServers, OutgoingSignal, PeerSignal, PeerState};
 
 pub(crate) struct WasmPeerConnection {
     pub connection: RtcPeerConnection,
@@ -20,27 +20,36 @@ pub(crate) struct WasmPeerConnection {
     remote_desc_set: Arc<Mutex<bool>>,
 }
 
-const STUN_URLS: &[&str] = &[
-    "stun:stun.l.google.com:19302",
-    "stun:stun1.l.google.com:19302",
-];
-
 pub(crate) fn create_peer_connection(
     peer_id: u128,
     signal_tx: mpsc::UnboundedSender<OutgoingSignal>,
     peer_state_tx: mpsc::UnboundedSender<(u128, PeerState)>,
     message_tx: mpsc::UnboundedSender<(u128, Box<[u8]>)>,
+    ice_servers: &IceServers,
 ) -> WasmPeerConnection {
     let config = RtcConfiguration::new();
 
+    /// The shape `RTCPeerConnection` expects, which is not the shape we hold: the browser reads
+    /// `credential`, the native stack reads it too, and neither wants the field present when it
+    /// is empty.
     #[derive(serde::Serialize)]
-    struct IceServer {
-        urls: Vec<&'static str>,
+    struct JsIceServer {
+        urls: Vec<String>,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        username: String,
+        #[serde(skip_serializing_if = "String::is_empty")]
+        credential: String,
     }
-    let ice_servers = [IceServer {
-        urls: STUN_URLS.to_vec(),
-    }];
-    config.set_ice_servers(&serde_wasm_bindgen::to_value(&ice_servers).unwrap());
+    let servers: Vec<JsIceServer> = ice_servers
+        .0
+        .iter()
+        .map(|server| JsIceServer {
+            urls: server.urls.clone(),
+            username: server.username.clone(),
+            credential: server.credential.clone(),
+        })
+        .collect();
+    config.set_ice_servers(&serde_wasm_bindgen::to_value(&servers).unwrap());
 
     let conn = RtcPeerConnection::new_with_configuration(&config).unwrap();
 
