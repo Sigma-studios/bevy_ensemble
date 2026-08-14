@@ -3,10 +3,22 @@ pub mod protocol;
 #[cfg(feature = "server")]
 pub mod server;
 
+/// The `axum` the signalling server is written against.
+///
+/// Use it — `bevy_ensemble_webrtc::axum::extract::ws::WebSocket` — rather than depending on
+/// `axum` yourself. [`server::handle_socket`] takes *this* crate's `WebSocket`, and two axum
+/// versions in one graph are two unrelated types, so a host binary that pins its own copy gets a
+/// mismatch at the one call it exists to make. Going through this re-export means the version is
+/// this crate's business, which is where it belongs.
+#[cfg(feature = "server")]
+pub use axum;
+
 #[cfg(feature = "client")]
 mod connection;
 #[cfg(feature = "client")]
 mod handshake;
+#[cfg(feature = "client")]
+mod session;
 #[cfg(feature = "client")]
 mod systems;
 
@@ -14,7 +26,7 @@ mod systems;
 #[cfg(feature = "client")]
 use bevy::prelude::*;
 #[cfg(feature = "client")]
-use bevy_ensemble::EnsembleAppExt;
+use bevy_ensemble::{EnsembleAppExt, EnsembleTransportAppExt};
 #[cfg(feature = "client")]
 pub use bevy_ensemble_sockets::{IceServer, IceServers};
 #[cfg(feature = "client")]
@@ -218,7 +230,8 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
 
         let (socket, lobby_connection) = webrtc_runtime.build_socket();
 
-        app.insert_resource(webrtc_runtime)
+        app.claim_transport("bevy_ensemble_webrtc")
+            .insert_resource(webrtc_runtime)
             .insert_resource(lobby_connection)
             .insert_resource(socket)
             .insert_resource(SignallingDisplayName(self.display_name.clone()))
@@ -257,6 +270,16 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
             .add_systems(
                 PreUpdate,
                 systems::read_peer_messages.in_set(bevy_ensemble::EnsembleSet::ReceivePackets),
+            )
+            // `bevy_ensemble`'s backend-neutral session requests, so a game does not have to
+            // name this crate to host, list, join or leave. See `session`.
+            .add_systems(
+                Update,
+                (
+                    session::refresh_lobbies,
+                    session::join_lobby,
+                    session::leave_lobby,
+                ),
             )
             .add_observer(systems::send_serialized_lobby_packet)
             .add_observer(systems::disconnect_removed_lobby_client);

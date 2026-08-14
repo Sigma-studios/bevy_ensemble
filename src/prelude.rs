@@ -38,6 +38,12 @@ pub use crate::{
 
     // Messages & events
     EnsembleAppExt, LobbyMessage, ReceivedEnsembleMessage, SendMode, StartHosting,
+
+    // Transport
+    EnsembleTransportAppExt, TransportBackend,
+
+    // Session requests
+    JoinLobby, LeaveLobby, RefreshLobbies,
 };
 
 // Network metrics (feature `netmetrics`).

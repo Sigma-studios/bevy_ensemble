@@ -1,9 +1,19 @@
 use bevy::prelude::*;
 use bevy_ensemble::{
-    EnsembleAppExt, Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipantOf,
-    LocalMultiplayerPlayerId, PendingLobby, RequestLobby, SerializedLobbyPacket,
-    decode_ensemble_packet, encode_ensemble_message,
+    EnsembleAppExt, EnsembleTransportAppExt, Host, Lobby, LobbyClient, LobbyClientPlayerUuid,
+    LobbyParticipantOf, LocalMultiplayerPlayerId, PendingLobby, RequestLobby,
+    SerializedLobbyPacket, decode_ensemble_packet, encode_ensemble_message,
 };
+
+/// The `bevy-steamworks` this crate is built against.
+///
+/// Use it — `bevy_ensemble_steam::bevy_steamworks::Client` — rather than depending on
+/// `bevy-steamworks` yourself. [`BevyEnsembleSteamPlugin`] adds `SteamworksPlugin`, and that is
+/// what inserts the `Client` resource; a consumer that reaches `Client` through a second copy of
+/// the crate gets a second, unrelated type. Cargo builds both without complaint, and then every
+/// system taking `Res<Client>` silently fails parameter validation at runtime, saying nothing
+/// about why. Going through this re-export makes that impossible rather than documented.
+pub use bevy_steamworks;
 pub use bevy_steamworks::LobbyId;
 use bevy_steamworks::{
     CallbackResult, ChatMemberStateChange, ChatRoomEnterResponse, Client, FriendFlags,
@@ -11,6 +21,8 @@ use bevy_steamworks::{
     networking_types::{NetworkingIdentity, SendFlags},
 };
 use std::collections::{HashMap, HashSet};
+
+mod session;
 
 pub const DEFAULT_STEAM_APP_ID: u32 = 480;
 /// TODO: this is EResult::k_EResultOK, swap it out for the proper type once exposed by steamworks-rs
@@ -74,6 +86,7 @@ impl Default for BevyEnsembleSteamPlugin {
 
 impl Plugin for BevyEnsembleSteamPlugin {
     fn build(&self, app: &mut App) {
+        app.claim_transport("bevy_ensemble_steam");
         app.add_plugins(
             SteamworksPlugin::init_app(self.app_id)
                 .expect("Steamworks initialization plugin should build with a valid app id"),
@@ -104,6 +117,19 @@ impl Plugin for BevyEnsembleSteamPlugin {
         .add_systems(
             PreUpdate,
             read_messages.in_set(bevy_ensemble::EnsembleSet::ReceivePackets),
+        )
+        // `bevy_ensemble`'s backend-neutral session requests, so a game does not have to name
+        // this crate — or know how a Steam session is torn down — to host, list, join or leave.
+        // See `session`.
+        .init_resource::<bevy_ensemble::PublicLobbies>()
+        .add_systems(
+            Update,
+            (
+                session::refresh_lobbies,
+                session::publish_public_lobbies,
+                session::join_lobby,
+                session::leave_lobby,
+            ),
         )
         .add_observer(send_serialized_lobby_packet);
     }

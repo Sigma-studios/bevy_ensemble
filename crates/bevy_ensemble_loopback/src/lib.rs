@@ -70,8 +70,9 @@
 
 use bevy::prelude::*;
 use bevy_ensemble::{
-    EnsembleSet, Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipantOf, NetPreset,
-    PeerRtt, PlayerUUID, SendMode, SerializedLobbyPacket, decode_ensemble_packet,
+    EnsembleSet, EnsembleTransportAppExt, Host, Lobby, LobbyClient, LobbyClientPlayerUuid,
+    LobbyParticipantOf, NetPreset, PeerRtt, PlayerUUID, SendMode, SerializedLobbyPacket,
+    decode_ensemble_packet,
 };
 use std::time::Duration;
 
@@ -96,7 +97,8 @@ pub struct LoopbackTransportPlugin;
 
 impl Plugin for LoopbackTransportPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Outbox>()
+        app.claim_transport("bevy_ensemble_loopback")
+            .init_resource::<Outbox>()
             .init_resource::<Inbox>()
             .add_observer(capture_outbound_packet)
             .add_systems(PreUpdate, drain_inbox.in_set(EnsembleSet::ReceivePackets));

@@ -6,6 +6,7 @@
 
 A backend plugin is responsible for:
 
+0. **Claiming the transport** (call `app.claim_transport("my_crate_name")` first — see below)
 1. **Creating lobbies** on the platform (observe `RequestLobby` + `Host` entities)
 2. **Joining lobbies** via platform-specific mechanisms
 3. **Managing the lobby lifecycle** (`PendingLobby` to `Lobby` promotion)
@@ -13,6 +14,31 @@ A backend plugin is responsible for:
 5. **Receiving packets** (call `decode_ensemble_packet` when bytes arrive)
 6. **Tracking connections** (spawn and manage `LobbyClient` entities)
 7. **Setting player identity** (insert `LocalMultiplayerPlayerId` resource)
+
+## Claiming the Transport
+
+Every backend observes the same outbound event, so an app holding two of them encodes each message
+once and sends it twice — once down each wire. Nothing downstream detects the duplicate; the
+session just behaves strangely.
+
+So a backend claims the transport as the first thing it does in `build`:
+
+```rust,ignore
+use bevy_ensemble::EnsembleTransportAppExt;
+
+impl Plugin for MyBackendPlugin {
+    fn build(&self, app: &mut App) {
+        app.claim_transport("my_backend_crate");
+        // ... everything else
+    }
+}
+```
+
+A second claim panics and names both backends. The name is what that message calls you, so use the
+crate name. Game code can read the winner back out of the `TransportBackend` resource.
+
+Two backends in one graph is nearly always a pair of cargo features that ought to be mutually
+exclusive rather than additive.
 
 ## Required Components
 
