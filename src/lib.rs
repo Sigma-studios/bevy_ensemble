@@ -98,7 +98,9 @@ mod ping;
 mod player_data;
 pub mod prelude;
 pub mod registry;
+mod session;
 mod systems;
+mod transport;
 mod types;
 
 pub use broadcast::{BroadcastLobbyMessage, LobbyBroadcastAppExt, LobbyBroadcastPlugin};
@@ -113,6 +115,8 @@ pub use netsim::{ChannelModel, NetPreset, NetSim, NetSimClock, NetSimConfig, Net
 pub use ping::{PeerLastPong, PeerRtt, PeerWireRtt};
 pub use player_data::{PlayerData, PlayerDataPlugin, SetPlayerData};
 pub use registry::{EnsembleMessageRegistry, decode_ensemble_packet, encode_ensemble_message};
+pub use session::{JoinLobby, LeaveLobby, RefreshLobbies};
+pub use transport::{EnsembleTransportAppExt, TransportBackend};
 pub use types::*;
 
 /// Core plugin that sets up the ensemble lobby and participant systems.
@@ -147,6 +151,8 @@ pub enum EnsembleSet {
 
 impl Plugin for EnsemblePlugin {
     fn build(&self, app: &mut App) {
+        session::register_session_messages(app);
+
         app.init_resource::<EnsembleMessageRegistry>()
             .add_message::<StartHosting>()
             .register_ensemble_message_type::<SyncLobbyParticipant>()
