@@ -5,7 +5,16 @@ use crate::{
     messages::{LobbyClientMessage, LobbyMessage},
 };
 
-const PING_INTERVAL_SECS: f32 = 1.0;
+/// How often each peer pings every other.
+///
+/// Once a second was too slow to be a signal. Two consumers need this to be a *series* and not an
+/// occasional reading: the smoothed mean takes about a dozen samples to follow a genuine latency
+/// shift, which at 1 Hz is fifteen seconds of a session running on a stale number, and
+/// [`PeerRttJitter`] cannot exist at all without enough samples to have a spread.
+///
+/// Ten a second, and it costs nothing worth counting: the payload is two `f64`s and it goes
+/// unreliably, against a lockstep stream already sending 64 messages a second in each direction.
+const PING_INTERVAL_SECS: f32 = 0.1;
 
 /// Internal ping message sent over data channels to measure RTT.
 #[derive(Message, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -45,6 +54,27 @@ pub struct PeerRtt(pub f64);
 /// genuine network RTT. Added alongside [`PeerRtt`].
 #[derive(Component, Debug, Clone, Copy)]
 pub struct PeerWireRtt(pub f64);
+
+/// How much a peer's round trip varies, in seconds: an EMA of each raw sample's absolute
+/// deviation from the smoothed mean.
+///
+/// # Why this has to be measured here
+///
+/// Because here is the only place raw samples exist. A consumer sizing a playout buffer needs the
+/// spread as well as the mean — the mean says where packets land on average, and the spread says
+/// how late the unlucky ones are, which is what the buffer has to cover.
+///
+/// Deriving it from [`PeerRtt`] instead does not work, and quietly returns near-zero rather than
+/// failing. `PeerRtt` is already smoothed, so its own variation is the *smoothed* signal's
+/// variation, which is precisely the thing smoothing removed;
+/// `bevy_ticked_lockstep_networking`'s adaptive buffer did exactly that, applied a second EMA on
+/// top, and computed its jitter headroom from a series that had been averaged twice and sampled
+/// once a second. It came out as roughly nothing on links with tens of milliseconds of real
+/// spread, so a buffer that was meant to carry jitter headroom carried none.
+///
+/// Added alongside [`PeerRtt`], on the same entities.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct PeerRttJitter(pub f64);
 
 /// Seconds elapsed since the last pong was received from a peer.
 ///
@@ -145,6 +175,25 @@ fn smooth(previous: Option<f64>, sample: f64) -> f64 {
     }
 }
 
+/// Fold one raw sample into the jitter estimate.
+///
+/// The deviation is taken against the *previous* mean rather than the updated one, so the sample
+/// being measured has not already been folded into the thing it is measured against — otherwise a
+/// large sample partly moves the mean toward itself and reports a smaller deviation than it is.
+///
+/// Zero on the first sample: one reading has a mean and no spread, and seeding the estimate with
+/// its distance from nothing would claim an enormous one.
+fn smooth_jitter(previous_jitter: Option<f64>, previous_mean: Option<f64>, sample: f64) -> f64 {
+    let Some(previous_mean) = previous_mean else {
+        return 0.0;
+    };
+    let deviation = (sample - previous_mean).abs();
+    match previous_jitter {
+        Some(prev) => (1.0 - RTT_SMOOTHING) * prev + RTT_SMOOTHING * deviation,
+        None => deviation,
+    }
+}
+
 /// When we receive a pong, compute the round trip and store both the full end-to-end RTT
 /// ([`PeerRtt`]) and the wire estimate ([`PeerWireRtt`], the RTT minus the peer's dwell).
 ///
@@ -156,10 +205,19 @@ pub(crate) fn receive_pongs(
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
     client_lobby: Option<Single<Entity, (With<Lobby>, Without<Host>)>>,
     lobby_clients: Query<
-        (Entity, &LobbyClientPlayerUuid, Option<&PeerRtt>, Option<&PeerWireRtt>),
+        (
+            Entity,
+            &LobbyClientPlayerUuid,
+            Option<&PeerRtt>,
+            Option<&PeerWireRtt>,
+            Option<&PeerRttJitter>,
+        ),
         With<LobbyClient>,
     >,
-    client_lobby_rtt: Query<(Option<&PeerRtt>, Option<&PeerWireRtt>), (With<Lobby>, Without<Host>)>,
+    client_lobby_rtt: Query<
+        (Option<&PeerRtt>, Option<&PeerWireRtt>, Option<&PeerRttJitter>),
+        (With<Lobby>, Without<Host>),
+    >,
 ) {
     for message in messages.read() {
         let pong = message.message;
@@ -178,12 +236,20 @@ pub(crate) fn receive_pongs(
 
         // Host side: find the LobbyClient entity for this sender
         if host_lobby.is_some() {
-            if let Some((entity, _, prev_rtt, prev_wire)) =
-                lobby_clients.iter().find(|(_, uuid, _, _)| uuid.0 == sender)
+            if let Some((entity, _, prev_rtt, prev_wire, prev_jitter)) = lobby_clients
+                .iter()
+                .find(|(_, uuid, _, _, _)| uuid.0 == sender)
             {
+                let previous_mean = prev_rtt.map(|p| p.0);
                 commands.entity(entity).insert((
-                    PeerRtt(smooth(prev_rtt.map(|p| p.0), e2e)),
+                    PeerRtt(smooth(previous_mean, e2e)),
                     PeerWireRtt(smooth(prev_wire.map(|p| p.0), wire)),
+                    // Folded from the raw `e2e` against the mean as it stood *before* this sample.
+                    PeerRttJitter(smooth_jitter(
+                        prev_jitter.map(|p| p.0),
+                        previous_mean,
+                        e2e,
+                    )),
                     PeerLastPong(0.0),
                 ));
             }
@@ -191,12 +257,14 @@ pub(crate) fn receive_pongs(
 
         // Client side: store on the lobby entity
         if let Some(lobby_entity) = client_lobby.as_ref() {
-            let (prev_rtt, prev_wire) = client_lobby_rtt
+            let (prev_rtt, prev_wire, prev_jitter) = client_lobby_rtt
                 .get(**lobby_entity)
-                .unwrap_or((None, None));
+                .unwrap_or((None, None, None));
+            let previous_mean = prev_rtt.map(|p| p.0);
             commands.entity(**lobby_entity).insert((
-                PeerRtt(smooth(prev_rtt.map(|p| p.0), e2e)),
+                PeerRtt(smooth(previous_mean, e2e)),
                 PeerWireRtt(smooth(prev_wire.map(|p| p.0), wire)),
+                PeerRttJitter(smooth_jitter(prev_jitter.map(|p| p.0), previous_mean, e2e)),
                 PeerLastPong(0.0),
             ));
         }
@@ -208,5 +276,81 @@ pub(crate) fn tick_last_pong(time: Res<Time>, mut peers: Query<&mut PeerLastPong
     let dt = time.delta_secs_f64();
     for mut last_pong in peers.iter_mut() {
         last_pong.0 += dt;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feed a series of raw round trips through both estimators, as `receive_pongs` does.
+    fn estimate(samples: &[f64]) -> (f64, f64) {
+        let (mut mean, mut jitter) = (None, None);
+        for sample in samples {
+            jitter = Some(smooth_jitter(jitter, mean, *sample));
+            mean = Some(smooth(mean, *sample));
+        }
+        (mean.unwrap_or(0.0), jitter.unwrap_or(0.0))
+    }
+
+    #[test]
+    fn one_sample_has_a_mean_and_no_spread() {
+        let (mean, jitter) = estimate(&[0.050]);
+        assert_eq!(mean, 0.050);
+        assert_eq!(
+            jitter, 0.0,
+            "a first sample has nothing to deviate from; seeding the estimate with its distance \
+             from zero would claim a 50ms spread on a link that has shown none"
+        );
+    }
+
+    #[test]
+    fn a_steady_link_reports_no_spread() {
+        let (mean, jitter) = estimate(&[0.050; 40]);
+        assert!((mean - 0.050).abs() < 0.001);
+        assert!(
+            jitter < 0.001,
+            "a link that always answers in 50ms is not jittery, and reported {jitter}"
+        );
+    }
+
+    #[test]
+    fn an_unsteady_link_reports_the_spread_and_not_the_mean() {
+        // Same mean as above, ±20ms around it.
+        let samples: Vec<f64> = (0..40)
+            .map(|index| if index % 2 == 0 { 0.030 } else { 0.070 })
+            .collect();
+        let (mean, jitter) = estimate(&samples);
+
+        assert!(
+            (mean - 0.050).abs() < 0.005,
+            "the mean should be unmoved by symmetric jitter, and was {mean}"
+        );
+        assert!(
+            jitter > 0.010,
+            "±20ms of spread reported as {jitter} — this is the number a playout buffer sizes its \
+             headroom from, and a buffer given zero headroom stalls on every late packet"
+        );
+    }
+
+    #[test]
+    fn the_spread_is_measured_against_the_mean_before_the_sample_joined_it() {
+        // Folding the sample into the mean first drags the mean toward it, so the deviation comes
+        // out smaller than it was — the estimator would under-report exactly the large samples it
+        // exists to catch.
+        let naive = {
+            let (mut mean, mut jitter) = (None, None);
+            for sample in [0.050, 0.050, 0.050, 0.150] {
+                mean = Some(smooth(mean, sample));
+                jitter = Some(smooth_jitter(jitter, mean, sample));
+            }
+            jitter.unwrap()
+        };
+        let (_, correct) = estimate(&[0.050, 0.050, 0.050, 0.150]);
+
+        assert!(
+            correct > naive,
+            "measuring against the updated mean under-reports the spike ({naive} vs {correct})"
+        );
     }
 }

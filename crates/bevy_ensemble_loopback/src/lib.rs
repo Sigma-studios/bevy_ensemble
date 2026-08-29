@@ -71,7 +71,8 @@
 use bevy::prelude::*;
 use bevy_ensemble::{
     EnsembleSet, EnsembleTransportAppExt, Host, Lobby, LobbyClient, LobbyClientPlayerUuid,
-    LobbyParticipantOf, NetPreset, PeerRtt, PlayerUUID, SendMode, SerializedLobbyPacket,
+    LobbyParticipantOf, NetPreset, PeerRtt, PeerRttJitter, PlayerUUID, SendMode,
+    SerializedLobbyPacket,
     decode_ensemble_packet,
 };
 use std::time::Duration;
@@ -520,6 +521,18 @@ impl LoopbackNetwork {
             round_trip += 2.0 * f64::from(config.delay_ms + sampled) / 1000.0;
         }
 
+        // Published alongside the round trip, because a consumer sizing a playout buffer needs the
+        // spread as well as the mean, and because the alternative is worse than it looks: a
+        // harness that publishes only `PeerRtt` leaves that consumer deriving jitter from a
+        // pre-smoothed series, which is what `bevy_ticked_lockstep_networking`'s adaptive buffer
+        // was doing on real transports while every loopback test said its jitter headroom worked.
+        // Modelling the same *signals* a real backend produces is what makes the harness able to
+        // catch that class of bug at all.
+        //
+        // The expectation of `next_below(n + 1)`, doubled for the round trip, is the mean absolute
+        // deviation the real estimator converges to on this link.
+        let mean_jitter = self.link.jitter.as_secs_f64() / 2.0;
+
         let connected: Vec<PlayerUUID> = self
             .peers
             .iter()
@@ -540,12 +553,14 @@ impl LoopbackNetwork {
                     .map(|(entity, _)| entity)
                     .collect();
                 for client in clients {
-                    world.entity_mut(client).insert(PeerRtt(round_trip));
+                    world
+                        .entity_mut(client)
+                        .insert((PeerRtt(round_trip), PeerRttJitter(mean_jitter)));
                 }
             } else {
                 let lobby = peer.lobby;
                 if let Ok(mut lobby) = peer.app.world_mut().get_entity_mut(lobby) {
-                    lobby.insert(PeerRtt(round_trip));
+                    lobby.insert((PeerRtt(round_trip), PeerRttJitter(mean_jitter)));
                 }
             }
         }

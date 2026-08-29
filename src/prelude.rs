@@ -34,7 +34,7 @@ pub use crate::{
     PlayerOwned, PlayerOwnedEntities,
 
     // Ping
-    PeerLastPong, PeerRtt, PeerWireRtt,
+    PeerLastPong, PeerRtt, PeerRttJitter, PeerWireRtt,
 
     // Messages & events
     EnsembleAppExt, LobbyMessage, ReceivedEnsembleMessage, SendMode, StartHosting,
