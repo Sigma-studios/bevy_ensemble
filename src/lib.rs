@@ -112,7 +112,7 @@ pub use netdebug::{NetDebugConfig, NetDebugExtras, NetDebugPlugin};
 pub use netmetrics::{NetMetrics, NetMetricsPlugin};
 #[cfg(feature = "netdebug")]
 pub use netsim::{ChannelModel, NetPreset, NetSim, NetSimClock, NetSimConfig, NetSimPlugin};
-pub use ping::{PeerLastPong, PeerRtt, PeerWireRtt};
+pub use ping::{PeerLastPong, PeerRtt, PeerRttJitter, PeerWireRtt};
 pub use player_data::{PlayerData, PlayerDataPlugin, SetPlayerData};
 pub use registry::{EnsembleMessageRegistry, decode_ensemble_packet, encode_ensemble_message};
 pub use session::{JoinLobby, LeaveLobby, RefreshLobbies};
