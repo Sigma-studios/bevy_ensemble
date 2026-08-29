@@ -362,7 +362,7 @@ pub(crate) fn send_serialized_lobby_packet(
     >,
     lobby_client_query: Query<&LobbyClientWebrtcUuid>,
 ) {
-    let reliable = packet.send_mode == bevy_ensemble::SendMode::Reliable;
+    let reliable = packet.send_mode.is_reliable();
 
     // Resolve the target: active lobby, pending lobby, or a specific client entity.
     let host = lobby_query

@@ -179,8 +179,13 @@ fn send_serialized_lobby_packet(
     >,
     lobby_client_query: Query<&LobbyClientSteamId>,
 ) {
+    // The only backend where `ReliableNoDelay` differs from `Reliable`, because it is the only one
+    // that coalesces: bare `RELIABLE` runs Steam's Nagle timer, which holds a small message ~5 ms
+    // hoping to pack it with the next. See `SendMode` for when that is worth paying and when it is
+    // pure loss.
     let send_flags = match packet.send_mode {
         bevy_ensemble::SendMode::Reliable => SendFlags::RELIABLE,
+        bevy_ensemble::SendMode::ReliableNoDelay => SendFlags::RELIABLE_NO_NAGLE,
         bevy_ensemble::SendMode::Unreliable => SendFlags::UNRELIABLE_NO_NAGLE,
     };
 

@@ -606,14 +606,17 @@ impl LoopbackNetwork {
         }
 
         if self.link.loss > 0.0 && self.rng.next_unit() < self.link.loss {
-            match send_mode {
-                // A reliable channel retransmits. That costs a round trip; it does not lose the
-                // message. Modelling it as a drop would test a failure the game cannot have.
-                SendMode::Reliable => {
-                    delay_frames += self.duration_to_frames(self.link.round_trip())
-                }
-                // Unreliable really is fire-and-forget.
-                SendMode::Unreliable => return,
+            // A reliable channel retransmits. That costs a round trip; it does not lose the
+            // message. Modelling it as a drop would test a failure the game cannot have.
+            // Unreliable really is fire-and-forget.
+            //
+            // Asked of the mode rather than matched variant by variant: what this models is
+            // delivery, and `ReliableNoDelay` differs from `Reliable` only in whether the
+            // transport packs it with the next message, which nothing here simulates.
+            if send_mode.is_reliable() {
+                delay_frames += self.duration_to_frames(self.link.round_trip());
+            } else {
+                return;
             }
         }
 
@@ -621,7 +624,7 @@ impl LoopbackNetwork {
         // through a real socket poll.
         let mut deliver_at_frame = self.frame + delay_frames.max(1);
 
-        if matches!(send_mode, SendMode::Reliable) {
+        if send_mode.is_reliable() {
             // Preserve per-link ordering. Jitter may only ever push a packet later.
             let last = self.last_delivery.entry((from, to)).or_insert(0);
             deliver_at_frame = deliver_at_frame.max(*last);
