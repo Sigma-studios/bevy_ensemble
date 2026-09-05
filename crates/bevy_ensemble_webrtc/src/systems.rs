@@ -79,6 +79,10 @@ pub(crate) fn apply_lobby_events(
             LobbyEvent::LobbyCreated { lobby_id, code } => {
                 info!("Lobby created: {lobby_id} (code: {code})");
                 let Some(player_uuid) = lobby_conn.local_player_uuid else {
+                    warn!(
+                        "the server created lobby {lobby_id} before it said `Welcome`; no local \
+                         uuid to host under, so this lobby is being left unclaimed"
+                    );
                     continue;
                 };
                 commands.insert_resource(LocalMultiplayerPlayerId(player_uuid));
@@ -92,18 +96,32 @@ pub(crate) fn apply_lobby_events(
                             LobbyWebrtcId(*lobby_id),
                             LobbyWebrtcCode(code.clone()),
                         ));
+                } else {
+                    warn!(
+                        "lobby {lobby_id} was created with no pending host lobby to promote. \
+                         The lobby exists on the server and this peer is not in it."
+                    );
                 }
             }
 
             LobbyEvent::LobbyJoined { lobby_id } => {
                 info!("Joined lobby: {lobby_id}");
                 let Some(player_uuid) = lobby_conn.local_player_uuid else {
+                    warn!(
+                        "joined lobby {lobby_id} before the server said `Welcome`; no local uuid \
+                         to play under, so the join is being dropped"
+                    );
                     continue;
                 };
                 commands.insert_resource(LocalMultiplayerPlayerId(player_uuid));
 
                 if let Some(entity) = pending_client_lobbies.iter().next() {
                     commands.entity(entity).insert(LobbyWebrtcId(*lobby_id));
+                } else {
+                    warn!(
+                        "joined lobby {lobby_id} with no pending client lobby to attach it to. \
+                         The join succeeded on the server and nothing here is holding it."
+                    );
                 }
             }
 
@@ -121,7 +139,16 @@ pub(crate) fn apply_lobby_events(
             LobbyEvent::PlayerJoined { player_uuid } => {
                 let player_uuid = *player_uuid;
                 info!("Player joined lobby: {player_uuid}");
+                // Not merely a missing lobby: `Single` also yields `None` when *two* entities
+                // match. Either way the peer is never connected to, and the joiner is left
+                // waiting on a data channel this side never opens -- with, until this line
+                // existed, the `info!` above as the only trace, which reads exactly like a join
+                // that worked.
                 let Some(lobby) = host_lobby.as_ref() else {
+                    warn!(
+                        "dropping the join of {player_uuid}: this peer has no single hosted \
+                         lobby to attach them to, so no connection to them will be opened"
+                    );
                     continue;
                 };
 
@@ -129,6 +156,7 @@ pub(crate) fn apply_lobby_events(
                     .iter()
                     .any(|(_, _, puuid)| puuid.0 == player_uuid);
                 if already_known {
+                    debug!("{player_uuid} is already a known client; not connecting twice");
                     continue;
                 }
 

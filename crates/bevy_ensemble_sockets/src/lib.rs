@@ -154,8 +154,10 @@ impl EnsembleSocket {
     /// Initiate a WebRTC connection to a peer (we create the offer).
     pub fn connect_peer(&mut self, peer_id: u128) {
         if self.peers.contains_key(&peer_id) {
+            log::debug!("peer {peer_id:#x}: already connecting or connected, not offering again");
             return;
         }
+        log::info!("peer {peer_id:#x}: opening a connection, offering as the caller");
 
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -186,12 +188,29 @@ impl EnsembleSocket {
     }
 
     /// Handle an incoming signal from a remote peer.
+    ///
+    /// # Every path that discards a signal says so
+    ///
+    /// Signalling is an ordered conversation that arrives over a channel this type does not
+    /// control, and the ways it can go wrong all look the same from the outside: a data channel
+    /// that never opens, on a connection that reported no error of any kind. Answering "was the
+    /// offer applied, and how many of its candidates survived?" used to mean adding print
+    /// statements to this function, because none of the discards below were audible.
+    ///
+    /// They are `warn!` rather than `debug!` deliberately. Reaching one of them means a peer sent
+    /// something this side had no state for, which is either a bug here or a peer that is not
+    /// speaking the protocol — never routine traffic.
     pub fn receive_signal(&mut self, sender: u128, signal: PeerSignal) {
         match signal {
             PeerSignal::Offer(sdp) => {
                 if self.peers.contains_key(&sender) {
+                    log::warn!(
+                        "peer {sender:#x}: ignoring a second offer; a connection to it already \
+                         exists. Both sides may believe they are the offerer."
+                    );
                     return;
                 }
+                log::info!("peer {sender:#x}: applying its offer, answering as the callee");
 
                 #[cfg(not(target_arch = "wasm32"))]
                 {
@@ -221,20 +240,34 @@ impl EnsembleSocket {
                 }
             }
             PeerSignal::Answer(sdp) => {
-                if let Some(pc) = self.peers.get(&sender) {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    native::set_remote_answer(pc, &sdp);
-                    #[cfg(target_arch = "wasm32")]
-                    wasm::set_remote_answer(pc, &sdp);
-                }
+                let Some(pc) = self.peers.get(&sender) else {
+                    log::warn!(
+                        "peer {sender:#x}: discarding its answer -- no connection to it exists. \
+                         An answer to an offer this side never made."
+                    );
+                    return;
+                };
+                log::info!("peer {sender:#x}: applying its answer");
+                #[cfg(not(target_arch = "wasm32"))]
+                native::set_remote_answer(pc, &sdp);
+                #[cfg(target_arch = "wasm32")]
+                wasm::set_remote_answer(pc, &sdp);
             }
             PeerSignal::IceCandidate(candidate) => {
-                if let Some(pc) = self.peers.get(&sender) {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    native::add_ice_candidate(pc, &candidate);
-                    #[cfg(target_arch = "wasm32")]
-                    wasm::add_ice_candidate(pc, &candidate);
-                }
+                let Some(pc) = self.peers.get(&sender) else {
+                    // The address is gone and there is no retry: the peer will not resend it.
+                    // Losing every candidate on both sides is a connection that gathers happily
+                    // and never pairs, so this is worth a line even though ICE often survives it.
+                    log::warn!(
+                        "peer {sender:#x}: discarding an ICE candidate that arrived before its \
+                         offer -- no connection to it exists yet"
+                    );
+                    return;
+                };
+                #[cfg(not(target_arch = "wasm32"))]
+                native::add_ice_candidate(pc, &candidate);
+                #[cfg(target_arch = "wasm32")]
+                wasm::add_ice_candidate(pc, &candidate);
             }
         }
     }
