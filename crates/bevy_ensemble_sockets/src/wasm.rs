@@ -315,6 +315,10 @@ async fn apply_ice_candidate(conn: &RtcPeerConnection, json: &str) {
     if parsed.is_null() {
         return;
     }
+    let described = js_sys::Reflect::get(&parsed, &JsValue::from_str("candidate"))
+        .ok()
+        .and_then(|value| value.as_string())
+        .unwrap_or_default();
     let candidate = RtcIceCandidateInit::from(parsed);
     // A rejected candidate is an address gone for good -- the peer will not send it again -- and
     // losing every candidate on both sides is a connection that gathers happily and never pairs.
@@ -323,7 +327,13 @@ async fn apply_ice_candidate(conn: &RtcPeerConnection, json: &str) {
             .await
     {
         log::warn!("discarding a remote ICE candidate the browser rejected: {error:?}");
+        return;
     }
+    // The counterpart to the `gathered local candidate` line. With only one of the two, a log
+    // says what this peer offered the world and nothing about what reached it, and "the remote
+    // candidates never arrived" and "they arrived and no pair worked" are different problems that
+    // end the same way.
+    log::info!("applied remote candidate {described}");
 }
 
 pub(crate) fn send_message(pc: &WasmPeerConnection, data: &[u8], reliable: bool) {

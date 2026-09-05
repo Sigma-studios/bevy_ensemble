@@ -288,9 +288,16 @@ async fn run_signal_queue(
                 // Reachable only if a peer trickles a candidate before its own offer, which is
                 // its bug rather than ours — but it is logged rather than dropped, because the
                 // silence is what made the original race expensive to find.
+                let candidate = init.candidate.clone();
                 if let Err(error) = conn.add_ice_candidate(init).await {
                     log::warn!("peer {peer_id:#x}: discarding an ICE candidate: {error}");
+                    continue;
                 }
+                // The counterpart to the `gathered local candidate` line. With only one of the
+                // two, a log says what this peer offered the world and nothing about what reached
+                // it, and "the remote candidates never arrived" and "they arrived and no pair
+                // worked" are different problems that end the same way.
+                log::info!("peer {peer_id:#x}: applied remote candidate {candidate}");
             }
         }
     }
