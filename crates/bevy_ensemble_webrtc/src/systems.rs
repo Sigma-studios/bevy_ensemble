@@ -4,7 +4,7 @@ use bevy_ensemble::{
     LocalMultiplayerPlayerId, PendingLobby, PublicLobbies, PublicLobbyInfo, RemoveLobbyParticipant,
     RequestLobby, SerializedLobbyPacket, decode_ensemble_packet, encode_ensemble_message,
 };
-use bevy_ensemble_sockets::PeerState;
+use bevy_ensemble_sockets::{PeerSignal, PeerState};
 
 use crate::connection::{LobbyConnection, LobbyEvent};
 use crate::protocol::ClientMessage;
@@ -334,18 +334,39 @@ pub(crate) fn poll_socket_peers(
 /// Each frame, pump signals between the WS handler and the EnsembleSocket:
 /// 1. Drain incoming signals from LobbyConnection's signal_rx and feed them to socket.receive_signal()
 /// 2. Drain outbound signals from socket.drain_signals() and send them as ClientMessage::Signal
+/// What kind of signal this is, for a log line. The bodies are an SDP blob or a candidate line,
+/// neither of which belongs in a log; which of the three it is, and who it is for, is the part
+/// that answers questions.
+fn signal_kind(signal: &PeerSignal) -> &'static str {
+    match signal {
+        PeerSignal::Offer(_) => "offer",
+        PeerSignal::Answer(_) => "answer",
+        PeerSignal::IceCandidate(_) => "candidate",
+    }
+}
+
 pub(crate) fn pump_socket_signals(
     mut socket: ResMut<crate::EnsembleSocketRes>,
     lobby_conn: Res<LobbyConnection>,
 ) {
     if let Ok(mut signal_rx) = lobby_conn.signal_rx.lock() {
         while let Ok((sender, signal)) = signal_rx.try_recv() {
+            // Both directions are logged, at the one seam every signal crosses, because the
+            // interesting failures are asymmetric: a peer whose offer and answer both arrive
+            // while its candidates do not is a different bug from one that never sends them, and
+            // the two are indistinguishable from either end alone.
+            info!("<- {} from peer {sender:#x}", signal_kind(&signal));
             socket.receive_signal(sender, signal);
         }
     }
 
     for outgoing in socket.drain_signals() {
         let data = serde_json::to_string(&outgoing.signal).expect("Failed to serialize PeerSignal");
+        info!(
+            "-> {} to peer {:#x}",
+            signal_kind(&outgoing.signal),
+            outgoing.peer
+        );
         let _ = lobby_conn.command_tx.send(ClientMessage::Signal {
             receiver_uuid: outgoing.peer,
             data,

@@ -293,10 +293,15 @@ pub(crate) fn set_remote_answer(pc: &WasmPeerConnection, sdp: &str) {
 pub(crate) fn add_ice_candidate(pc: &WasmPeerConnection, candidate_json: &str) {
     // Buffer candidates until remote description is set.
     if !*pc.remote_desc_set.lock().unwrap() {
-        pc.pending_candidates
-            .lock()
-            .unwrap()
-            .push(candidate_json.to_string());
+        let mut pending = pc.pending_candidates.lock().unwrap();
+        pending.push(candidate_json.to_string());
+        // Held, not applied. Whatever sets the remote description has to flush these, and if it
+        // never runs they are never applied and never reported -- a candidate that arrived and
+        // did nothing, which reads from the far end exactly like one that never arrived.
+        log::info!(
+            "buffering a remote candidate until the remote description is set ({} held)",
+            pending.len()
+        );
         return;
     }
 
