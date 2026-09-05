@@ -11,8 +11,10 @@ use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
@@ -89,17 +91,72 @@ pub(crate) fn create_peer_connection(
         connection.on_ice_candidate(Box::new(move |candidate| {
             let sig_tx = sig_tx.clone();
             Box::pin(async move {
-                let Some(candidate) = candidate else { return };
+                // `None` is the end-of-candidates marker. Worth a line of its own: "gathering
+                // finished having found nothing usable" and "gathering is still running" are
+                // different problems that otherwise look identical from the log.
+                let Some(candidate) = candidate else {
+                    log::info!("peer {peer_id:#x}: finished gathering local candidates");
+                    return;
+                };
                 let init = match candidate.to_json() {
                     Ok(init) => init,
-                    Err(_) => return,
+                    Err(error) => {
+                        log::warn!(
+                            "peer {peer_id:#x}: dropping a local candidate that would not \
+                             serialise: {error}"
+                        );
+                        return;
+                    }
                 };
                 let json = serde_json::to_string(&init).unwrap();
+                // The candidate line carries its type (host / srflx / relay) and address, which
+                // is what says whether this peer has anything a remote peer could reach it on.
+                log::info!("peer {peer_id:#x}: gathered local candidate {}", init.candidate);
                 let _ = sig_tx.send(OutgoingSignal {
                     peer: peer_id,
                     signal: PeerSignal::IceCandidate(json),
                 });
             })
+        }));
+    }
+
+    // ICE and peer connection state.
+    //
+    // Every other callback in this file reports success -- a channel that opened, a message that
+    // arrived -- so a connection that simply never completes produced no line at all. That is the
+    // one symptom shared by every distinct failure in this stack: a lost candidate, a blocked
+    // port, a peer that went away, a NAT neither side can traverse. These two handlers are what
+    // separate them, and they cost nothing on a connection that works.
+    //
+    // Observation only: `PeerState` still comes from the data channel opening and closing, so a
+    // consumer's notion of "connected" is unchanged by this.
+    {
+        connection.on_ice_connection_state_change(Box::new(move |state| {
+            match state {
+                RTCIceConnectionState::Failed => log::warn!(
+                    "peer {peer_id:#x}: ICE failed -- no pair of candidates could carry traffic. \
+                     Neither peer can reach the other directly; a relay (TURN) is the only \
+                     remaining route."
+                ),
+                RTCIceConnectionState::Disconnected => {
+                    log::warn!("peer {peer_id:#x}: ICE disconnected, may recover")
+                }
+                _ => log::info!("peer {peer_id:#x}: ICE state {state}"),
+            }
+            Box::pin(async {})
+        }));
+    }
+
+    {
+        connection.on_peer_connection_state_change(Box::new(move |state| {
+            match state {
+                RTCPeerConnectionState::Failed => log::warn!(
+                    "peer {peer_id:#x}: connection failed. If ICE reported `connected` before \
+                     this, the failure is in DTLS or SCTP rather than in reaching the peer."
+                ),
+                _ => log::info!("peer {peer_id:#x}: connection state {state}"),
+            }
+            Box::pin(async {})
         }));
     }
 

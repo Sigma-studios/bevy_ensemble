@@ -57,19 +57,82 @@ pub(crate) fn create_peer_connection(
     let sig_tx = signal_tx.clone();
     let onicecandidate: Closure<dyn FnMut(RtcPeerConnectionIceEvent)> =
         Closure::wrap(Box::new(move |event: RtcPeerConnectionIceEvent| {
-            if let Some(candidate) = event.candidate() {
-                let json = js_sys::JSON::stringify(&candidate.to_json())
-                    .unwrap()
-                    .as_string()
-                    .unwrap();
-                let _ = sig_tx.send(OutgoingSignal {
-                    peer: peer_id,
-                    signal: PeerSignal::IceCandidate(json),
-                });
-            }
+            let Some(candidate) = event.candidate() else {
+                // The end-of-candidates marker. Distinguishes "gathering finished and found
+                // nothing reachable" from "gathering is still running", which are different
+                // problems that read identically in a log that only prints candidates.
+                log::info!("peer {peer_id:#x}: finished gathering local candidates");
+                return;
+            };
+            // A browser reports host candidates as randomised `<uuid>.local` mDNS names rather
+            // than addresses, and a remote peer that cannot resolve them over multicast is left
+            // with nothing to reach this one on. That is visible here and nowhere else, which is
+            // the reason this line prints the candidate rather than counting it.
+            log::info!(
+                "peer {peer_id:#x}: gathered local candidate {}",
+                candidate.candidate()
+            );
+            let json = js_sys::JSON::stringify(&candidate.to_json())
+                .unwrap()
+                .as_string()
+                .unwrap();
+            let _ = sig_tx.send(OutgoingSignal {
+                peer: peer_id,
+                signal: PeerSignal::IceCandidate(json),
+            });
         }));
     conn.set_onicecandidate(Some(onicecandidate.as_ref().unchecked_ref()));
     onicecandidate.forget();
+
+    // ICE and connection state.
+    //
+    // Every other callback here reports success -- a channel that opened, a message that arrived
+    // -- so a connection that never completes produced no line at all. In a browser that is worse
+    // than on native: there is no `webrtc_ice` log to fall back on, and short of opening
+    // `chrome://webrtc-internals` there was no way to tell a lost candidate from a blocked port
+    // from a NAT neither peer can traverse. These two handlers are what separate them.
+    //
+    // Observation only: `PeerState` still comes from the data channel opening and closing, so
+    // what a consumer treats as "connected" does not change.
+    {
+        let conn_for_ice = conn.clone();
+        let oniceconnectionstatechange: Closure<dyn FnMut(JsValue)> =
+            Closure::wrap(Box::new(move |_: JsValue| {
+                let state = conn_for_ice.ice_connection_state();
+                if state == web_sys::RtcIceConnectionState::Failed {
+                    log::warn!(
+                        "peer {peer_id:#x}: ICE failed -- no pair of candidates could carry \
+                         traffic. Neither peer can reach the other directly; a relay (TURN) is \
+                         the only remaining route."
+                    );
+                } else {
+                    log::info!("peer {peer_id:#x}: ICE state {state:?}");
+                }
+            }));
+        conn.set_oniceconnectionstatechange(Some(
+            oniceconnectionstatechange.as_ref().unchecked_ref(),
+        ));
+        oniceconnectionstatechange.forget();
+    }
+
+    {
+        let conn_for_state = conn.clone();
+        let onconnectionstatechange: Closure<dyn FnMut(JsValue)> =
+            Closure::wrap(Box::new(move |_: JsValue| {
+                let state = conn_for_state.connection_state();
+                if state == web_sys::RtcPeerConnectionState::Failed {
+                    log::warn!(
+                        "peer {peer_id:#x}: connection failed. If ICE reported `connected` \
+                         before this, the failure is in DTLS or SCTP rather than in reaching \
+                         the peer."
+                    );
+                } else {
+                    log::info!("peer {peer_id:#x}: connection state {state:?}");
+                }
+            }));
+        conn.set_onconnectionstatechange(Some(onconnectionstatechange.as_ref().unchecked_ref()));
+        onconnectionstatechange.forget();
+    }
 
     // Create negotiated reliable data channel (ordered, reliable).
     let reliable_config = RtcDataChannelInit::new();
@@ -246,16 +309,21 @@ pub(crate) fn add_ice_candidate(pc: &WasmPeerConnection, candidate_json: &str) {
 
 async fn apply_ice_candidate(conn: &RtcPeerConnection, json: &str) {
     let Ok(parsed) = js_sys::JSON::parse(json) else {
+        log::warn!("discarding an ICE candidate that is not valid JSON");
         return;
     };
     if parsed.is_null() {
         return;
     }
     let candidate = RtcIceCandidateInit::from(parsed);
-    let _ = JsFuture::from(
-        conn.add_ice_candidate_with_opt_rtc_ice_candidate_init(Some(&candidate)),
-    )
-    .await;
+    // A rejected candidate is an address gone for good -- the peer will not send it again -- and
+    // losing every candidate on both sides is a connection that gathers happily and never pairs.
+    if let Err(error) =
+        JsFuture::from(conn.add_ice_candidate_with_opt_rtc_ice_candidate_init(Some(&candidate)))
+            .await
+    {
+        log::warn!("discarding a remote ICE candidate the browser rejected: {error:?}");
+    }
 }
 
 pub(crate) fn send_message(pc: &WasmPeerConnection, data: &[u8], reliable: bool) {
