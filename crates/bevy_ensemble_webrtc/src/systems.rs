@@ -1,8 +1,9 @@
 use bevy::prelude::*;
 use bevy_ensemble::{
-    Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipant, LobbyParticipantOf,
-    LocalMultiplayerPlayerId, PendingLobby, PublicLobbies, PublicLobbyInfo, RemoveLobbyParticipant,
-    RequestLobby, SerializedLobbyPacket, decode_ensemble_packet, encode_ensemble_message,
+    Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyJoinFailed, LobbyParticipant,
+    LobbyParticipantOf, LocalMultiplayerPlayerId, PendingLobby, PublicLobbies, PublicLobbyInfo,
+    RemoveLobbyParticipant, RequestLobby, SerializedLobbyPacket, decode_ensemble_packet,
+    encode_ensemble_message,
 };
 use bevy_ensemble_sockets::{PeerSignal, PeerState};
 
@@ -295,8 +296,12 @@ pub(crate) fn refresh_lobby_list(
 pub(crate) fn poll_socket_peers(
     mut commands: Commands,
     mut socket: ResMut<crate::EnsembleSocketRes>,
+    mut join_failed: MessageWriter<LobbyJoinFailed>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
-    client_lobbies: Query<Entity, (Or<(With<Lobby>, With<PendingLobby>)>, Without<Host>)>,
+    client_lobbies: Query<
+        (Entity, Has<PendingLobby>),
+        (Or<(With<Lobby>, With<PendingLobby>)>, Without<Host>),
+    >,
     lobby_clients: Query<
         (Entity, &LobbyClientWebrtcUuid),
         Or<(With<LobbyClient>, With<PendingWebrtcLobbyClient>)>,
@@ -307,10 +312,21 @@ pub(crate) fn poll_socket_peers(
             PeerState::Connected => {
                 info!("Peer connected: {peer_id}");
             }
-            PeerState::Disconnected => {
-                info!("Peer disconnected: {peer_id}");
+            // The same teardown either way -- what differs is what it means and who is told.
+            // `Failed` is a connection that never opened, so if the lobby is still pending this
+            // is a join that will not be completing, and somebody is watching a screen that
+            // would otherwise never change.
+            PeerState::Disconnected | PeerState::Failed => {
+                let failed = state == PeerState::Failed;
+                if failed {
+                    warn!("Peer {peer_id} could not be connected to");
+                } else {
+                    info!("Peer disconnected: {peer_id}");
+                }
 
-                // Host side: despawn the lobby client for this peer
+                // Host side: one player is gone, and the lobby carries on without them. Tearing
+                // it down here would evict everybody already playing over one arrival that could
+                // not get in.
                 if host_lobby.is_some() {
                     if let Some((client_entity, _)) = lobby_clients
                         .iter()
@@ -318,16 +334,88 @@ pub(crate) fn poll_socket_peers(
                     {
                         commands.entity(client_entity).try_despawn();
                     }
+                    if failed {
+                        join_failed.write(LobbyJoinFailed {
+                            reason: format!("A player could not connect to this lobby ({peer_id})"),
+                        });
+                    }
                     continue;
                 }
 
-                // Client side: the host disconnected us — leave the lobby
-                for entity in client_lobbies.iter() {
+                // Client side: that peer was the whole session.
+                let mut was_joining = false;
+                for (entity, pending) in client_lobbies.iter() {
+                    was_joining |= pending;
                     commands.entity(entity).try_despawn();
                 }
                 commands.remove_resource::<LocalMultiplayerPlayerId>();
+                if failed {
+                    join_failed.write(LobbyJoinFailed {
+                        reason: if was_joining {
+                            "Could not connect to the host. Their network or yours is refusing \
+                             the connection."
+                                .into()
+                        } else {
+                            "Lost the connection to the host.".into()
+                        },
+                    });
+                }
             }
         }
+    }
+}
+
+/// When a lobby was first seen still waiting to be promoted, so a join can be given up on.
+///
+/// Inserted here rather than where the lobby is spawned because both kinds arrive from elsewhere:
+/// a client's from a join request in this crate, a host's from `bevy_ensemble` itself. Noticing
+/// them is uniform; where they came from is not.
+#[derive(Component)]
+pub(crate) struct PendingSince(f64);
+
+/// Give up on a lobby that has been about to happen for too long.
+///
+/// The backstop under [`poll_socket_peers`], for the failures that report nothing at all: an
+/// offer that never arrives, a signalling server that accepts a join and goes quiet, a relay that
+/// black-holes. WebRTC reports `Failed` for a connection it actually attempted; there is no event
+/// for one that was never attempted, and that case used to be indistinguishable from a slow
+/// network for ever.
+///
+/// Despawning is the whole action, and it is enough: the lobby's removal is what tells the
+/// signalling server, rebuilds the socket, releases the ticked role and lets the game's own
+/// teardown run. [`LobbyJoinFailed`] carries the reason for whatever wants to say so on screen.
+pub(crate) fn time_out_pending_lobbies(
+    mut commands: Commands,
+    time: Res<Time>,
+    runtime: Res<crate::WebrtcRuntime>,
+    mut join_failed: MessageWriter<LobbyJoinFailed>,
+    pending: Query<(Entity, Option<&PendingSince>, Has<Host>), (With<PendingLobby>, Without<Lobby>)>,
+) {
+    let Some(deadline) = runtime.join_timeout else {
+        return;
+    };
+    let now = time.elapsed_secs_f64();
+    for (entity, since, is_host) in pending.iter() {
+        let Some(since) = since else {
+            commands.entity(entity).try_insert(PendingSince(now));
+            continue;
+        };
+        if now - since.0 < deadline.as_secs_f64() {
+            continue;
+        }
+        let what = if is_host { "host a lobby" } else { "join a lobby" };
+        warn!(
+            "giving up after {:.0}s: the attempt to {what} never completed",
+            deadline.as_secs_f64()
+        );
+        join_failed.write(LobbyJoinFailed {
+            reason: if is_host {
+                "Could not open a lobby. The signalling server did not answer.".into()
+            } else {
+                "Could not join. The lobby never finished connecting.".into()
+            },
+        });
+        commands.entity(entity).despawn();
     }
 }
 

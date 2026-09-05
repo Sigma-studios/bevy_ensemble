@@ -128,16 +128,22 @@ pub(crate) fn create_peer_connection(
     // port, a peer that went away, a NAT neither side can traverse. These two handlers are what
     // separate them, and they cost nothing on a connection that works.
     //
-    // Observation only: `PeerState` still comes from the data channel opening and closing, so a
-    // consumer's notion of "connected" is unchanged by this.
+    // A failure is reported as well as logged. `Connected` and `Disconnected` still come from the
+    // data channel opening and closing -- a channel that is open is the only proof that traffic
+    // actually flows -- but nothing opens or closes when a connection never forms, so without
+    // these the far side waits for ever on an event that is never coming.
     {
+        let ps_tx = peer_state_tx.clone();
         connection.on_ice_connection_state_change(Box::new(move |state| {
             match state {
-                RTCIceConnectionState::Failed => log::warn!(
-                    "peer {peer_id:#x}: ICE failed -- no pair of candidates could carry traffic. \
-                     Neither peer can reach the other directly; a relay (TURN) is the only \
-                     remaining route."
-                ),
+                RTCIceConnectionState::Failed => {
+                    log::warn!(
+                        "peer {peer_id:#x}: ICE failed -- no pair of candidates could carry \
+                         traffic. Neither peer can reach the other directly; a relay (TURN) is \
+                         the only remaining route."
+                    );
+                    let _ = ps_tx.send((peer_id, PeerState::Failed));
+                }
                 RTCIceConnectionState::Disconnected => {
                     log::warn!("peer {peer_id:#x}: ICE disconnected, may recover")
                 }
@@ -148,12 +154,20 @@ pub(crate) fn create_peer_connection(
     }
 
     {
+        // Both handlers report, and the duplicate costs nothing: `update_peers` reports a state
+        // once. Which of the two reaches `Failed` first -- or at all -- differs between stacks,
+        // and this is not a signal to be clever about missing.
+        let ps_tx = peer_state_tx.clone();
         connection.on_peer_connection_state_change(Box::new(move |state| {
             match state {
-                RTCPeerConnectionState::Failed => log::warn!(
-                    "peer {peer_id:#x}: connection failed. If ICE reported `connected` before \
-                     this, the failure is in DTLS or SCTP rather than in reaching the peer."
-                ),
+                RTCPeerConnectionState::Failed => {
+                    log::warn!(
+                        "peer {peer_id:#x}: connection failed. If ICE reported `connected` \
+                         before this, the failure is in DTLS or SCTP rather than in reaching \
+                         the peer."
+                    );
+                    let _ = ps_tx.send((peer_id, PeerState::Failed));
+                }
                 _ => log::info!("peer {peer_id:#x}: connection state {state}"),
             }
             Box::pin(async {})

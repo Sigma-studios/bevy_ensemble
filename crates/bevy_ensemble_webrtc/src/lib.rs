@@ -53,6 +53,17 @@ pub struct BevyEnsembleWebrtcPlugin {
     /// machine need none of them and wait on them anyway, so a local run or a test can pass
     /// [`IceServers::none()`] and skip straight to host candidates.
     pub ice_servers: IceServers,
+    /// How long a lobby may stay pending before the attempt is given up on. `None` waits for ever.
+    ///
+    /// A backstop, not the main mechanism: a connection that is actually attempted and fails
+    /// reports `Failed` and is handled the moment it does. This covers the attempts that report
+    /// nothing — an offer that never arrives, a signalling server that accepts a join and goes
+    /// quiet — where the alternative is a peer that waits for the rest of the session.
+    ///
+    /// Fifteen seconds because it has to sit above a slow-but-working join and below a person's
+    /// patience. Both peers gathering, exchanging and pairing takes a second or two on a healthy
+    /// network and a few more on a bad one; nothing legitimate takes fifteen.
+    pub join_timeout: Option<std::time::Duration>,
 }
 
 #[cfg(feature = "client")]
@@ -63,6 +74,7 @@ impl Default for BevyEnsembleWebrtcPlugin {
             display_name: "Player".into(),
             max_players: 8,
             ice_servers: IceServers::default(),
+            join_timeout: Some(std::time::Duration::from_secs(15)),
         }
     }
 }
@@ -165,6 +177,7 @@ pub(crate) struct WebrtcRuntime {
     display_name: String,
     pub(crate) max_players: u32,
     ice_servers: IceServers,
+    pub(crate) join_timeout: Option<std::time::Duration>,
 }
 
 #[cfg(feature = "client")]
@@ -226,6 +239,7 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
             display_name: self.display_name.clone(),
             max_players: self.max_players,
             ice_servers: self.ice_servers.clone(),
+            join_timeout: self.join_timeout,
         };
 
         let (socket, lobby_connection) = webrtc_runtime.build_socket();
@@ -262,6 +276,7 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
                     handshake::send_host_handshakes,
                     handshake::promote_client_lobby_on_host_handshake,
                     handshake::promote_host_client_on_client_handshake,
+                    systems::time_out_pending_lobbies,
                     systems::detect_lobby_leave,
                 ),
             )

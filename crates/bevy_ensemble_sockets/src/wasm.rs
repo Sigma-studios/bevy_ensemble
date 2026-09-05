@@ -92,10 +92,12 @@ pub(crate) fn create_peer_connection(
     // `chrome://webrtc-internals` there was no way to tell a lost candidate from a blocked port
     // from a NAT neither peer can traverse. These two handlers are what separate them.
     //
-    // Observation only: `PeerState` still comes from the data channel opening and closing, so
-    // what a consumer treats as "connected" does not change.
+    // A failure is reported as well as logged. `Connected` and `Disconnected` still come from the
+    // data channel opening and closing, but nothing opens or closes when a connection never
+    // forms, so without these the far side waits for ever on an event that is never coming.
     {
         let conn_for_ice = conn.clone();
+        let ps_tx = peer_state_tx.clone();
         let oniceconnectionstatechange: Closure<dyn FnMut(JsValue)> =
             Closure::wrap(Box::new(move |_: JsValue| {
                 let state = conn_for_ice.ice_connection_state();
@@ -105,6 +107,7 @@ pub(crate) fn create_peer_connection(
                          traffic. Neither peer can reach the other directly; a relay (TURN) is \
                          the only remaining route."
                     );
+                    let _ = ps_tx.send((peer_id, PeerState::Failed));
                 } else {
                     log::info!("peer {peer_id:#x}: ICE state {state:?}");
                 }
@@ -116,7 +119,11 @@ pub(crate) fn create_peer_connection(
     }
 
     {
+        // Both handlers report, and the duplicate costs nothing: `update_peers` reports a state
+        // once. Which of the two reaches `Failed` first -- or at all -- differs between browsers,
+        // and this is not a signal to be clever about missing.
         let conn_for_state = conn.clone();
+        let ps_tx = peer_state_tx.clone();
         let onconnectionstatechange: Closure<dyn FnMut(JsValue)> =
             Closure::wrap(Box::new(move |_: JsValue| {
                 let state = conn_for_state.connection_state();
@@ -126,6 +133,7 @@ pub(crate) fn create_peer_connection(
                          before this, the failure is in DTLS or SCTP rather than in reaching \
                          the peer."
                     );
+                    let _ = ps_tx.send((peer_id, PeerState::Failed));
                 } else {
                     log::info!("peer {peer_id:#x}: connection state {state:?}");
                 }

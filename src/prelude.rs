@@ -43,7 +43,7 @@ pub use crate::{
     EnsembleTransportAppExt, TransportBackend,
 
     // Session requests
-    JoinLobby, LeaveLobby, RefreshLobbies,
+    JoinLobby, LeaveLobby, LobbyJoinFailed, RefreshLobbies,
 };
 
 // Network metrics (feature `netmetrics`).
