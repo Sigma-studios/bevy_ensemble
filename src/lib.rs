@@ -115,7 +115,7 @@ pub use netsim::{ChannelModel, NetPreset, NetSim, NetSimClock, NetSimConfig, Net
 pub use ping::{PeerLastPong, PeerRtt, PeerRttJitter, PeerWireRtt};
 pub use player_data::{PlayerData, PlayerDataPlugin, SetPlayerData};
 pub use registry::{EnsembleMessageRegistry, decode_ensemble_packet, encode_ensemble_message};
-pub use session::{JoinLobby, LeaveLobby, RefreshLobbies};
+pub use session::{JoinLobby, LeaveLobby, LobbyJoinFailed, RefreshLobbies};
 pub use transport::{EnsembleTransportAppExt, TransportBackend};
 pub use types::*;
 

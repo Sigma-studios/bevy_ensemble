@@ -19,6 +19,13 @@ pub enum PeerSignal {
 pub enum PeerState {
     Connected,
     Disconnected,
+    /// The connection will not be happening: ICE found no working pair, or the transport gave up.
+    ///
+    /// Distinct from [`Disconnected`](PeerState::Disconnected), which means a connection that
+    /// existed has ended. This one never opened, and the difference matters to whoever is
+    /// listening: a peer that drops mid-session was playing a moment ago, where a peer that
+    /// fails to connect leaves somebody waiting on a screen that will never change.
+    Failed,
 }
 
 /// Outbound signal destined for a remote peer (must be relayed via signalling server).
@@ -98,7 +105,7 @@ pub struct EnsembleSocket {
     peers: HashMap<u128, native::NativePeerConnection>,
     #[cfg(target_arch = "wasm32")]
     peers: HashMap<u128, wasm::WasmPeerConnection>,
-    connected: HashMap<u128, bool>,
+    states: HashMap<u128, PeerState>,
     ice_servers: IceServers,
     #[cfg(not(target_arch = "wasm32"))]
     runtime_handle: tokio::runtime::Handle,
@@ -118,7 +125,7 @@ impl EnsembleSocket {
             message_tx,
             message_rx,
             peers: HashMap::new(),
-            connected: HashMap::new(),
+            states: HashMap::new(),
             ice_servers: IceServers::default(),
             runtime_handle,
         }
@@ -137,7 +144,7 @@ impl EnsembleSocket {
             message_tx,
             message_rx,
             peers: HashMap::new(),
-            connected: HashMap::new(),
+            states: HashMap::new(),
             ice_servers: IceServers::default(),
         }
     }
@@ -273,13 +280,30 @@ impl EnsembleSocket {
     }
 
     /// Drain peer state changes since last call.
+    ///
+    /// # Why this is not a `connected: bool`
+    ///
+    /// It was, and the comparison it made was `was_connected != is_connected`. For a connection
+    /// that never opened, both sides of that are `false`, so a failure was reported as no change
+    /// at all -- and a peer that never connects is the single case a consumer most needs to hear
+    /// about, because nothing else in this crate will ever mention it again. Tracking the last
+    /// state instead of a flag is what lets [`PeerState::Failed`] through.
+    ///
+    /// `Disconnected` keeps its old meaning deliberately: a close on a channel that never opened
+    /// says nothing a listener can act on, and reporting it would turn one failure into two
+    /// events describing it differently.
     pub fn update_peers(&mut self) -> Vec<(u128, PeerState)> {
         let mut changes = Vec::new();
         while let Ok((peer, state)) = self.peer_state_rx.try_recv() {
-            let was_connected = self.connected.get(&peer).copied().unwrap_or(false);
-            let is_connected = state == PeerState::Connected;
-            if was_connected != is_connected {
-                self.connected.insert(peer, is_connected);
+            let report = match (self.states.get(&peer).copied(), state) {
+                (Some(previous), current) if previous == current => false,
+                (_, PeerState::Connected) => true,
+                (_, PeerState::Failed) => true,
+                (Some(PeerState::Connected), PeerState::Disconnected) => true,
+                (_, PeerState::Disconnected) => false,
+            };
+            if report {
+                self.states.insert(peer, state);
                 changes.push((peer, state));
             }
         }
@@ -288,9 +312,9 @@ impl EnsembleSocket {
 
     /// Currently connected peer IDs.
     pub fn connected_peers(&self) -> impl Iterator<Item = u128> + '_ {
-        self.connected
+        self.states
             .iter()
-            .filter(|&(_, &c)| c)
+            .filter(|&(_, &state)| state == PeerState::Connected)
             .map(|(&id, _)| id)
     }
 
@@ -333,7 +357,7 @@ impl EnsembleSocket {
     /// Disconnect a specific peer.
     pub fn disconnect_peer(&mut self, peer: u128) {
         if let Some(_pc) = self.peers.remove(&peer) {
-            self.connected.remove(&peer);
+            self.states.remove(&peer);
             // Dropping the peer connection closes it.
         }
     }
@@ -341,6 +365,6 @@ impl EnsembleSocket {
     /// Disconnect all peers.
     pub fn disconnect_all(&mut self) {
         self.peers.clear();
-        self.connected.clear();
+        self.states.clear();
     }
 }
