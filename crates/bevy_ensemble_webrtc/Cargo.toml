@@ -10,7 +10,7 @@ serde_json = "1"
 futures-util = "0.3"
 
 # Client plugin deps
-bevy = { version = "0.19", optional = true }
+bevy = { version = "0.19", optional = true, default-features = false, features = ["std", "bevy_log"] }
 bevy_ensemble = { path = "../..", optional = true }
 bevy_ensemble_sockets = { path = "../bevy_ensemble_sockets", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
@@ -61,6 +61,8 @@ cli = [
 ]
 
 [dev-dependencies]
+# The example runs a whole app; the plugin itself only needs the ECS and the log.
+bevy = "0.19"
 bevy_immediate = "0.7"
 
 [[bin]]
