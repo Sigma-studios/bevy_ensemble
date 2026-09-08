@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = "0.19"
+bevy = { version = "0.19", default-features = false, features = ["std", "bevy_log"] }
 # bevy-steamworks re-exports the *safe* `steamworks` wrapper (currently the
 # published 0.13.1). We use it for everything except one call — see below.
 bevy-steamworks = { git = "https://github.com/HouraiTeahouse/bevy_steamworks", branch = "main" }
@@ -20,4 +20,6 @@ serde = { version = "1", features = ["derive"] }
 steamworks-sys = { git = "https://github.com/Noxime/steamworks-rs", rev = "ee85258d2b9965f5d29082e7c104b183d8fda7c9" }
 
 [dev-dependencies]
+# The examples run whole apps; the plugin itself only needs the ECS.
+bevy = "0.19"
 bevy_immediate = "0.7"

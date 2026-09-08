@@ -12,7 +12,7 @@ members = [
 ]
 
 [dependencies]
-bevy = { version = "0.19", features = ["serialize"] }
+bevy = { version = "0.19", default-features = false, features = ["std", "serialize", "bevy_log"] }
 postcard = { version = "1", features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 
@@ -29,7 +29,8 @@ netmetrics = []
 # Interactive overlay: live metrics window + toggleable network-condition
 # simulation (delay / jitter / loss / duplication). Implies `netmetrics`.
 # Inert until the game adds `NetDebugPlugin`, so it costs nothing when unused.
-netdebug = ["netmetrics"]
+# The overlay is bevy UI, so this is where the UI half of bevy is switched on.
+netdebug = ["netmetrics", "bevy/bevy_ui", "bevy/bevy_ui_render", "bevy/bevy_text", "bevy/bevy_color"]
 
 # bevy-steamworks pulls the safe `steamworks` wrapper, which transitively depends
 # on the crates.io `steamworks-sys`. bevy_ensemble_steam also depends on
