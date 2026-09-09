@@ -9,7 +9,7 @@ use web_sys::{
     RtcSessionDescriptionInit,
 };
 
-use crate::{IceServers, OutgoingSignal, PeerSignal, PeerState};
+use crate::{IceServers, OutgoingSignal, PeerRoute, PeerSignal, PeerState};
 
 pub(crate) struct WasmPeerConnection {
     pub connection: RtcPeerConnection,
@@ -20,10 +20,79 @@ pub(crate) struct WasmPeerConnection {
     remote_desc_set: Arc<Mutex<bool>>,
 }
 
+/// Which kind of pair the browser settled on, via `getStats`.
+///
+/// There is no property for this: `RTCPeerConnection` exposes the selected pair only through the
+/// stats report, which is a maplike of records keyed by id. The pair record names its two
+/// candidates by id, and the candidate records carry the `candidateType` that actually answers the
+/// question — so it takes two passes over the same report.
+///
+/// A cast to [`js_sys::Map`] rather than a typed `RtcStatsReport`: the report is maplike and
+/// carries `forEach`, which is all this needs, and the typed wrapper would mean another `web-sys`
+/// feature for no gain.
+async fn selected_route(conn: &RtcPeerConnection) -> Option<PeerRoute> {
+    let report = wasm_bindgen_futures::JsFuture::from(conn.get_stats())
+        .await
+        .ok()?;
+    let report: js_sys::Map = report.unchecked_into();
+
+    let string_field = |value: &JsValue, key: &str| -> Option<String> {
+        js_sys::Reflect::get(value, &JsValue::from_str(key))
+            .ok()?
+            .as_string()
+    };
+
+    // Pass one: the pair that won. Browsers differ on whether they mark it `succeeded`, or
+    // `nominated`, or both, so either will do.
+    let mut candidates: Option<(String, String)> = None;
+    report.for_each(&mut |value, _key| {
+        if candidates.is_some() || string_field(&value, "type").as_deref() != Some("candidate-pair")
+        {
+            return;
+        }
+        let nominated = js_sys::Reflect::get(&value, &JsValue::from_str("nominated"))
+            .ok()
+            .and_then(|flag| flag.as_bool())
+            .unwrap_or(false);
+        let succeeded = string_field(&value, "state").as_deref() == Some("succeeded");
+        if !nominated && !succeeded {
+            return;
+        }
+        if let (Some(local), Some(remote)) = (
+            string_field(&value, "localCandidateId"),
+            string_field(&value, "remoteCandidateId"),
+        ) {
+            candidates = Some((local, remote));
+        }
+    });
+    let (local_id, remote_id) = candidates?;
+
+    // Pass two: either end being a relay candidate means the traffic goes through the relay.
+    let mut relayed = false;
+    report.for_each(&mut |value, _key| {
+        let Some(id) = string_field(&value, "id") else {
+            return;
+        };
+        if id != local_id && id != remote_id {
+            return;
+        }
+        if string_field(&value, "candidateType").as_deref() == Some("relay") {
+            relayed = true;
+        }
+    });
+
+    Some(if relayed {
+        PeerRoute::Relayed
+    } else {
+        PeerRoute::Direct
+    })
+}
+
 pub(crate) fn create_peer_connection(
     peer_id: u128,
     signal_tx: mpsc::UnboundedSender<OutgoingSignal>,
     peer_state_tx: mpsc::UnboundedSender<(u128, PeerState)>,
+    route_tx: mpsc::UnboundedSender<(u128, PeerRoute)>,
     message_tx: mpsc::UnboundedSender<(u128, Box<[u8]>)>,
     ice_servers: &IceServers,
 ) -> WasmPeerConnection {
@@ -147,7 +216,8 @@ pub(crate) fn create_peer_connection(
     reliable_config.set_ordered(true);
     reliable_config.set_negotiated(true);
     reliable_config.set_id(0);
-    let reliable_dc = conn.create_data_channel_with_data_channel_dict("ensemble_reliable", &reliable_config);
+    let reliable_dc =
+        conn.create_data_channel_with_data_channel_dict("ensemble_reliable", &reliable_config);
     reliable_dc.set_binary_type(RtcDataChannelType::Arraybuffer);
 
     // Create negotiated unreliable data channel (unordered, no retransmits).
@@ -156,13 +226,30 @@ pub(crate) fn create_peer_connection(
     unreliable_config.set_max_retransmits(0);
     unreliable_config.set_negotiated(true);
     unreliable_config.set_id(1);
-    let unreliable_dc = conn.create_data_channel_with_data_channel_dict("ensemble_unreliable", &unreliable_config);
+    let unreliable_dc =
+        conn.create_data_channel_with_data_channel_dict("ensemble_unreliable", &unreliable_config);
     unreliable_dc.set_binary_type(RtcDataChannelType::Arraybuffer);
 
     // Use the reliable channel for connection state signaling.
     let ps_tx = peer_state_tx.clone();
+    let conn_for_route = conn.clone();
     let onopen: Closure<dyn FnMut(JsValue)> = Closure::wrap(Box::new(move |_: JsValue| {
         let _ = ps_tx.send((peer_id, PeerState::Connected));
+
+        // Same moment, same reasoning as the native backend: a negotiated channel cannot open
+        // before ICE has nominated a pair, so the answer exists now and traffic is about to use
+        // it. `getStats` is the only way to ask a browser — there is no property for it.
+        let route_tx = route_tx.clone();
+        let conn = conn_for_route.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            match selected_route(&conn).await {
+                Some(route) => {
+                    log::info!("peer {peer_id:#x}: {} pair", route.label());
+                    let _ = route_tx.send((peer_id, route));
+                }
+                None => log::debug!("peer {peer_id:#x}: no candidate pair to report"),
+            }
+        });
     }));
     reliable_dc.set_onopen(Some(onopen.as_ref().unchecked_ref()));
     onopen.forget();

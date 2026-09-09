@@ -22,15 +22,14 @@ mod session;
 #[cfg(feature = "client")]
 mod systems;
 
-
 #[cfg(feature = "client")]
 use bevy::prelude::*;
+#[cfg(feature = "client")]
+pub use bevy_ensemble::PeerRtt;
 #[cfg(feature = "client")]
 use bevy_ensemble::{EnsembleAppExt, EnsembleTransportAppExt};
 #[cfg(feature = "client")]
 pub use bevy_ensemble_sockets::{IceServer, IceServers};
-#[cfg(feature = "client")]
-pub use bevy_ensemble::PeerRtt;
 
 /// Bevy plugin for WebRTC P2P networking via a signaling server.
 ///
@@ -160,7 +159,6 @@ pub struct JoinWebrtcLobbyByCode(pub String);
 #[derive(Component)]
 pub struct LobbyWebrtcCode(pub String);
 
-
 /// Newtype wrapper around [`bevy_ensemble_sockets::EnsembleSocket`] so it can be used as a Bevy Resource.
 #[cfg(feature = "client")]
 #[derive(Resource, Deref, DerefMut)]
@@ -184,9 +182,7 @@ pub(crate) struct WebrtcRuntime {
 impl WebrtcRuntime {
     /// Build a fresh EnsembleSocket + lobby connection and start the WS handler task.
     /// Called at init and again each time the player leaves a lobby.
-    pub(crate) fn build_socket(
-        &self,
-    ) -> (EnsembleSocketRes, connection::LobbyConnection) {
+    pub(crate) fn build_socket(&self) -> (EnsembleSocketRes, connection::LobbyConnection) {
         use std::sync::{Arc, Mutex};
 
         use connection::WsHandlerBuilder;
@@ -271,6 +267,7 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
                     systems::join_requested_lobbies_by_code,
                     systems::refresh_lobby_list,
                     systems::poll_socket_peers,
+                    systems::poll_peer_routes,
                     systems::pump_socket_signals,
                     handshake::send_client_handshakes,
                     handshake::send_host_handshakes,

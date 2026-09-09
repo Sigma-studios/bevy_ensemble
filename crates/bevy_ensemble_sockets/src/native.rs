@@ -8,17 +8,19 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use webrtc::api::APIBuilder;
-use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::RTCDataChannel;
+use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
+use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::RTCPeerConnection;
 
-use crate::{IceServers, OutgoingSignal, PeerSignal, PeerState};
+use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
+
+use crate::{IceServers, OutgoingSignal, PeerRoute, PeerSignal, PeerState};
 
 pub(crate) struct NativePeerConnection {
     pub connection: Arc<RTCPeerConnection>,
@@ -52,6 +54,7 @@ pub(crate) fn create_peer_connection(
     peer_id: u128,
     signal_tx: mpsc::UnboundedSender<OutgoingSignal>,
     peer_state_tx: mpsc::UnboundedSender<(u128, PeerState)>,
+    route_tx: mpsc::UnboundedSender<(u128, PeerRoute)>,
     message_tx: mpsc::UnboundedSender<(u128, Box<[u8]>)>,
     ice_servers: &IceServers,
     handle: tokio::runtime::Handle,
@@ -72,9 +75,8 @@ pub(crate) fn create_peer_connection(
         ..Default::default()
     };
 
-    let connection = handle.block_on(async {
-        Arc::new(api.new_peer_connection(config).await.unwrap())
-    });
+    let connection =
+        handle.block_on(async { Arc::new(api.new_peer_connection(config).await.unwrap()) });
 
     let (signal_queue_tx, signal_queue_rx) = mpsc::unbounded_channel::<PeerSignal>();
     handle.spawn(run_signal_queue(
@@ -111,7 +113,10 @@ pub(crate) fn create_peer_connection(
                 let json = serde_json::to_string(&init).unwrap();
                 // The candidate line carries its type (host / srflx / relay) and address, which
                 // is what says whether this peer has anything a remote peer could reach it on.
-                log::info!("peer {peer_id:#x}: gathered local candidate {}", init.candidate);
+                log::info!(
+                    "peer {peer_id:#x}: gathered local candidate {}",
+                    init.candidate
+                );
                 let _ = sig_tx.send(OutgoingSignal {
                     peer: peer_id,
                     signal: PeerSignal::IceCandidate(json),
@@ -204,8 +209,39 @@ pub(crate) fn create_peer_connection(
     // Use the reliable channel for connection state signaling.
     {
         let ps_tx = peer_state_tx.clone();
+        let route_tx = route_tx.clone();
+        let pc = Arc::clone(&connection);
+        let route_handle = handle.clone();
         reliable_channel.on_open(Box::new(move || {
             let _ = ps_tx.send((peer_id, PeerState::Connected));
+
+            // Asked here, and only here, because this is the one moment the answer is both
+            // available and relevant: a negotiated data channel opens over SCTP, which needs
+            // DTLS, which needs a nominated pair — so by now ICE has chosen, and traffic is
+            // about to start flowing over whatever it chose.
+            //
+            // Reported rather than logged, because "is this session relayed" is the first thing
+            // to establish when somebody says the game feels worse than usual. A renomination
+            // later in the session would not be picked up; ICE rarely does one, and the cost of
+            // being wrong is a stale word in a debug overlay.
+            let route_tx = route_tx.clone();
+            let pc = Arc::clone(&pc);
+            route_handle.spawn(async move {
+                let dtls = pc.sctp().transport();
+                let Some(pair) = dtls.ice_transport().get_selected_candidate_pair().await else {
+                    log::debug!("peer {peer_id:#x}: no candidate pair to report");
+                    return;
+                };
+                let relayed = pair.local.typ == RTCIceCandidateType::Relay
+                    || pair.remote.typ == RTCIceCandidateType::Relay;
+                let route = if relayed {
+                    PeerRoute::Relayed
+                } else {
+                    PeerRoute::Direct
+                };
+                log::info!("peer {peer_id:#x}: {} pair, {pair}", route.label());
+                let _ = route_tx.send((peer_id, route));
+            });
             Box::pin(async {})
         }));
     }
