@@ -11,22 +11,39 @@ mod native;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) use native::WsHandlerBuilder;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use self::wasm::WsHandlerBuilder;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use native::WsHandlerBuilder;
 
 /// Lobby-specific events forwarded to Bevy systems (not signaling events).
 #[derive(Message, Debug)]
 pub(crate) enum LobbyEvent {
-    Welcome { player_uuid: u128 },
-    LobbyCreated { lobby_id: u64, code: String },
-    LobbyJoined { lobby_id: u64 },
-    LobbyError { reason: String },
-    PlayerJoined { player_uuid: u128 },
-    PlayerLeft { player_uuid: u128 },
-    LobbyList { lobbies: Vec<crate::protocol::LobbyInfo> },
-    Disconnected { reason: String },
+    Welcome {
+        player_uuid: u128,
+    },
+    LobbyCreated {
+        lobby_id: u64,
+        code: String,
+    },
+    LobbyJoined {
+        lobby_id: u64,
+    },
+    LobbyError {
+        reason: String,
+    },
+    PlayerJoined {
+        player_uuid: u128,
+    },
+    PlayerLeft {
+        player_uuid: u128,
+    },
+    LobbyList {
+        lobbies: Vec<crate::protocol::LobbyInfo>,
+    },
+    Disconnected {
+        reason: String,
+    },
 }
 
 /// Resource for lobby-level communication with the signaling server.

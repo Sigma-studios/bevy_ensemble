@@ -150,10 +150,7 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                 };
 
                 // Validate that sender and receiver are in the same lobby
-                let sender_lobby = state
-                    .connections
-                    .get(&from_uuid)
-                    .and_then(|c| c.lobby_id);
+                let sender_lobby = state.connections.get(&from_uuid).and_then(|c| c.lobby_id);
                 let receiver_lobby = state
                     .connections
                     .get(&receiver_uuid)

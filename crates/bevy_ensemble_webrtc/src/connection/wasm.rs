@@ -2,9 +2,9 @@ use std::sync::{Arc, Mutex};
 
 use bevy::log::{error, warn};
 use bevy_ensemble_sockets::PeerSignal;
-use futures_util::{SinkExt, StreamExt, FutureExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::sync::mpsc;
-use ws_stream_wasm::{WsMeta, WsMessage};
+use ws_stream_wasm::{WsMessage, WsMeta};
 
 use crate::protocol::{ClientMessage, ServerMessage, decode, encode};
 
@@ -51,11 +51,7 @@ impl WsHandlerBuilder {
                 error!("Failed to serialize authentication message");
                 return;
             };
-            if ws_sink
-                .send(WsMessage::Binary(auth_bytes))
-                .await
-                .is_err()
-            {
+            if ws_sink.send(WsMessage::Binary(auth_bytes)).await.is_err() {
                 error!("Failed to send authentication message");
                 return;
             }
