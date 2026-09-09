@@ -5,9 +5,14 @@
 //! reach each other directly. One process, two listeners.
 //!
 //! ```text
-//! cargo build --release -p bevy_ensemble_webrtc --features server \
+//! cargo build --release --target x86_64-unknown-linux-musl \
+//!     -p bevy_ensemble_webrtc --no-default-features --features server \
 //!     --bin bevy_ensemble_webrtc_server
 //! ```
+//!
+//! `--no-default-features` matters: the crate defaults to `client`, which pulls `bevy` and with it
+//! a Vulkan loader this will never call -- 74 MB against 2.6 MB. The musl target matters too, for
+//! anything that will be copied to a server rather than built on it. See `docs/deploying.md`.
 //!
 //! # Configuration
 //!
@@ -94,10 +99,7 @@ fn relay_config() -> Result<Option<RelayConfig>, String> {
         .map_err(|_| "TURN_PUBLIC_IP is not an IP address".to_string())?;
 
     let username = std::env::var("TURN_USER").unwrap_or_else(|_| DEFAULT_TURN_USER.to_owned());
-    let mut config = RelayConfig::new(
-        public_ip,
-        RelayCredentials::Static { username, password },
-    );
+    let mut config = RelayConfig::new(public_ip, RelayCredentials::Static { username, password });
     config.realm = std::env::var("TURN_REALM").unwrap_or_else(|_| DEFAULT_TURN_REALM.to_owned());
     config.relay_ports = relay_ports()?;
     if let Ok(raw) = std::env::var("TURN_PORT") {
@@ -117,7 +119,9 @@ async fn relay() -> Option<Relay> {
     let config = match relay_config() {
         Ok(Some(config)) => config,
         Ok(None) => {
-            info!("no relay: TURN_PASSWORD is unset, so peers that cannot pair directly cannot play");
+            info!(
+                "no relay: TURN_PASSWORD is unset, so peers that cannot pair directly cannot play"
+            );
             return None;
         }
         Err(error) => {
@@ -154,7 +158,9 @@ async fn main() {
 
     let state = Arc::new(ServerState::new());
 
-    let app = Router::new().route("/ws", get(ws_upgrade)).with_state(state);
+    let app = Router::new()
+        .route("/ws", get(ws_upgrade))
+        .with_state(state);
 
     let addr = std::env::var("SIGNALLING_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_owned());
     let listener = tokio::net::TcpListener::bind(&addr)
