@@ -19,16 +19,29 @@
 //! | Variable | Meaning |
 //! |---|---|
 //! | `SIGNALLING_ADDR` | Where signalling listens. Defaults to `0.0.0.0:9090`. |
-//! | `TURN_PASSWORD` | The credential clients present. **Absent means no relay.** |
+//! | `TURN_USERS` | `user:password` pairs, comma separated — one per application sharing this relay. |
+//! | `TURN_USER` / `TURN_PASSWORD` | Shorthand for a single pair. Merged with `TURN_USERS` if both are set. |
 //! | `TURN_PUBLIC_IP` | The address handed to players. Must be the public one; see below. |
-//! | `TURN_USER` | The username clients present. Defaults to `ensemble`. |
 //! | `TURN_REALM` | Hashed into the credential key. Defaults to `bevy_ensemble`. |
 //! | `TURN_PORT` | The relay's listener. Defaults to 3478. |
 //! | `TURN_RELAY_PORTS` | The range allocations are drawn from. Defaults to `49160-49260`. |
 //!
-//! A deployment with no `TURN_PASSWORD` is signalling only, which is what this has always been.
+//! A deployment with no credentials at all is signalling only, which is what this has always been.
 //! Peers who can pair directly are unaffected; peers who cannot simply have no route, and see a
 //! join that never completes.
+//!
+//! One relay commonly serves several games. TURN derives its key from
+//! `MD5(username:realm:password)`, so the username is not decoration — the server has to know
+//! which password goes with the name a client presents. Giving each application its own entry is
+//! what keeps them independent: rotating or revoking one leaves the others connected, where a
+//! single shared pair would take every application down at once.
+//!
+//! ```text
+//! TURN_USERS=run2d:2f9c…,bevy_kart:8a10…,bevy_clash:4b77…
+//! ```
+//!
+//! A password containing a comma cannot be expressed this way. Hex secrets, which is what
+//! `openssl rand -hex 32` produces, never contain one.
 //!
 //! Both port ranges have to be open, in the host firewall **and** any cloud firewall in front of
 //! it. The allocation range is bounded so that rule stays narrow — and it doubles as the only
@@ -42,6 +55,7 @@
 //! Nothing here needs a certificate. `turn:` over UDP authenticates with STUN message integrity,
 //! and WebRTC encrypts what it carries regardless.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -58,9 +72,6 @@ use bevy_ensemble_webrtc::server::{
 
 /// Where signalling listens when `SIGNALLING_ADDR` does not say otherwise.
 const DEFAULT_ADDR: &str = "0.0.0.0:9090";
-
-/// The username clients present when `TURN_USER` does not say otherwise.
-const DEFAULT_TURN_USER: &str = "ensemble";
 
 /// The realm the relay authenticates under when `TURN_REALM` does not say otherwise.
 ///
@@ -85,21 +96,48 @@ fn relay_ports() -> Result<(u16, u16), String> {
     Ok((port(min)?, port(max)?))
 }
 
+/// Every credential this relay accepts, from `TURN_USERS` and the single-pair shorthand.
+fn users() -> Result<HashMap<String, String>, String> {
+    let mut users = HashMap::new();
+
+    if let Ok(raw) = std::env::var("TURN_USERS") {
+        for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            let (user, password) = entry
+                .split_once(':')
+                .ok_or(format!("TURN_USERS wants `user:password`, got `{entry}`"))?;
+            if user.is_empty() || password.is_empty() {
+                return Err(format!("TURN_USERS entry `{entry}` has an empty half"));
+            }
+            users.insert(user.to_owned(), password.to_owned());
+        }
+    }
+
+    match (std::env::var("TURN_USER"), std::env::var("TURN_PASSWORD")) {
+        (Ok(user), Ok(password)) if !user.is_empty() && !password.is_empty() => {
+            users.insert(user, password);
+        }
+        // Half of the shorthand is a mistake worth naming: ignoring it silently would leave one
+        // application unable to allocate, and only that application's players would ever see it.
+        (Ok(_), Err(_)) => return Err("TURN_USER is set but TURN_PASSWORD is not".into()),
+        (Err(_), Ok(_)) => return Err("TURN_PASSWORD is set but TURN_USER is not".into()),
+        _ => {}
+    }
+
+    Ok(users)
+}
+
 /// The relay's configuration from the environment, or `None` when this deployment has no relay.
 fn relay_config() -> Result<Option<RelayConfig>, String> {
-    let Ok(password) = std::env::var("TURN_PASSWORD") else {
+    let users = users()?;
+    if users.is_empty() {
         return Ok(None);
-    };
-    if password.is_empty() {
-        return Err("TURN_PASSWORD is set but empty".into());
     }
     let public_ip: IpAddr = std::env::var("TURN_PUBLIC_IP")
-        .map_err(|_| "TURN_PASSWORD is set, so TURN_PUBLIC_IP must be too".to_string())?
+        .map_err(|_| "relay credentials are set, so TURN_PUBLIC_IP must be too".to_string())?
         .parse()
         .map_err(|_| "TURN_PUBLIC_IP is not an IP address".to_string())?;
 
-    let username = std::env::var("TURN_USER").unwrap_or_else(|_| DEFAULT_TURN_USER.to_owned());
-    let mut config = RelayConfig::new(public_ip, RelayCredentials::Static { username, password });
+    let mut config = RelayConfig::new(public_ip, RelayCredentials::Users(users));
     config.realm = std::env::var("TURN_REALM").unwrap_or_else(|_| DEFAULT_TURN_REALM.to_owned());
     config.relay_ports = relay_ports()?;
     if let Ok(raw) = std::env::var("TURN_PORT") {
@@ -120,7 +158,7 @@ async fn relay() -> Option<Relay> {
         Ok(Some(config)) => config,
         Ok(None) => {
             info!(
-                "no relay: TURN_PASSWORD is unset, so peers that cannot pair directly cannot play"
+                "no relay: no credentials configured, so peers that cannot pair directly cannot play"
             );
             return None;
         }
@@ -132,6 +170,13 @@ async fn relay() -> Option<Relay> {
 
     let (ip, port) = (config.public_ip, config.listen_port);
     let (min, max) = config.relay_ports;
+    // Named at startup because an unknown username and a wrong password are the same 401 on the
+    // wire, and a player experiences either as a join that never completes.
+    if let RelayCredentials::Users(users) = &config.credentials {
+        let mut names: Vec<&str> = users.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        info!("relay accepts: {}", names.join(", "));
+    }
     match start_relay(config).await {
         Ok(relay) => {
             info!("relay listening on turn:{ip}:{port} (udp), allocating in {min}-{max}");

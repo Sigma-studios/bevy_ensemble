@@ -51,16 +51,38 @@ The binary lands at `target/x86_64-unknown-linux-musl/release/bevy_ensemble_webr
 | Variable | Meaning |
 |---|---|
 | `SIGNALLING_ADDR` | Where signalling listens. Defaults to `0.0.0.0:9090`. |
-| `TURN_PASSWORD` | The credential clients present. **Absent means no relay.** |
+| `TURN_USERS` | `user:password` pairs, comma separated. **Absent means no relay.** |
+| `TURN_USER` / `TURN_PASSWORD` | Shorthand for a single pair. Merged with `TURN_USERS` if both are set. |
 | `TURN_PUBLIC_IP` | The address handed to players. Must be the public one. |
-| `TURN_USER` | The username clients present. Defaults to `ensemble`. |
 | `TURN_REALM` | Hashed into the credential key. Defaults to `bevy_ensemble`. |
 | `TURN_PORT` | The relay's listener. Defaults to 3478. |
 | `TURN_RELAY_PORTS` | The allocation range. Defaults to `49160-49260`. |
 
-`TURN_USER` has to match whatever the client was built to present. A mismatch is refused as
-`ErrNoSuchUser` — a 401 the player experiences as a join that never completes, which is
-indistinguishable from having no relay at all.
+## One relay, several games
+
+TURN derives its key from `MD5(username:realm:password)`, so the username is not decoration — the
+server has to know which password goes with the name a client presents. Give each application its
+own entry:
+
+```sh
+TURN_USERS=run2d:2f9c…,bevy_kart:8a10…,bevy_clash:4b77…
+```
+
+That is what keeps them independent. Rotating or revoking one leaves the others connected, where a
+single shared pair would take every application down at once. Each password is public anyway — a
+wasm client bakes its configuration in at compile time and anybody can read the bundle — so what
+per-application credentials buy is blast radius, not secrecy.
+
+The username each client presents has to match its entry. A mismatch and an unknown application
+fail identically, as a 401, which a player experiences as a join that never completes and cannot
+tell apart from having no relay at all. That is why startup logs the names it will accept:
+
+```
+INFO relay accepts: bevy_kart, run2d
+```
+
+A password containing a comma cannot be expressed in `TURN_USERS`. Hex secrets — what
+`openssl rand -hex 32` produces — never contain one.
 
 `TURN_PUBLIC_IP` is explicit rather than detected because it is *advertised* in an allocation
 rather than bound. On a host behind NAT the interface address is private, and a relay advertising

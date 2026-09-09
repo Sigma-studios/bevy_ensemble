@@ -29,12 +29,13 @@
 //! // Held for as long as the process should relay: dropping it stops the relay.
 //! let _relay = start_relay(RelayConfig::new(
 //!     "203.0.113.10".parse()?,
-//!     RelayCredentials::Static { username: "run2d".into(), password: "…".into() },
+//!     RelayCredentials::user("run2d", "…"),
 //! ))
 //! .await?;
 //! # Ok(()) }
 //! ```
 
+use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -66,16 +67,19 @@ pub const DEFAULT_RELAY_PORTS: (u16, u16) = (49160, 49260);
 /// relays are found by scanners within hours of coming up. Both variants below are real
 /// authentication; they differ in who holds what.
 pub enum RelayCredentials {
-    /// One fixed pair, shared by every player.
+    /// A password per username, so one relay can serve several applications.
     ///
-    /// The simplest thing that works, and the right choice when the client is a wasm bundle whose
-    /// configuration is baked in at compile time: there is nowhere to put a rotating credential
-    /// that the client could read. The cost is that the pair is public — anybody who opens the
-    /// bundle has it — and rotating it means republishing the client.
+    /// The username is not decoration: TURN derives its key from
+    /// `MD5(username:realm:password)`, so the server has to know which password belongs to the
+    /// username a client presents. Giving each application its own entry is what makes them
+    /// independent — rotating or revoking one leaves the others connected, where a single shared
+    /// pair would take every application down at once.
     ///
-    /// The bounded relay port range is what keeps that survivable: it caps concurrent allocations
-    /// regardless of who is asking.
-    Static { username: String, password: String },
+    /// Each password is public, in the sense that a wasm client bakes its configuration in at
+    /// compile time and anybody can read the bundle. That is the trade for a client with no
+    /// runtime configuration to read; what per-application credentials buy is blast radius, not
+    /// secrecy. The bounded relay port range is what caps the damage either way.
+    Users(HashMap<String, String>),
 
     /// Derived rather than stored: the username is an expiry and the password is an HMAC of it
     /// under this secret.
@@ -85,6 +89,13 @@ pub enum RelayCredentials {
     /// them to each client, which means a channel the client already has. Use this when the
     /// signalling connection carries them.
     Secret(String),
+}
+
+impl RelayCredentials {
+    /// One application's credentials, for a relay that serves exactly one.
+    pub fn user(username: impl Into<String>, password: impl Into<String>) -> Self {
+        Self::Users(HashMap::from([(username.into(), password.into())]))
+    }
 }
 
 /// Everything a relay needs that this crate cannot reasonably guess.
@@ -143,23 +154,23 @@ impl fmt::Display for RelayError {
 
 impl std::error::Error for RelayError {}
 
-/// Accepts one fixed credential.
-struct StaticAuth {
-    username: String,
-    password: String,
+/// Accepts any username the table knows, with that username's own password.
+struct UserAuth {
+    users: HashMap<String, String>,
 }
 
-impl AuthHandler for StaticAuth {
+impl AuthHandler for UserAuth {
     fn auth_handle(
         &self,
         username: &str,
         realm: &str,
         _src_addr: std::net::SocketAddr,
     ) -> Result<Vec<u8>, turn::Error> {
-        if username != self.username {
-            return Err(turn::Error::ErrNoSuchUser);
-        }
-        Ok(generate_auth_key(username, realm, &self.password))
+        // An unknown username and a wrong password fail the same way, which is what a client sees
+        // as a 401 and a player sees as a join that never completes. The log line at startup
+        // listing the configured usernames is what makes the difference diagnosable.
+        let password = self.users.get(username).ok_or(turn::Error::ErrNoSuchUser)?;
+        Ok(generate_auth_key(username, realm, password))
     }
 }
 
@@ -187,8 +198,13 @@ pub async fn start_relay(config: RelayConfig) -> Result<Relay, RelayError> {
     );
 
     let auth_handler: Arc<dyn AuthHandler + Send + Sync> = match config.credentials {
-        RelayCredentials::Static { username, password } => {
-            Arc::new(StaticAuth { username, password })
+        RelayCredentials::Users(users) => {
+            if users.is_empty() {
+                return Err(RelayError::Config(
+                    "no relay credentials: nothing would be able to allocate".into(),
+                ));
+            }
+            Arc::new(UserAuth { users })
         }
         RelayCredentials::Secret(secret) => Arc::new(LongTermAuthHandler::new(secret)),
     };
