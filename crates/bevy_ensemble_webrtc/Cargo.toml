@@ -28,6 +28,11 @@ rustls = { version = "0.23", features = ["ring"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["sync", "rt", "macros", "time", "rt-multi-thread", "net"] }
+# The relay half of `server`. Native only, because a relay is something a deployment runs and a
+# browser cannot be one. Already in the graph for any consumer building the client on native --
+# `bevy_ensemble_sockets` pulls `webrtc`, which pulls both -- so this adds no compilation there.
+turn = { version = "0.17", optional = true }
+webrtc-util = { version = "0.17", optional = true }
 async-tungstenite = { version = "0.32", features = ["tokio-runtime", "tokio-rustls-native-certs"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -54,6 +59,8 @@ server = [
     "dep:tracing",
     "dep:tracing-subscriber",
     "dep:rand",
+    "dep:turn",
+    "dep:webrtc-util",
 ]
 cli = [
     "dep:tokio-tungstenite",
