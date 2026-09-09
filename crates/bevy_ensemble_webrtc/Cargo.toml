@@ -72,6 +72,11 @@ cli = [
 bevy = "0.19"
 bevy_immediate = "0.7"
 
+[[example]]
+name = "relay_probe"
+path = "examples/relay_probe.rs"
+required-features = ["server"]
+
 [[bin]]
 name = "bevy_ensemble_webrtc_server"
 path = "src/bin/server.rs"
