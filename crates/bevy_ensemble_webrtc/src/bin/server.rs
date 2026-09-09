@@ -19,8 +19,8 @@
 //! | Variable | Meaning |
 //! |---|---|
 //! | `SIGNALLING_ADDR` | Where signalling listens. Defaults to `0.0.0.0:9090`. |
-//! | `TURN_USERS` | `user:password` pairs, comma separated — one per application sharing this relay. |
-//! | `TURN_USER` / `TURN_PASSWORD` | Shorthand for a single pair. Merged with `TURN_USERS` if both are set. |
+//! | `TURN_PASSWORD` | One password, accepted with any username. **Absent means no relay.** |
+//! | `TURN_USERS` | `user:password` pairs, comma separated. Only when applications need separate passwords. |
 //! | `TURN_PUBLIC_IP` | The address handed to players. Must be the public one; see below. |
 //! | `TURN_REALM` | Hashed into the credential key. Defaults to `bevy_ensemble`. |
 //! | `TURN_PORT` | The relay's listener. Defaults to 3478. |
@@ -30,18 +30,22 @@
 //! Peers who can pair directly are unaffected; peers who cannot simply have no route, and see a
 //! join that never completes.
 //!
-//! One relay commonly serves several games. TURN derives its key from
-//! `MD5(username:realm:password)`, so the username is not decoration — the server has to know
-//! which password goes with the name a client presents. Giving each application its own entry is
-//! what keeps them independent: rotating or revoking one leaves the others connected, where a
-//! single shared pair would take every application down at once.
+//! One relay commonly serves several games, and with `TURN_PASSWORD` it needs to be told about none
+//! of them. TURN derives its key from `MD5(username:realm:password)` and the username arrives in
+//! the request, so the server computes the key from whatever name the client presented. A new
+//! application points at the relay, picks a name, and works — no restart, no configuration here.
+//! The name still shows up in logs; it just is not what authenticates.
+//!
+//! `TURN_USERS` is for when that is not enough — when applications must be revocable
+//! independently, so rotating one password does not disconnect the others:
 //!
 //! ```text
 //! TURN_USERS=first-game:2f9c…,second-game:8a10…,third-game:4b77…
 //! ```
 //!
-//! A password containing a comma cannot be expressed this way. Hex secrets, which is what
-//! `openssl rand -hex 32` produces, never contain one.
+//! It costs a server change per application, which is the trade. A password containing a comma
+//! cannot be expressed this way; hex secrets, which is what `openssl rand -hex 32` produces, never
+//! contain one.
 //!
 //! Both port ranges have to be open, in the host firewall **and** any cloud firewall in front of
 //! it. The allocation range is bounded so that rule stays narrow — and it doubles as the only
@@ -96,11 +100,16 @@ fn relay_ports() -> Result<(u16, u16), String> {
     Ok((port(min)?, port(max)?))
 }
 
-/// Every credential this relay accepts, from `TURN_USERS` and the single-pair shorthand.
-fn users() -> Result<HashMap<String, String>, String> {
-    let mut users = HashMap::new();
-
-    if let Ok(raw) = std::env::var("TURN_USERS") {
+/// What this relay accepts, from the environment, or `None` when it has no relay.
+///
+/// `TURN_USERS` wins when both are set: asking for per-application passwords and a catch-all at
+/// once is a contradiction, and silently keeping the looser of the two would defeat the reason for
+/// setting the stricter.
+fn credentials() -> Result<Option<RelayCredentials>, String> {
+    if let Ok(raw) = std::env::var("TURN_USERS")
+        && !raw.trim().is_empty()
+    {
+        let mut users = HashMap::new();
         for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
             let (user, password) = entry
                 .split_once(':')
@@ -110,34 +119,27 @@ fn users() -> Result<HashMap<String, String>, String> {
             }
             users.insert(user.to_owned(), password.to_owned());
         }
+        return Ok(Some(RelayCredentials::Users(users)));
     }
 
-    match (std::env::var("TURN_USER"), std::env::var("TURN_PASSWORD")) {
-        (Ok(user), Ok(password)) if !user.is_empty() && !password.is_empty() => {
-            users.insert(user, password);
-        }
-        // Half of the shorthand is a mistake worth naming: ignoring it silently would leave one
-        // application unable to allocate, and only that application's players would ever see it.
-        (Ok(_), Err(_)) => return Err("TURN_USER is set but TURN_PASSWORD is not".into()),
-        (Err(_), Ok(_)) => return Err("TURN_PASSWORD is set but TURN_USER is not".into()),
-        _ => {}
+    match std::env::var("TURN_PASSWORD") {
+        Ok(password) if !password.is_empty() => Ok(Some(RelayCredentials::shared(password))),
+        Ok(_) => Err("TURN_PASSWORD is set but empty".into()),
+        Err(_) => Ok(None),
     }
-
-    Ok(users)
 }
 
 /// The relay's configuration from the environment, or `None` when this deployment has no relay.
 fn relay_config() -> Result<Option<RelayConfig>, String> {
-    let users = users()?;
-    if users.is_empty() {
+    let Some(credentials) = credentials()? else {
         return Ok(None);
-    }
+    };
     let public_ip: IpAddr = std::env::var("TURN_PUBLIC_IP")
         .map_err(|_| "relay credentials are set, so TURN_PUBLIC_IP must be too".to_string())?
         .parse()
         .map_err(|_| "TURN_PUBLIC_IP is not an IP address".to_string())?;
 
-    let mut config = RelayConfig::new(public_ip, RelayCredentials::Users(users));
+    let mut config = RelayConfig::new(public_ip, credentials);
     config.realm = std::env::var("TURN_REALM").unwrap_or_else(|_| DEFAULT_TURN_REALM.to_owned());
     config.relay_ports = relay_ports()?;
     if let Ok(raw) = std::env::var("TURN_PORT") {
@@ -172,10 +174,16 @@ async fn relay() -> Option<Relay> {
     let (min, max) = config.relay_ports;
     // Named at startup because an unknown username and a wrong password are the same 401 on the
     // wire, and a player experiences either as a join that never completes.
-    if let RelayCredentials::Users(users) = &config.credentials {
-        let mut names: Vec<&str> = users.keys().map(String::as_str).collect();
-        names.sort_unstable();
-        info!("relay accepts: {}", names.join(", "));
+    match &config.credentials {
+        RelayCredentials::Shared { .. } => {
+            info!("relay accepts: any username, on one shared password");
+        }
+        RelayCredentials::Users(users) => {
+            let mut names: Vec<&str> = users.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            info!("relay accepts: {}", names.join(", "));
+        }
+        RelayCredentials::Secret(_) => info!("relay accepts: time-limited credentials"),
     }
     match start_relay(config).await {
         Ok(relay) => {
