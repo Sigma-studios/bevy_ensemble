@@ -65,7 +65,7 @@ server has to know which password goes with the name a client presents. Give eac
 own entry:
 
 ```sh
-TURN_USERS=run2d:2f9c…,bevy_kart:8a10…,bevy_clash:4b77…
+TURN_USERS=first-game:2f9c…,second-game:8a10…,third-game:4b77…
 ```
 
 That is what keeps them independent. Rotating or revoking one leaves the others connected, where a
@@ -78,7 +78,7 @@ fail identically, as a 401, which a player experiences as a join that never comp
 tell apart from having no relay at all. That is why startup logs the names it will accept:
 
 ```
-INFO relay accepts: bevy_kart, run2d
+INFO relay accepts: first-game, second-game
 ```
 
 A password containing a comma cannot be expressed in `TURN_USERS`. Hex secrets — what
@@ -118,5 +118,14 @@ A missing second line is always explained: `no relay: TURN_PASSWORD is unset`, o
 `relay disabled: <reason>`. A relay that will not start never takes signalling down with it.
 
 Then measure it from somewhere else — not from the server, which would measure loopback.
-`run-2d`'s `examples/relay_probe.rs` allocates for real and pushes game-shaped traffic through the
-relay, reporting latency, jitter and loss.
+`examples/relay_probe.rs` in this crate allocates for real and pushes game-shaped traffic through
+the relay, reporting latency, jitter and loss:
+
+```sh
+cargo run --example relay_probe -p bevy_ensemble_webrtc --no-default-features --features server -- \
+    --target ours --url turn:relay.example.com:3478 --user first-game --pass … \
+    --preset loopback --budget 50 --cliff 190
+```
+
+The `loopback` preset runs an in-process relay alongside, so the floor and the real thing appear in
+one comparison table and a surprising number can be pinned on the network rather than the tool.

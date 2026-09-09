@@ -29,7 +29,7 @@
 //! // Held for as long as the process should relay: dropping it stops the relay.
 //! let _relay = start_relay(RelayConfig::new(
 //!     "203.0.113.10".parse()?,
-//!     RelayCredentials::user("run2d", "…"),
+//!     RelayCredentials::user("my-game", "…"),
 //! ))
 //! .await?;
 //! # Ok(()) }

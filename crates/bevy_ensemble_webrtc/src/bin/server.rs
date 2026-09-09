@@ -37,7 +37,7 @@
 //! single shared pair would take every application down at once.
 //!
 //! ```text
-//! TURN_USERS=run2d:2f9c…,bevy_kart:8a10…,bevy_clash:4b77…
+//! TURN_USERS=first-game:2f9c…,second-game:8a10…,third-game:4b77…
 //! ```
 //!
 //! A password containing a comma cannot be expressed this way. Hex secrets, which is what
