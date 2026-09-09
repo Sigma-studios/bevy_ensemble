@@ -98,6 +98,26 @@ fn is_loopback_signalling(url: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
 }
 
+#[cfg(all(test, feature = "client"))]
+mod ice_server_tests {
+    use super::is_loopback_signalling;
+
+    /// Every shape a local signalling server is written as, and some that are not one.
+    ///
+    /// `192.168.1.20` is the case worth keeping honest: a LAN address is *not* loopback. Two peers
+    /// on one network still gather host candidates that pair directly, but a third on a phone does
+    /// not, and treating a LAN address as local would silently deny them STUN and the relay.
+    #[test]
+    fn loopback_signalling_is_recognised() {
+        assert!(is_loopback_signalling("ws://127.0.0.1:9090/ws"));
+        assert!(is_loopback_signalling("ws://localhost:9090/ws"));
+        assert!(is_loopback_signalling("ws://[::1]:9090/ws"));
+        assert!(is_loopback_signalling("127.0.0.1:9090"));
+        assert!(!is_loopback_signalling("wss://signal.sigma-dev.eu/ws"));
+        assert!(!is_loopback_signalling("ws://192.168.1.20:9090/ws"));
+    }
+}
+
 /// The ICE servers a client should gather candidates from, given how it is configured.
 ///
 /// Prefer the [`ice_servers_from_env!`] macro, which fills the relay arguments in from the
