@@ -29,7 +29,7 @@
 //! // Held for as long as the process should relay: dropping it stops the relay.
 //! let _relay = start_relay(RelayConfig::new(
 //!     "203.0.113.10".parse()?,
-//!     RelayCredentials::user("my-game", "…"),
+//!     RelayCredentials::shared("…"),
 //! ))
 //! .await?;
 //! # Ok(()) }
@@ -67,18 +67,28 @@ pub const DEFAULT_RELAY_PORTS: (u16, u16) = (49160, 49260);
 /// relays are found by scanners within hours of coming up. Both variants below are real
 /// authentication; they differ in who holds what.
 pub enum RelayCredentials {
-    /// A password per username, so one relay can serve several applications.
+    /// One password, and any username.
     ///
-    /// The username is not decoration: TURN derives its key from
-    /// `MD5(username:realm:password)`, so the server has to know which password belongs to the
-    /// username a client presents. Giving each application its own entry is what makes them
-    /// independent — rotating or revoking one leaves the others connected, where a single shared
-    /// pair would take every application down at once.
+    /// The right default for a relay serving several applications, because it needs to be told
+    /// about none of them. TURN derives its key from `MD5(username:realm:password)`, and the
+    /// username arrives in the request — so the key can be computed from whatever name the client
+    /// presented without the server having been configured with it. A new application points at
+    /// the relay, picks a name, and works. Nothing restarts.
     ///
-    /// Each password is public, in the sense that a wasm client bakes its configuration in at
-    /// compile time and anybody can read the bundle. That is the trade for a client with no
-    /// runtime configuration to read; what per-application credentials buy is blast radius, not
-    /// secrecy. The bounded relay port range is what caps the damage either way.
+    /// The name still reaches the server, so it stays useful as a label for logs; it just is not
+    /// a credential. What authenticates is the password.
+    Shared { password: String },
+
+    /// A password per username, when applications need to be revocable independently.
+    ///
+    /// The reason to prefer this over [`Shared`](RelayCredentials::Shared) is blast radius:
+    /// rotating or revoking one application's password leaves the others connected, where one
+    /// shared password takes every application down at once. The cost is that every application
+    /// has to be configured here before it can allocate.
+    ///
+    /// Not secrecy, either way. A wasm client bakes its configuration in at compile time, so any
+    /// password it presents is readable by anybody who opens the bundle. The bounded relay port
+    /// range is what caps the damage.
     Users(HashMap<String, String>),
 
     /// Derived rather than stored: the username is an expiry and the password is an HMAC of it
@@ -92,7 +102,14 @@ pub enum RelayCredentials {
 }
 
 impl RelayCredentials {
-    /// One application's credentials, for a relay that serves exactly one.
+    /// One password for everything that points at this relay.
+    pub fn shared(password: impl Into<String>) -> Self {
+        Self::Shared {
+            password: password.into(),
+        }
+    }
+
+    /// One application's own credentials.
     pub fn user(username: impl Into<String>, password: impl Into<String>) -> Self {
         Self::Users(HashMap::from([(username.into(), password.into())]))
     }
@@ -154,6 +171,26 @@ impl fmt::Display for RelayError {
 
 impl std::error::Error for RelayError {}
 
+/// Accepts any username at all, against one password.
+///
+/// Not a weaker check than [`UserAuth`] on the password — the client still has to have derived its
+/// key from the same secret. It simply does not treat the username as one, which is the whole
+/// point: an application the server has never been told about can still authenticate.
+struct SharedAuth {
+    password: String,
+}
+
+impl AuthHandler for SharedAuth {
+    fn auth_handle(
+        &self,
+        username: &str,
+        realm: &str,
+        _src_addr: std::net::SocketAddr,
+    ) -> Result<Vec<u8>, turn::Error> {
+        Ok(generate_auth_key(username, realm, &self.password))
+    }
+}
+
 /// Accepts any username the table knows, with that username's own password.
 struct UserAuth {
     users: HashMap<String, String>,
@@ -198,6 +235,7 @@ pub async fn start_relay(config: RelayConfig) -> Result<Relay, RelayError> {
     );
 
     let auth_handler: Arc<dyn AuthHandler + Send + Sync> = match config.credentials {
+        RelayCredentials::Shared { password } => Arc::new(SharedAuth { password }),
         RelayCredentials::Users(users) => {
             if users.is_empty() {
                 return Err(RelayError::Config(

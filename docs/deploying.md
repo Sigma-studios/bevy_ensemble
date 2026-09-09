@@ -51,8 +51,8 @@ The binary lands at `target/x86_64-unknown-linux-musl/release/bevy_ensemble_webr
 | Variable | Meaning |
 |---|---|
 | `SIGNALLING_ADDR` | Where signalling listens. Defaults to `0.0.0.0:9090`. |
-| `TURN_USERS` | `user:password` pairs, comma separated. **Absent means no relay.** |
-| `TURN_USER` / `TURN_PASSWORD` | Shorthand for a single pair. Merged with `TURN_USERS` if both are set. |
+| `TURN_PASSWORD` | One password, accepted with any username. **Absent means no relay.** |
+| `TURN_USERS` | `user:password` pairs, comma separated. Only when applications need separate passwords. |
 | `TURN_PUBLIC_IP` | The address handed to players. Must be the public one. |
 | `TURN_REALM` | Hashed into the credential key. Defaults to `bevy_ensemble`. |
 | `TURN_PORT` | The relay's listener. Defaults to 3478. |
@@ -60,33 +60,48 @@ The binary lands at `target/x86_64-unknown-linux-musl/release/bevy_ensemble_webr
 
 ## One relay, several games
 
-TURN derives its key from `MD5(username:realm:password)`, so the username is not decoration — the
-server has to know which password goes with the name a client presents. Give each application its
-own entry:
+Set `TURN_PASSWORD` and the relay needs to be told about none of them.
+
+TURN derives its key from `MD5(username:realm:password)`, and the username arrives *in the
+request* — so the server computes the key from whatever name the client presented. It never has to
+have been configured with that name. A new game points at the relay, picks a username, ships, and
+works. Nothing restarts and nothing here changes.
+
+The username still reaches the server and still appears in logs. It is a label, not a credential.
+What authenticates is the password.
+
+```sh
+TURN_PASSWORD=2f9c…          # every game, one secret
+```
+
+### When you want per-application passwords instead
+
+`TURN_USERS` trades that convenience for blast radius. With separate passwords, rotating or
+revoking one application leaves the others connected, where one shared password disconnects
+everything at once:
 
 ```sh
 TURN_USERS=first-game:2f9c…,second-game:8a10…,third-game:4b77…
 ```
 
-That is what keeps them independent. Rotating or revoking one leaves the others connected, where a
-single shared pair would take every application down at once. Each password is public anyway — a
-wasm client bakes its configuration in at compile time and anybody can read the bundle — so what
-per-application credentials buy is blast radius, not secrecy.
+The cost is a server change for every new application, and a username that must now match its
+entry exactly — a mismatch and an unknown application fail identically, as a 401, which a player
+experiences as a join that never completes. `TURN_USERS` wins if both are set; asking for strict
+per-application passwords and a catch-all at once is a contradiction.
 
-The username each client presents has to match its entry. A mismatch and an unknown application
-fail identically, as a 401, which a player experiences as a join that never completes and cannot
-tell apart from having no relay at all. That is why startup logs the names it will accept:
+Startup says which mode is live:
 
 ```
+INFO relay accepts: any username, on one shared password
 INFO relay accepts: first-game, second-game
 ```
 
+Neither mode is about secrecy. A wasm client bakes its configuration in at compile time, so any
+password it presents is readable by anybody who opens the bundle. The bounded relay port range is
+what caps the damage.
+
 A password containing a comma cannot be expressed in `TURN_USERS`. Hex secrets — what
 `openssl rand -hex 32` produces — never contain one.
-
-`TURN_PUBLIC_IP` is explicit rather than detected because it is *advertised* in an allocation
-rather than bound. On a host behind NAT the interface address is private, and a relay advertising
-`10.x.x.x` hands every player somewhere unreachable while looking perfectly healthy in its own log.
 
 ## Ports
 
