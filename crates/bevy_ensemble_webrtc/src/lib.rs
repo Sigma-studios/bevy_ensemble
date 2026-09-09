@@ -78,6 +78,122 @@ impl Default for BevyEnsembleWebrtcPlugin {
     }
 }
 
+/// Whether a signalling URL points at this machine.
+///
+/// Used to decide that no STUN and no relay are wanted: two peers reached through a loopback
+/// signalling server are on one machine, pair on host candidates, and would otherwise wait on
+/// servers whose answers cannot help them.
+#[cfg(feature = "client")]
+fn is_loopback_signalling(url: &str) -> bool {
+    let authority = url
+        .split("//")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host);
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+}
+
+/// The ICE servers a client should gather candidates from, given how it is configured.
+///
+/// Prefer the [`ice_servers_from_env!`] macro, which fills the relay arguments in from the
+/// environment. This is the same logic with the values passed explicitly, for a consumer that
+/// gets them from somewhere else.
+///
+/// # What it decides
+///
+/// | Signalling | Relay configured | Result |
+/// |---|---|---|
+/// | loopback | either | [`IceServers::none()`] — peers on one machine pair on host candidates |
+/// | remote | no | the public STUN pair |
+/// | remote | yes | the public STUN pair, plus the relay |
+///
+/// The loopback case is not an optimisation detail: gathering waits on servers that cannot help,
+/// which makes every local run slower and every local test noisier.
+///
+/// A relay matters because STUN alone is not always enough. It tells a peer its public address,
+/// which is sufficient whenever the two networks will carry a direct connection — and when they
+/// will not, because of client isolation, filtered mDNS, or a NAT neither side can traverse,
+/// there is no third option and the join simply fails. That failure is per-device, which is why
+/// it shows up as "some of us could not join and the rest could".
+///
+/// All three relay parts are required together. Two of them is a relay that silently is not
+/// there, so it warns rather than half-configuring itself.
+#[cfg(feature = "client")]
+pub fn ice_servers_for(
+    signalling_url: &str,
+    turn_url: Option<&str>,
+    turn_username: Option<&str>,
+    turn_credential: Option<&str>,
+) -> IceServers {
+    if is_loopback_signalling(signalling_url) {
+        return IceServers::none();
+    }
+
+    /// The runtime environment wins over whatever was baked in at compile time, so a native build
+    /// can be pointed at another relay without being rebuilt. A wasm build has no environment to
+    /// read, which is why the baked value has to exist at all.
+    fn resolve(name: &str, baked: Option<&str>) -> Option<String> {
+        std::env::var(name)
+            .ok()
+            .or_else(|| baked.map(String::from))
+            .filter(|value| !value.is_empty())
+    }
+
+    let mut servers = IceServers::default().0;
+    match (
+        resolve("TURN_URL", turn_url),
+        resolve("TURN_USER", turn_username),
+        resolve("TURN_PASSWORD", turn_credential),
+    ) {
+        (Some(urls), Some(username), Some(credential)) => {
+            info!("relay configured: {urls}");
+            servers.push(IceServer {
+                urls: vec![urls],
+                username,
+                credential,
+            });
+        }
+        (None, None, None) => {}
+        _ => warn!(
+            "no relay: TURN_URL, TURN_USER and TURN_PASSWORD must all be set, and some are not"
+        ),
+    }
+    IceServers(servers)
+}
+
+/// The ICE servers for this build, reading the relay from the environment.
+///
+/// ```rust,ignore
+/// app.add_plugins(BevyEnsembleWebrtcPlugin {
+///     server_url: signalling_url.clone(),
+///     ice_servers: bevy_ensemble_webrtc::ice_servers_from_env!(&signalling_url),
+///     ..default()
+/// });
+/// ```
+///
+/// `TURN_URL`, `TURN_USER` and `TURN_PASSWORD` are read from the environment at runtime, falling
+/// back to whatever they were at **this call site's** compile time. A macro rather than a
+/// function because that is the only way `option_env!` can see the consumer's build: expanded
+/// inside this crate it would capture whatever was set when *this* crate was compiled, which for
+/// a cached dependency is a different build entirely, and silently stale.
+#[cfg(feature = "client")]
+#[macro_export]
+macro_rules! ice_servers_from_env {
+    ($signalling_url:expr) => {
+        $crate::ice_servers_for(
+            $signalling_url,
+            ::core::option_env!("TURN_URL"),
+            ::core::option_env!("TURN_USER"),
+            ::core::option_env!("TURN_PASSWORD"),
+        )
+    };
+}
+
 /// Log directives that silence ICE gathering noise, for a consumer's `LogPlugin` filter.
 ///
 /// # Why this is a string and not a fix

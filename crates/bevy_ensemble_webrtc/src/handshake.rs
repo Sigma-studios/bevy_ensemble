@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use bevy_ensemble::{
-    EnsembleMessageRegistry, Host, Lobby, LobbyClient, LobbyClientPlayerUuid,
-    LobbyParticipantOf, PendingLobby, ReceivedEnsembleMessage, encode_ensemble_message,
+    EnsembleMessageRegistry, Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipantOf,
+    PendingLobby, ReceivedEnsembleMessage, encode_ensemble_message,
 };
 
 use crate::{EnsembleSocketRes, LobbyClientWebrtcUuid, LobbyWebrtcId, PendingWebrtcLobbyClient};
@@ -27,10 +27,7 @@ pub(crate) struct WebrtcReadyHandshake {
 pub(crate) fn send_client_handshakes(
     registry: Res<EnsembleMessageRegistry>,
     socket: ResMut<EnsembleSocketRes>,
-    client_lobbies: Query<
-        &LobbyWebrtcId,
-        (Without<Host>, Or<(With<PendingLobby>, With<Lobby>)>),
-    >,
+    client_lobbies: Query<&LobbyWebrtcId, (Without<Host>, Or<(With<PendingLobby>, With<Lobby>)>)>,
     time: Res<Time>,
     mut cooldown: Local<f32>,
 ) {
