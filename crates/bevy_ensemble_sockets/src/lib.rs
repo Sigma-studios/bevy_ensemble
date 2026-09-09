@@ -28,6 +28,31 @@ pub enum PeerState {
     Failed,
 }
 
+/// How a peer's traffic actually reaches it, once ICE has nominated a pair.
+///
+/// Worth surfacing rather than inferring from the ICE servers offered: a build configured with a
+/// relay still connects directly whenever it can, so "a relay was available" and "a relay is being
+/// used" are different facts, and only the second one costs latency. A player reporting that the
+/// game feels worse than usual is answering a different question depending on which is true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRoute {
+    /// A direct pair — host or server-reflexive at both ends. No third party in the path.
+    Direct,
+    /// Through a TURN relay, because no direct pair worked. Costs the relay's round trip, and is
+    /// the difference between a slower session and no session at all.
+    Relayed,
+}
+
+impl PeerRoute {
+    /// For a readout that has one column to spend on this.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Relayed => "relayed",
+        }
+    }
+}
+
 /// Outbound signal destined for a remote peer (must be relayed via signalling server).
 #[derive(Debug)]
 pub struct OutgoingSignal {
@@ -99,6 +124,8 @@ pub struct EnsembleSocket {
     signal_rx: mpsc::UnboundedReceiver<OutgoingSignal>,
     peer_state_tx: mpsc::UnboundedSender<(u128, PeerState)>,
     peer_state_rx: mpsc::UnboundedReceiver<(u128, PeerState)>,
+    route_tx: mpsc::UnboundedSender<(u128, PeerRoute)>,
+    route_rx: mpsc::UnboundedReceiver<(u128, PeerRoute)>,
     message_tx: mpsc::UnboundedSender<(u128, Box<[u8]>)>,
     message_rx: mpsc::UnboundedReceiver<(u128, Box<[u8]>)>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -106,6 +133,7 @@ pub struct EnsembleSocket {
     #[cfg(target_arch = "wasm32")]
     peers: HashMap<u128, wasm::WasmPeerConnection>,
     states: HashMap<u128, PeerState>,
+    routes: HashMap<u128, PeerRoute>,
     ice_servers: IceServers,
     #[cfg(not(target_arch = "wasm32"))]
     runtime_handle: tokio::runtime::Handle,
@@ -116,16 +144,20 @@ impl EnsembleSocket {
     pub fn new(runtime_handle: tokio::runtime::Handle) -> Self {
         let (signal_tx, signal_rx) = mpsc::unbounded_channel();
         let (peer_state_tx, peer_state_rx) = mpsc::unbounded_channel();
+        let (route_tx, route_rx) = mpsc::unbounded_channel();
         let (message_tx, message_rx) = mpsc::unbounded_channel();
         Self {
             signal_tx,
             signal_rx,
             peer_state_tx,
             peer_state_rx,
+            route_tx,
+            route_rx,
             message_tx,
             message_rx,
             peers: HashMap::new(),
             states: HashMap::new(),
+            routes: HashMap::new(),
             ice_servers: IceServers::default(),
             runtime_handle,
         }
@@ -135,16 +167,20 @@ impl EnsembleSocket {
     pub fn new() -> Self {
         let (signal_tx, signal_rx) = mpsc::unbounded_channel();
         let (peer_state_tx, peer_state_rx) = mpsc::unbounded_channel();
+        let (route_tx, route_rx) = mpsc::unbounded_channel();
         let (message_tx, message_rx) = mpsc::unbounded_channel();
         Self {
             signal_tx,
             signal_rx,
             peer_state_tx,
             peer_state_rx,
+            route_tx,
+            route_rx,
             message_tx,
             message_rx,
             peers: HashMap::new(),
             states: HashMap::new(),
+            routes: HashMap::new(),
             ice_servers: IceServers::default(),
         }
     }
@@ -172,6 +208,7 @@ impl EnsembleSocket {
                 peer_id,
                 self.signal_tx.clone(),
                 self.peer_state_tx.clone(),
+                self.route_tx.clone(),
                 self.message_tx.clone(),
                 &self.ice_servers,
                 self.runtime_handle.clone(),
@@ -186,6 +223,7 @@ impl EnsembleSocket {
                 peer_id,
                 self.signal_tx.clone(),
                 self.peer_state_tx.clone(),
+                self.route_tx.clone(),
                 self.message_tx.clone(),
                 &self.ice_servers,
             );
@@ -225,6 +263,7 @@ impl EnsembleSocket {
                         sender,
                         self.signal_tx.clone(),
                         self.peer_state_tx.clone(),
+                        self.route_tx.clone(),
                         self.message_tx.clone(),
                         &self.ice_servers,
                         self.runtime_handle.clone(),
@@ -239,6 +278,7 @@ impl EnsembleSocket {
                         sender,
                         self.signal_tx.clone(),
                         self.peer_state_tx.clone(),
+                        self.route_tx.clone(),
                         self.message_tx.clone(),
                         &self.ice_servers,
                     );
@@ -308,6 +348,29 @@ impl EnsembleSocket {
             }
         }
         changes
+    }
+
+    /// Drain the routes ICE has settled on since the last call.
+    ///
+    /// Reported once per change rather than once per query, matching [`update_peers`]: the route
+    /// is decided when a pair is nominated and only changes if ICE renominates, so a consumer that
+    /// polls every frame would otherwise re-apply the same fact for the length of the session.
+    ///
+    /// [`update_peers`]: EnsembleSocket::update_peers
+    pub fn update_routes(&mut self) -> Vec<(u128, PeerRoute)> {
+        let mut changes = Vec::new();
+        while let Ok((peer, route)) = self.route_rx.try_recv() {
+            if self.routes.get(&peer).copied() != Some(route) {
+                self.routes.insert(peer, route);
+                changes.push((peer, route));
+            }
+        }
+        changes
+    }
+
+    /// How this peer is reached, if ICE has settled on a pair yet.
+    pub fn route(&self, peer: u128) -> Option<PeerRoute> {
+        self.routes.get(&peer).copied()
     }
 
     /// Currently connected peer IDs.

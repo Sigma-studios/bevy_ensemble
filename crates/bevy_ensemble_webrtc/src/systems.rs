@@ -1,9 +1,9 @@
 use bevy::prelude::*;
 use bevy_ensemble::{
     Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyJoinFailed, LobbyParticipant,
-    LobbyParticipantOf, LocalMultiplayerPlayerId, PendingLobby, PublicLobbies, PublicLobbyInfo,
-    RemoveLobbyParticipant, RequestLobby, SerializedLobbyPacket, decode_ensemble_packet,
-    encode_ensemble_message,
+    LobbyParticipantOf, LocalMultiplayerPlayerId, PeerRoute, PendingLobby, PublicLobbies,
+    PublicLobbyInfo, RemoveLobbyParticipant, RequestLobby, SerializedLobbyPacket,
+    decode_ensemble_packet, encode_ensemble_message,
 };
 use bevy_ensemble_sockets::{PeerSignal, PeerState};
 
@@ -365,6 +365,43 @@ pub(crate) fn poll_socket_peers(
     }
 }
 
+/// Record which kind of ICE pair each peer ended up on.
+///
+/// Separate from [`poll_socket_peers`] because the two answer different questions at different
+/// moments: that one reports a connection appearing or going away, this one reports what the
+/// connection turned out to *be*, which is only known once ICE has nominated a pair — after the
+/// peer is already connected.
+///
+/// The entity mapping is the same in both: a host carries one `LobbyClient` per peer, a client
+/// carries the lobby itself.
+pub(crate) fn poll_peer_routes(
+    mut commands: Commands,
+    mut socket: ResMut<crate::EnsembleSocketRes>,
+    host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
+    client_lobbies: Query<Entity, (With<Lobby>, Without<Host>)>,
+    lobby_clients: Query<(Entity, &LobbyClientWebrtcUuid), With<LobbyClient>>,
+) {
+    for (peer_id, route) in socket.update_routes() {
+        let route = match route {
+            bevy_ensemble_sockets::PeerRoute::Direct => PeerRoute::Direct,
+            bevy_ensemble_sockets::PeerRoute::Relayed => PeerRoute::Relayed,
+        };
+        if route == PeerRoute::Relayed {
+            info!("peer {peer_id:#x} is connected through the relay, not directly");
+        }
+
+        if host_lobby.is_some() {
+            if let Some((entity, _)) = lobby_clients.iter().find(|(_, uuid)| uuid.0 == peer_id) {
+                commands.entity(entity).try_insert(route);
+            }
+            continue;
+        }
+        for entity in client_lobbies.iter() {
+            commands.entity(entity).try_insert(route);
+        }
+    }
+}
+
 /// When a lobby was first seen still waiting to be promoted, so a join can be given up on.
 ///
 /// Inserted here rather than where the lobby is spawned because both kinds arrive from elsewhere:
@@ -389,7 +426,10 @@ pub(crate) fn time_out_pending_lobbies(
     time: Res<Time>,
     runtime: Res<crate::WebrtcRuntime>,
     mut join_failed: MessageWriter<LobbyJoinFailed>,
-    pending: Query<(Entity, Option<&PendingSince>, Has<Host>), (With<PendingLobby>, Without<Lobby>)>,
+    pending: Query<
+        (Entity, Option<&PendingSince>, Has<Host>),
+        (With<PendingLobby>, Without<Lobby>),
+    >,
 ) {
     let Some(deadline) = runtime.join_timeout else {
         return;
@@ -403,7 +443,11 @@ pub(crate) fn time_out_pending_lobbies(
         if now - since.0 < deadline.as_secs_f64() {
             continue;
         }
-        let what = if is_host { "host a lobby" } else { "join a lobby" };
+        let what = if is_host {
+            "host a lobby"
+        } else {
+            "join a lobby"
+        };
         warn!(
             "giving up after {:.0}s: the attempt to {what} never completed",
             deadline.as_secs_f64()

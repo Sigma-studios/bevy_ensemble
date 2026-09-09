@@ -28,7 +28,7 @@
 use bevy::prelude::*;
 
 use crate::{
-    PeerLastPong, PeerRtt, PeerWireRtt,
+    PeerLastPong, PeerRoute, PeerRtt, PeerWireRtt,
     netmetrics::NetMetrics,
     netsim::{NetPreset, NetSim},
 };
@@ -328,7 +328,12 @@ fn update_overlay_text(
     metrics: Res<NetMetrics>,
     sim: Res<NetSim>,
     time: Res<Time>,
-    peers: Query<(&PeerRtt, &PeerLastPong, Option<&PeerWireRtt>)>,
+    peers: Query<(
+        &PeerRtt,
+        &PeerLastPong,
+        Option<&PeerWireRtt>,
+        Option<&PeerRoute>,
+    )>,
     extras: Res<NetDebugExtras>,
     mut text: Single<&mut Text, With<NetOverlayText>>,
     // Lightly smoothed frame time so the fps readout doesn't flicker.
@@ -351,7 +356,7 @@ fn update_overlay_text(
         let mut rtt_sum = 0.0;
         let mut wire_sum = 0.0;
         let mut worst = 0.0_f64;
-        for (rtt, last_pong, wire) in peers.iter() {
+        for (rtt, last_pong, wire, _) in peers.iter() {
             rtt_sum += rtt.0;
             wire_sum += wire.map(|w| w.0).unwrap_or(0.0);
             worst = worst.max(last_pong.0);
@@ -360,6 +365,25 @@ fn update_overlay_text(
         (rtt_sum / n * 1000.0, wire_sum / n * 1000.0, worst)
     } else {
         (0.0, 0.0, 0.0)
+    };
+
+    // Whether the traffic is going through a relay, which the round trip alone cannot tell you:
+    // a relayed session looks exactly like a direct one with a worse ping. Counted rather than
+    // listed because a lobby can be mixed — one player relayed, the rest direct.
+    let relayed = peers
+        .iter()
+        .filter(|(.., route)| route.is_some_and(|route| *route == PeerRoute::Relayed))
+        .count();
+    let known = peers.iter().filter(|(.., route)| route.is_some()).count();
+    let route_line = match (peer_count, known, relayed) {
+        (0, _, _) => "route: —".to_string(),
+        // Nothing has been nominated yet, or the transport does not report it.
+        (_, 0, _) => "route: pending".to_string(),
+        (_, _, 0) => format!("route: direct ({known}/{peer_count})"),
+        (_, _, n) if n == known && known == peer_count => {
+            format!("route: RELAYED ({n}/{peer_count})")
+        }
+        (_, _, n) => format!("route: {n} relayed, {} direct", known - n),
     };
 
     let cfg = sim.config();
@@ -379,6 +403,8 @@ fn update_overlay_text(
     out.push_str(&format!(
         "peers: {peer_count}   rtt: {avg_rtt_ms:.0}ms (wire {avg_wire_ms:.0}ms)   silence: {worst_silence:.1}s\n"
     ));
+    out.push_str(&route_line);
+    out.push('\n');
     out.push_str(&format!(
         "rx: {}  {:.0} pkt/s\n",
         fmt_rate(metrics.rx_bytes_per_sec),
@@ -419,7 +445,10 @@ fn handle_preset_buttons(
 }
 
 /// Highlight whichever preset button is currently active.
-fn tint_preset_buttons(sim: Res<NetSim>, mut buttons: Query<(&PresetButton, &mut BackgroundColor)>) {
+fn tint_preset_buttons(
+    sim: Res<NetSim>,
+    mut buttons: Query<(&PresetButton, &mut BackgroundColor)>,
+) {
     if !sim.is_changed() {
         return;
     }
