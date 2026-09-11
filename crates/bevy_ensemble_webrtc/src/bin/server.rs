@@ -63,15 +63,10 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use axum::Router;
-use axum::extract::{State, WebSocketUpgrade};
-use axum::response::IntoResponse;
-use axum::routing::get;
 use tracing::{info, warn};
 
 use bevy_ensemble_webrtc::server::{
-    DEFAULT_RELAY_PORTS, Relay, RelayConfig, RelayCredentials, ServerState, handle_socket,
-    start_relay,
+    DEFAULT_RELAY_PORTS, Relay, RelayConfig, RelayCredentials, ServerState, serve, start_relay,
 };
 
 /// Where signalling listens when `SIGNALLING_ADDR` does not say otherwise.
@@ -198,22 +193,11 @@ async fn relay() -> Option<Relay> {
     }
 }
 
-async fn ws_upgrade(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<ServerState>>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
-}
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
     let state = Arc::new(ServerState::new());
-
-    let app = Router::new()
-        .route("/ws", get(ws_upgrade))
-        .with_state(state);
 
     let addr = std::env::var("SIGNALLING_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_owned());
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -225,5 +209,5 @@ async fn main() {
     // Held for the lifetime of the process: dropping it stops the relay.
     let _relay = relay().await;
 
-    axum::serve(listener, app).await.expect("Server failed");
+    serve(listener, state).await.expect("Server failed");
 }

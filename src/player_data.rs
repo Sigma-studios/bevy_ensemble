@@ -4,6 +4,7 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    messages::MessageAuthority,
     Host, Lobby, LobbyClient, LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId,
     PendingLobby, PlayerUUID, SendMode,
     messages::{EnsembleAppExt, EnsembleMessage, LobbyClientMessage, LobbyMessage, ReceivedEnsembleMessage},
@@ -71,7 +72,8 @@ impl<T: EnsembleMessage> SetPlayerData<T> {
 
 /// Internal message for synchronizing player data across the network.
 #[derive(Message, Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct SyncPlayerData<T> {
+#[doc(hidden)]
+pub struct SyncPlayerData<T> {
     pub player_uuid: PlayerUUID,
     pub data: T,
 }
@@ -79,7 +81,7 @@ pub(crate) struct SyncPlayerData<T> {
 /// Buffer for player data messages that arrived before their participant entity existed.
 #[derive(Resource)]
 struct PendingPlayerData<T: EnsembleMessage> {
-    pending: Vec<SyncPlayerData<T>>,
+    pending: Vec<(Option<PlayerUUID>, SyncPlayerData<T>)>,
 }
 
 impl<T: EnsembleMessage> Default for PendingPlayerData<T> {
@@ -112,7 +114,7 @@ impl<T: EnsembleMessage> Default for PlayerDataPlugin<T> {
 impl<T: EnsembleMessage> Plugin for PlayerDataPlugin<T> {
     fn build(&self, app: &mut App) {
         app.init_resource::<PendingPlayerData<T>>()
-            .register_ensemble_message_type::<SyncPlayerData<T>>()
+            .register_control_message_type::<SyncPlayerData<T>>(MessageAuthority::HostOnly)
             .add_observer(handle_set_player_data::<T>)
             .add_systems(
                 Update,
@@ -153,11 +155,15 @@ fn handle_set_player_data<T: EnsembleMessage>(
         {
             commands.entity(participant_entity).insert(PlayerData(data));
         } else {
-            // Participant not created yet — buffer for retry
-            pending.pending.push(SyncPlayerData {
-                player_uuid: local_player.0,
-                data,
-            });
+            // Participant not created yet — buffer for retry. The host's own request is
+            // filed under its own identity, which is what the sender check will compare.
+            pending.pending.push((
+                Some(local_player.0),
+                SyncPlayerData {
+                    player_uuid: local_player.0,
+                    data,
+                },
+            ));
         }
     } else {
         // Client: send request to host
@@ -250,13 +256,21 @@ fn apply_received_player_data<T: EnsembleMessage>(
     let buffered = std::mem::take(&mut pending.pending);
     let all_messages = buffered
         .into_iter()
-        .chain(messages.read().map(|m| m.message.clone()));
+        .chain(messages.read().map(|m| (m.sender, m.message.clone())));
 
-    for sync_msg in all_messages {
+    for (sender, sync_msg) in all_messages {
         let player_uuid = sync_msg.player_uuid;
 
-        // Host: a client is requesting to set their data
+        // Host: a client is requesting to set their data — its own, and nobody else's. The
+        // target used to be whatever the message named, so one message rewrote any player.
         if let Some(host_lobby) = host_lobbies.iter().next() {
+            if sender != Some(player_uuid) {
+                warn!(
+                    "refused player data for {player_uuid:#x} sent by {sender:#x?}: a client may \
+                     only set its own"
+                );
+                continue;
+            }
             if let Some((participant_entity, _, _)) = participants
                 .iter()
                 .find(|(_, p, pof)| pof.0 == host_lobby && p.player_uuid == player_uuid)
@@ -265,7 +279,7 @@ fn apply_received_player_data<T: EnsembleMessage>(
                     .entity(participant_entity)
                     .insert(PlayerData(sync_msg.data));
             } else {
-                pending.pending.push(sync_msg);
+                pending.pending.push((sender, sync_msg));
             }
             continue;
         }
@@ -276,7 +290,7 @@ fn apply_received_player_data<T: EnsembleMessage>(
             .map(|s| **s)
             .or_else(|| pending_client_lobby.as_ref().map(|s| **s))
         else {
-            pending.pending.push(sync_msg);
+            pending.pending.push((sender, sync_msg));
             continue;
         };
 
@@ -288,7 +302,7 @@ fn apply_received_player_data<T: EnsembleMessage>(
                 .entity(participant_entity)
                 .insert(PlayerData(sync_msg.data));
         } else {
-            pending.pending.push(sync_msg);
+            pending.pending.push((sender, sync_msg));
         }
     }
 }

@@ -1,10 +1,29 @@
 use std::collections::HashSet;
 
+use dashmap::Entry;
 use rand::Rng;
 
 use crate::protocol::{LobbyInfo, ServerMessage};
 
 use super::state::{LobbyState, ServerState};
+
+/// The most players a lobby may be created for, whatever the client asked.
+///
+/// `max_players` arrives from the client and was stored as is, so a client could declare a lobby
+/// of four billion. Nothing broke on the server — the count is only compared against — but the
+/// listing advertised it, and nothing bounds a mesh of WebRTC peers except this. Sixty-four is
+/// well above anything a full-mesh session can carry.
+pub const MAX_PLAYERS: u32 = 64;
+
+/// The size a lobby is actually created with, given what the client asked for.
+///
+/// `0` means "as many as the server allows", which is also what anything above the cap gets.
+pub fn clamp_max_players(requested: u32) -> u32 {
+    match requested {
+        0 => MAX_PLAYERS,
+        n => n.min(MAX_PLAYERS),
+    }
+}
 
 fn generate_lobby_code(state: &ServerState) -> String {
     let mut rng = rand::rng();
@@ -35,23 +54,29 @@ pub fn create_lobby(state: &ServerState, host_uuid: u128, max_players: u32) -> S
     let host_name = conn.display_name.clone();
     drop(conn);
 
-    let lobby_id = state.next_lobby_id();
+    let max_players = clamp_max_players(max_players);
     let code = generate_lobby_code(state);
     let mut members = HashSet::new();
     members.insert(host_uuid);
 
+    // Picked and inserted under the same entry so two creations that draw the same id -- which a
+    // random u64 makes as good as impossible, but not impossible -- retry instead of one silently
+    // replacing the other.
+    let lobby_id = loop {
+        let lobby_id = state.next_lobby_id();
+        if let Entry::Vacant(slot) = state.lobbies.entry(lobby_id) {
+            slot.insert(LobbyState {
+                lobby_id,
+                code: code.clone(),
+                host_uuid,
+                host_name: host_name.clone(),
+                members: members.clone(),
+                max_players,
+            });
+            break lobby_id;
+        }
+    };
     state.lobby_codes.insert(code.clone(), lobby_id);
-    state.lobbies.insert(
-        lobby_id,
-        LobbyState {
-            lobby_id,
-            code: code.clone(),
-            host_uuid,
-            host_name,
-            members,
-            max_players,
-        },
-    );
 
     if let Some(mut conn) = state.connections.get_mut(&host_uuid) {
         conn.lobby_id = Some(lobby_id);

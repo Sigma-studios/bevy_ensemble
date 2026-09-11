@@ -24,8 +24,6 @@ use crate::{IceServers, OutgoingSignal, PeerRoute, PeerSignal, PeerState};
 
 pub(crate) struct NativePeerConnection {
     pub connection: Arc<RTCPeerConnection>,
-    pub reliable_channel: Arc<RTCDataChannel>,
-    pub unreliable_channel: Arc<RTCDataChannel>,
     runtime_handle: tokio::runtime::Handle,
     /// Every signal for this peer, applied strictly in the order it arrived.
     ///
@@ -48,6 +46,45 @@ pub(crate) struct NativePeerConnection {
     /// there is no separate candidate buffer here: ordering is a property of the queue rather
     /// than something each handler has to defend against.
     signal_queue: mpsc::UnboundedSender<PeerSignal>,
+    /// Every outbound packet for this peer, written to its data channel in the order it was sent.
+    ///
+    /// One task per `send` is what this used to be, and two packets sent in the same frame then
+    /// raced each other to the SCTP stream: the "reliable, ordered" channel delivered same-frame
+    /// sends reordered between one time in seven and three in four, depending on the machine.
+    /// SCTP orders what it is handed; it cannot order what it is handed in the wrong order.
+    ///
+    /// One writer, awaiting each send to completion, is the whole fix — the same shape as
+    /// `signal_queue`, for the same reason. Both channels share the one queue: an unreliable
+    /// packet waiting behind a reliable one costs nothing measurable, and a single queue cannot
+    /// reorder anything.
+    outbound: mpsc::UnboundedSender<(bytes::Bytes, bool)>,
+    /// The two workers above, so that a disconnect ends them rather than leaving whatever they
+    /// were awaiting to finish on its own.
+    workers: [tokio::task::JoinHandle<()>; 2],
+}
+
+impl Drop for NativePeerConnection {
+    /// Dropping the `Arc<RTCPeerConnection>` is not enough: webrtc-rs keeps its ICE agent, its
+    /// sockets and their tasks alive until `close()` is called, and a socket that is rebuilt on
+    /// every lobby leaves a set of them behind each time. Closing here rather than in
+    /// `disconnect_peer` means every path that lets go of a peer — one disconnect, all of them,
+    /// or the socket itself being dropped — closes it.
+    ///
+    /// Spawned rather than awaited because this runs on the game thread, and a runtime that has
+    /// already shut down drops the future instead of running it, which is the right outcome
+    /// there too.
+    fn drop(&mut self) {
+        let pc = Arc::clone(&self.connection);
+        self.runtime_handle.spawn(async move {
+            let _ = pc.close().await;
+        });
+        // The senders die with `self`, which ends both loops at their next `recv()`. The abort
+        // covers a worker that is mid-await — a write the peer has stopped acknowledging, an SDP
+        // that is still being applied — and would otherwise outlive the connection it serves.
+        for worker in &self.workers {
+            worker.abort();
+        }
+    }
 }
 
 pub(crate) fn create_peer_connection(
@@ -79,7 +116,7 @@ pub(crate) fn create_peer_connection(
         handle.block_on(async { Arc::new(api.new_peer_connection(config).await.unwrap()) });
 
     let (signal_queue_tx, signal_queue_rx) = mpsc::unbounded_channel::<PeerSignal>();
-    handle.spawn(run_signal_queue(
+    let signal_worker = handle.spawn(run_signal_queue(
         connection.clone(),
         peer_id,
         signal_tx.clone(),
@@ -206,6 +243,16 @@ pub(crate) fn create_peer_connection(
             .unwrap()
     });
 
+    let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<(bytes::Bytes, bool)>();
+    // The writer owns the only handles to the channels this side keeps; the peer connection
+    // holds its own, so this is not what keeps them alive.
+    let outbound_worker = handle.spawn(run_outbound_queue(
+        peer_id,
+        Arc::clone(&reliable_channel),
+        Arc::clone(&unreliable_channel),
+        outbound_rx,
+    ));
+
     // Use the reliable channel for connection state signaling.
     {
         let ps_tx = peer_state_tx.clone();
@@ -273,10 +320,36 @@ pub(crate) fn create_peer_connection(
 
     NativePeerConnection {
         connection,
-        reliable_channel,
-        unreliable_channel,
         runtime_handle: handle,
         signal_queue: signal_queue_tx,
+        outbound: outbound_tx,
+        workers: [signal_worker, outbound_worker],
+    }
+}
+
+/// Write one peer's outbound packets, one at a time, in the order they were sent.
+///
+/// Ends when the sender is dropped, i.e. with the peer connection; see `NativePeerConnection::outbound`.
+async fn run_outbound_queue(
+    peer_id: u128,
+    reliable: Arc<RTCDataChannel>,
+    unreliable: Arc<RTCDataChannel>,
+    mut outbound: mpsc::UnboundedReceiver<(bytes::Bytes, bool)>,
+) {
+    while let Some((bytes, reliably)) = outbound.recv().await {
+        let (channel, label) = if reliably {
+            (&reliable, "reliable")
+        } else {
+            (&unreliable, "unreliable")
+        };
+        // Sending before the channel is open, or after it has closed, is the usual reason. Either
+        // way a packet the caller believes was sent was not, and that used to be silent.
+        if let Err(error) = channel.send(&bytes).await {
+            log::warn!(
+                "peer {peer_id:#x}: could not send {} bytes on the {label} channel: {error}",
+                bytes.len()
+            );
+        }
     }
 }
 
@@ -390,14 +463,10 @@ pub(crate) fn add_ice_candidate(pc: &NativePeerConnection, candidate_json: &str)
         .send(PeerSignal::IceCandidate(candidate_json.to_string()));
 }
 
+/// Queue a packet for this peer's writer. Order between calls is the order on the wire.
 pub(crate) fn send_message(pc: &NativePeerConnection, data: Box<[u8]>, reliable: bool) {
-    let dc = if reliable {
-        pc.reliable_channel.clone()
-    } else {
-        pc.unreliable_channel.clone()
-    };
     let bytes = bytes::Bytes::from(data.into_vec());
-    pc.runtime_handle.spawn(async move {
-        let _ = dc.send(&bytes).await;
-    });
+    // The only way this fails is a writer that has already ended, which only happens when the
+    // connection is being dropped — and a packet to a peer being dropped has nowhere to go.
+    let _ = pc.outbound.send((bytes, reliable));
 }

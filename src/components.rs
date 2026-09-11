@@ -6,17 +6,6 @@ use crate::PlayerUUID;
 /// The local player's network identity.
 ///
 /// Inserted as a resource when the local player creates or joins a lobby.
-/// Initially set to [`LOCAL_PLAYER_UUID`](crate::LOCAL_PLAYER_UUID) by
-/// [`EnsemblePlugin`](crate::EnsemblePlugin), then overwritten by the platform
-/// backend with the real player identity.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// fn my_system(local_id: Res<LocalMultiplayerPlayerId>) {
-///     println!("I am player {}", local_id.0);
-/// }
-/// ```
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LocalMultiplayerPlayerId(pub PlayerUUID);
 
@@ -188,3 +177,16 @@ pub struct PlayerOwned(pub Entity);
 #[derive(Component, Default)]
 #[relationship_target(relationship = PlayerOwned, linked_spawn)]
 pub struct PlayerOwnedEntities(Vec<Entity>);
+
+/// Who the host of this peer's session is.
+///
+/// On the host, its own [`LocalMultiplayerPlayerId`]; on a client, the identity of the peer it
+/// joined, set by the backend as part of joining — from the signalling server's answer, from the
+/// Steam lobby's owner — before any data channel carries traffic. Removed with the lobby.
+///
+/// This is the one fact the trust boundary rests on: a [`MessageAuthority::HostOnly`] message is
+/// accepted on a client only from this peer, whatever any packet claims about itself.
+///
+/// [`MessageAuthority::HostOnly`]: crate::MessageAuthority::HostOnly
+#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostUuid(pub PlayerUUID);

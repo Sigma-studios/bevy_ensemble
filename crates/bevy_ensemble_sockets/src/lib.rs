@@ -298,7 +298,7 @@ impl EnsembleSocket {
                 #[cfg(not(target_arch = "wasm32"))]
                 native::set_remote_answer(pc, &sdp);
                 #[cfg(target_arch = "wasm32")]
-                wasm::set_remote_answer(pc, &sdp);
+                wasm::set_remote_answer(pc, sender, &sdp);
             }
             PeerSignal::IceCandidate(candidate) => {
                 let Some(pc) = self.peers.get(&sender) else {
@@ -418,10 +418,17 @@ impl EnsembleSocket {
     }
 
     /// Disconnect a specific peer.
+    ///
+    /// Dropping the connection is what closes it. On native that is an explicit `close()` on the
+    /// `RTCPeerConnection` and the end of the peer's worker tasks, both from the connection's
+    /// `Drop` — webrtc-rs leaks its ICE agent and sockets otherwise — so [`disconnect_all`] and
+    /// dropping the socket close their peers the same way.
+    ///
+    /// [`disconnect_all`]: EnsembleSocket::disconnect_all
     pub fn disconnect_peer(&mut self, peer: u128) {
-        if let Some(_pc) = self.peers.remove(&peer) {
+        if self.peers.remove(&peer).is_some() {
             self.states.remove(&peer);
-            // Dropping the peer connection closes it.
+            self.routes.remove(&peer);
         }
     }
 
@@ -429,5 +436,6 @@ impl EnsembleSocket {
     pub fn disconnect_all(&mut self) {
         self.peers.clear();
         self.states.clear();
+        self.routes.clear();
     }
 }
