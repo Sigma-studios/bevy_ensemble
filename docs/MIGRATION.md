@@ -4,6 +4,32 @@ One section per phase of the netcode overhaul, in the order they landed. Each na
 what to change in a consumer, and why. Both peers of a session must be built from the same
 commit; the join handshake enforces it from phase E2 onward.
 
+## E4 — the first real join
+
+Nothing on the wire changed. The first session between two processes over a real data
+channel — `bevy_ticked`'s `netpeer` example, run by its multi-process test — never got past
+the join, twice, for reasons the in-process harness could not produce. Both fixed here, with
+loopback regression tests.
+
+### A backend's ready handshake is decoded before the protocol is compared
+
+**Before** every message from a peer whose protocol was not yet verified was held, the
+protocol handshake excepted. The WebRTC backend promotes a pending lobby on its own ready
+handshake, and the protocol handshake is announced on the promotion: held behind the
+comparison it was meant to lead to, the ready handshake never arrived and no real join
+completed. **After** `register_backend_handshake_message_type::<T>(name, authority)`
+registers a backend's ready handshake as one decoded before verification; the WebRTC and
+Steam backends use it. Every other control message still waits.
+**What to change** A third-party backend registers its ready handshake with the new method
+instead of `register_control_message_type`.
+
+### A protocol match that arrives before its seat is kept
+
+**Before** a client's protocol handshake that reached the host a frame before the host had
+promoted it found no `LobbyClient` to mark and was dropped; it is sent once, so the join then
+timed out. The same on a client whose lobby was still pending. **After** the match is
+remembered (`ProtocolMatched`) and applied when the seat appears. No change for consumers.
+
 ## E3 — ICE restart and connection state
 
 Nothing on the wire changed. A WebRTC session now survives a network path change — a phone

@@ -70,6 +70,10 @@ struct RegisteredEnsembleMessage {
     /// Whether the broadcast relay may carry this type. Control messages may not: a client that
     /// could wrap a roster change in an envelope would have the host announce it to everyone.
     relayable: bool,
+    /// Decoded before the sender's protocol has been compared. Only a backend's own ready
+    /// handshake: the message that promotes a pending lobby, which is what the protocol
+    /// handshake is announced on. Everything else waits.
+    pre_verification: bool,
     /// A pinned index outside the sorted space, for the handshake. `None` for everything else.
     fixed_index: Option<u16>,
 }
@@ -160,7 +164,7 @@ impl EnsembleMessageRegistry {
         authority: MessageAuthority,
         relayable: bool,
     ) {
-        self.register_inner::<T>(wire_name, authority, relayable, None);
+        self.register_inner::<T>(wire_name, authority, relayable, None, false);
     }
 
     /// Register a type under a pinned index outside the sorted space. Only the handshake.
@@ -174,7 +178,23 @@ impl EnsembleMessageRegistry {
             index == HANDSHAKE_INDEX,
             "the only pinned index is the handshake's"
         );
-        self.register_inner::<T>(wire_name, authority, false, Some(index));
+        self.register_inner::<T>(wire_name, authority, false, Some(index), false);
+    }
+
+    /// Register a backend's ready handshake: never relayed, and decoded before the sender's
+    /// protocol is compared, because it is the message that leads to the comparison.
+    pub fn register_pre_verification<T: EnsembleMessage>(
+        &mut self,
+        wire_name: &'static str,
+        authority: MessageAuthority,
+    ) {
+        self.register_inner::<T>(wire_name, authority, false, None, true);
+    }
+
+    /// Whether the type at `index` is decoded from a peer whose protocol is not yet verified.
+    pub fn is_pre_verification(&self, index: u16) -> bool {
+        self.entry(index)
+            .is_some_and(|entry| entry.pre_verification)
     }
 
     fn register_inner<T: EnsembleMessage>(
@@ -183,6 +203,7 @@ impl EnsembleMessageRegistry {
         authority: MessageAuthority,
         relayable: bool,
         fixed_index: Option<u16>,
+        pre_verification: bool,
     ) {
         let type_id = TypeId::of::<T>();
         let type_name = type_name::<T>();
@@ -218,6 +239,7 @@ impl EnsembleMessageRegistry {
             dispatch: dispatch_message::<T>,
             authority,
             relayable,
+            pre_verification,
             fixed_index,
         });
     }
@@ -507,7 +529,26 @@ pub(crate) fn decode_ensemble_packet_now(
     let mut all = true;
     let messages = unframe_packet(packet).unwrap_or_else(|| vec![packet]);
     for message in messages {
-        if packet_index(message) == Some(HANDSHAKE_INDEX) || verified {
+        // A backend's ready handshake is decoded before the protocol is compared: the WebRTC
+        // backend promotes a pending lobby on it, and the protocol handshake is announced on
+        // the promotion. Holding the one behind the other deadlocked every real join.
+        let index = packet_index(message);
+        let handshake = index.is_some_and(|index| {
+            index == HANDSHAKE_INDEX
+                || world
+                    .resource::<EnsembleMessageRegistry>()
+                    .is_pre_verification(index)
+        });
+        debug!(
+            "packet from {sender:#x}: {:?}, handshake {handshake}, sender verified {verified}",
+            index.and_then(|index| {
+                world
+                    .resource::<EnsembleMessageRegistry>()
+                    .entry(index)
+                    .map(|entry| entry.type_name)
+            })
+        );
+        if handshake || verified {
             all &= decode_one(world, Some(sender), message, received_at);
         } else {
             world
@@ -543,11 +584,14 @@ pub(crate) fn decode_verified_packet(
 /// kind verifies nobody.
 fn peer_is_verified(world: &mut World, sender: PlayerUUID) -> bool {
     let is_host = {
-        let mut hosts = world.query_filtered::<(), (With<Host>, Or<(With<Lobby>, With<PendingLobby>)>)>();
+        let mut hosts =
+            world.query_filtered::<(), (With<Host>, Or<(With<Lobby>, With<PendingLobby>)>)>();
         hosts.iter(world).next().is_some()
     };
     if is_host {
-        let mut clients = world.query_filtered::<&LobbyClientPlayerUuid, (With<LobbyClient>, With<HandshakeVerified>)>();
+        let mut clients = world
+            .query_filtered::<&LobbyClientPlayerUuid, (With<LobbyClient>, With<HandshakeVerified>)>(
+            );
         return clients.iter(world).any(|uuid| uuid.0 == sender);
     }
     let host_is_sender = world
@@ -556,7 +600,11 @@ fn peer_is_verified(world: &mut World, sender: PlayerUUID) -> bool {
     if !host_is_sender {
         return false;
     }
-    let mut lobbies = world.query_filtered::<(), (Or<(With<Lobby>, With<PendingLobby>)>, Without<Host>, With<HandshakeVerified>)>();
+    let mut lobbies = world.query_filtered::<(), (
+        Or<(With<Lobby>, With<PendingLobby>)>,
+        Without<Host>,
+        With<HandshakeVerified>,
+    )>();
     lobbies.iter(world).next().is_some()
 }
 
@@ -597,7 +645,12 @@ fn decode_one(
         return false;
     }
 
-    dispatch(world, sender, &packet[MESSAGE_TYPE_INDEX_BYTES..], received_at)
+    dispatch(
+        world,
+        sender,
+        &packet[MESSAGE_TYPE_INDEX_BYTES..],
+        received_at,
+    )
 }
 
 /// Whether `sender` may deliver a [`MessageAuthority::HostOnly`] message to this peer.
@@ -608,8 +661,8 @@ fn decode_one(
 /// joining, before the data channel carries anything.
 fn sender_is_trusted_for_host_only(world: &mut World, sender: Option<PlayerUUID>) -> bool {
     let is_client = {
-        let mut lobbies = world
-            .query_filtered::<(), (Or<(With<Lobby>, With<PendingLobby>)>, Without<Host>)>();
+        let mut lobbies =
+            world.query_filtered::<(), (Or<(With<Lobby>, With<PendingLobby>)>, Without<Host>)>();
         lobbies.iter(world).next().is_some()
     };
     if !is_client {

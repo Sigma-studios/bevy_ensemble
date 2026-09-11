@@ -1,13 +1,13 @@
 use bevy::prelude::*;
 
 use crate::{
-    Host, HostUuid, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipant, LobbyParticipantOf,
-    LocalMultiplayerPlayerId, PendingLobby, RequestLobby, SendMode,
-    session::{LobbyLeft, LobbyLeftReason},
+    Host, HostUuid, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipant,
+    LobbyParticipantOf, LocalMultiplayerPlayerId, PendingLobby, RequestLobby, SendMode,
     messages::{
         LobbyClientMessage, LobbyMessage, ReceivedEnsembleMessage, RemoveLobbyParticipant,
         StartHosting, SyncLobbyParticipant,
     },
+    session::{LobbyLeft, LobbyLeftReason},
 };
 
 /// Spawns a host lobby entity when [`StartHosting`] is received.
@@ -104,10 +104,7 @@ pub(crate) fn add_host_lobby_participant(
 pub(crate) fn add_remote_lobby_participants(
     mut commands: Commands,
     added_lobby_clients: Query<
-        (
-            &LobbyClientPlayerUuid,
-            &LobbyParticipantOf,
-        ),
+        (&LobbyClientPlayerUuid, &LobbyParticipantOf),
         (With<LobbyClient>, Added<LobbyClient>),
     >,
     existing_participants: Query<(&LobbyParticipant, &LobbyParticipantOf)>,
@@ -191,10 +188,12 @@ pub(crate) fn sync_host_lobby_participant_identity(
                 continue;
             }
 
-            commands.entity(participant_entity).try_insert(LobbyParticipant {
-                player_uuid: local_player_id.0,
-                is_host: true,
-            });
+            commands
+                .entity(participant_entity)
+                .try_insert(LobbyParticipant {
+                    player_uuid: local_player_id.0,
+                    is_host: true,
+                });
         }
     }
 }
@@ -227,7 +226,11 @@ pub(crate) fn broadcast_changed_lobby_participants(
         };
         commands
             .entity(participant_of.0)
-            .trigger(move |entity| LobbyMessage::<SyncLobbyParticipant> { entity, message, send_mode: SendMode::Reliable });
+            .trigger(move |entity| LobbyMessage::<SyncLobbyParticipant> {
+                entity,
+                message,
+                send_mode: SendMode::Reliable,
+            });
     }
 }
 

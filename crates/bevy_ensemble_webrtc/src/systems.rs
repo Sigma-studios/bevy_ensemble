@@ -1,10 +1,9 @@
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use bevy_ensemble::{
-    Host, HostUuid, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyJoinFailed, LobbyLeft,
-    LivenessGrace, LobbyLeftReason, LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId,
-    PeerRoute,
-    PendingLobby, PublicLobbies, PublicLobbyInfo, RemoveLobbyParticipant, RequestLobby,
+    Host, HostUuid, LivenessGrace, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyJoinFailed,
+    LobbyLeft, LobbyLeftReason, LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId,
+    PeerRoute, PendingLobby, PublicLobbies, PublicLobbyInfo, RemoveLobbyParticipant, RequestLobby,
     SerializedLobbyPacket, decode_ensemble_packet, encode_ensemble_message,
 };
 use bevy_ensemble_sockets::{PeerSignal, PeerState};
@@ -464,7 +463,12 @@ pub(crate) fn poll_socket_peers(
             PeerState::Connected => {
                 info!("Peer connected: {peer_id}");
                 // Back from a restart, or never away: liveness runs on its normal clock.
-                for entity in liveness_entity(peer_id, host_lobby.as_deref(), &lobby_clients, &client_lobbies) {
+                for entity in liveness_entity(
+                    peer_id,
+                    host_lobby.as_deref(),
+                    &lobby_clients,
+                    &client_lobbies,
+                ) {
                     commands.entity(entity).try_remove::<LivenessGrace>();
                 }
             }
@@ -480,7 +484,12 @@ pub(crate) fn poll_socket_peers(
                 // The liveness check must outlast the restart, or it ends the session the
                 // restart was about to save. The socket gives up after `ICE_RESTART_TIMEOUT`
                 // and reports `Failed`, which tears down on its own.
-                for entity in liveness_entity(peer_id, host_lobby.as_deref(), &lobby_clients, &client_lobbies) {
+                for entity in liveness_entity(
+                    peer_id,
+                    host_lobby.as_deref(),
+                    &lobby_clients,
+                    &client_lobbies,
+                ) {
                     commands.entity(entity).try_insert(LivenessGrace {
                         extra: bevy_ensemble_sockets::ICE_RESTART_TIMEOUT,
                     });
@@ -870,8 +879,7 @@ pub(crate) fn read_peer_messages(world: &mut World) {
         if let Some(host) = client_lobbies.iter(world).next() {
             (PeerRole::Client, host.map(|host| host.0))
         } else {
-            let mut host_lobbies =
-                world.query_filtered::<(), (With<Lobby>, With<Host>)>();
+            let mut host_lobbies = world.query_filtered::<(), (With<Lobby>, With<Host>)>();
             if host_lobbies.iter(world).next().is_some() {
                 (PeerRole::Host, None)
             } else {
@@ -985,7 +993,12 @@ mod trust_tests {
     #[test]
     fn a_client_reads_only_its_host_and_a_host_only_its_known_clients() {
         assert!(accept_packet_from(PeerRole::Client, Some(HOST), &[], HOST));
-        assert!(!accept_packet_from(PeerRole::Client, Some(HOST), &[], OTHER));
+        assert!(!accept_packet_from(
+            PeerRole::Client,
+            Some(HOST),
+            &[],
+            OTHER
+        ));
         assert!(!accept_packet_from(PeerRole::Client, None, &[], HOST));
         assert!(accept_packet_from(PeerRole::Host, None, &[OTHER], OTHER));
         assert!(!accept_packet_from(PeerRole::Host, None, &[OTHER], HOST));

@@ -169,7 +169,7 @@ impl Plugin for BevyEnsembleSteamPlugin {
         // A control message: never relayed by the broadcast path, and on a client only taken
         // from the host. That only restricts what a *client* accepts, so the client -> host
         // half of the handshake is unaffected.
-        .register_control_message_type::<SteamReadyHandshake>(
+        .register_backend_handshake_message_type::<SteamReadyHandshake>(
             "bevy_ensemble_steam/ReadyHandshake",
             MessageAuthority::HostOnly,
         )

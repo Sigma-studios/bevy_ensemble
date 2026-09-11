@@ -172,12 +172,15 @@ fn handle_h_key(
     }
 
     if let Some(lobby) = lobbies.iter().next() {
-        commands
-            .entity(lobby)
-            .trigger(|entity| BroadcastLobbyMessage::new(entity, ChatMessage {
-                sender_name: steam_client.friends().name(),
-                text: "Hello".to_string(),
-            }));
+        commands.entity(lobby).trigger(|entity| {
+            BroadcastLobbyMessage::new(
+                entity,
+                ChatMessage {
+                    sender_name: steam_client.friends().name(),
+                    text: "Hello".to_string(),
+                },
+            )
+        });
         return;
     }
 

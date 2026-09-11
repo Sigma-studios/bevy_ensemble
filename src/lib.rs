@@ -86,6 +86,7 @@ use bevy::prelude::*;
 
 mod broadcast;
 mod components;
+pub mod handshake;
 mod messages;
 #[cfg(feature = "netdebug")]
 mod netdebug;
@@ -93,9 +94,8 @@ mod netdebug;
 mod netmetrics;
 #[cfg(feature = "netdebug")]
 pub mod netsim;
-pub mod outbound;
-pub mod handshake;
 pub(crate) mod observers;
+pub mod outbound;
 mod ping;
 mod player_data;
 pub mod prelude;
@@ -106,8 +106,11 @@ mod systems;
 mod transport;
 mod types;
 
-pub use broadcast::{BroadcastLobbyMessage, LobbyBroadcastAppExt, LobbyBroadcastEnvelope, LobbyBroadcastPlugin};
+pub use broadcast::{
+    BroadcastLobbyMessage, LobbyBroadcastAppExt, LobbyBroadcastEnvelope, LobbyBroadcastPlugin,
+};
 pub use components::*;
+pub use handshake::{HandshakeVerified, ProtocolHandshake};
 pub use messages::*;
 #[cfg(feature = "netdebug")]
 pub use netdebug::{NetDebugConfig, NetDebugExtras, NetDebugPlugin};
@@ -115,24 +118,24 @@ pub use netdebug::{NetDebugConfig, NetDebugExtras, NetDebugPlugin};
 pub use netmetrics::{NetMetrics, NetMetricsPlugin};
 #[cfg(feature = "netdebug")]
 pub use netsim::{ChannelModel, NetPreset, NetSim, NetSimClock, NetSimConfig, NetSimPlugin};
+pub use outbound::{MAX_DATAGRAM_BYTES, OutboundBatches, UNRELIABLE_ADVISORY_BYTES};
 pub use ping::{
-    EnsemblePing, EnsemblePong, LivenessGrace, PeerLastPong, PeerReliableRtt, PeerRtt, PeerRttJitter, PeerTimeout,
-    PeerWireRtt,
+    EnsemblePing, EnsemblePong, LivenessGrace, PeerLastPong, PeerReliableRtt, PeerRtt,
+    PeerRttJitter, PeerTimeout, PeerWireRtt,
 };
 pub use player_data::{PlayerData, PlayerDataPlugin, SetPlayerData, SyncPlayerData};
 pub use registry::{
     EnsembleMessageRegistry, HANDSHAKE_INDEX, HeldUntilVerified, PROTOCOL_VERSION, RefusedPackets,
-    decode_ensemble_packet,
-    encode_ensemble_message, frame_packets, packet_index, unframe_packet,
+    decode_ensemble_packet, encode_ensemble_message, frame_packets, packet_index, unframe_packet,
 };
-pub use outbound::{MAX_DATAGRAM_BYTES, OutboundBatches, UNRELIABLE_ADVISORY_BYTES};
-pub use handshake::{HandshakeVerified, ProtocolHandshake};
-/// An `Instant` that also works on wasm. Every packet is stamped with one at the socket seam.
-pub use web_time::Instant;
 pub use route::PeerRoute;
-pub use session::{JoinLobby, LeaveLobby, LobbyJoinFailed, LobbyLeft, LobbyLeftReason, RefreshLobbies};
+pub use session::{
+    JoinLobby, LeaveLobby, LobbyJoinFailed, LobbyLeft, LobbyLeftReason, RefreshLobbies,
+};
 pub use transport::{EnsembleTransportAppExt, TransportBackend};
 pub use types::*;
+/// An `Instant` that also works on wasm. Every packet is stamped with one at the socket seam.
+pub use web_time::Instant;
 
 /// Core plugin that sets up the ensemble lobby and participant systems.
 ///
@@ -181,6 +184,7 @@ impl Plugin for EnsemblePlugin {
             .init_resource::<ping::OutstandingPings>()
             .init_resource::<outbound::OutboundBatches>()
             .init_resource::<registry::HeldUntilVerified>()
+            .init_resource::<handshake::ProtocolMatched>()
             .add_message::<StartHosting>()
             // Roster changes are the host's to make: a client accepts them only from its host.
             .register_control_message_type::<SyncLobbyParticipant>(
@@ -210,6 +214,7 @@ impl Plugin for EnsemblePlugin {
                 (
                     handshake::announce_protocol,
                     handshake::verify_protocol,
+                    handshake::verify_promoted_peers,
                     systems::spawn_host_lobby,
                     systems::publish_host_uuid,
                     systems::add_host_lobby_participant,

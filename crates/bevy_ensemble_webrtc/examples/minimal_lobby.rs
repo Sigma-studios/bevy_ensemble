@@ -360,12 +360,15 @@ fn handle_h_key(
             .as_ref()
             .map(|p| format!("Player {}", p.0 % 10000))
             .unwrap_or_else(|| "Me".to_string());
-        commands
-            .entity(lobby)
-            .trigger(|entity| BroadcastLobbyMessage::new(entity, ChatMessage {
-                sender_name,
-                text: "Hello".to_string(),
-            }));
+        commands.entity(lobby).trigger(|entity| {
+            BroadcastLobbyMessage::new(
+                entity,
+                ChatMessage {
+                    sender_name,
+                    text: "Hello".to_string(),
+                },
+            )
+        });
         return;
     }
 
@@ -417,9 +420,8 @@ fn handle_number_keys(
         kickable.sort();
 
         if let Some(&target_uuid) = kickable.get(pressed_index) {
-            if let Some((client_entity, _)) = lobby_clients
-                .iter()
-                .find(|(_, uuid)| uuid.0 == target_uuid)
+            if let Some((client_entity, _)) =
+                lobby_clients.iter().find(|(_, uuid)| uuid.0 == target_uuid)
             {
                 commands.entity(client_entity).try_despawn();
             }

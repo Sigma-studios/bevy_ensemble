@@ -110,7 +110,11 @@ fn reliable_bursts_arrive_in_order(burst_len: u32, bursts: u32) {
             );
             for (peer, bytes, _received_at) in pair.b.receive() {
                 assert_eq!(peer, A);
-                assert_eq!(bytes.len(), 8, "burst {burst}: a packet of the wrong size arrived");
+                assert_eq!(
+                    bytes.len(),
+                    8,
+                    "burst {burst}: a packet of the wrong size arrived"
+                );
                 let got_burst = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
                 let got_index = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
                 arrived.push((got_burst, got_index));
