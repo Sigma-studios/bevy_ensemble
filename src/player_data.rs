@@ -4,10 +4,12 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    messages::MessageAuthority,
     Host, Lobby, LobbyClient, LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId,
     PendingLobby, PlayerUUID, SendMode,
-    messages::{EnsembleAppExt, EnsembleMessage, LobbyClientMessage, LobbyMessage, ReceivedEnsembleMessage},
+    messages::MessageAuthority,
+    messages::{
+        EnsembleAppExt, EnsembleMessage, LobbyClientMessage, LobbyMessage, ReceivedEnsembleMessage,
+    },
 };
 
 /// Per-player data synchronized across the lobby.

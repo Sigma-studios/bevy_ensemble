@@ -398,7 +398,7 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
             // A control message: never relayed through the broadcast path, and on a client
             // taken only from the host. `from_host: true` from anybody else is refused before it
             // is decoded, on top of the sender check in `promote_client_lobby_on_host_handshake`.
-            .register_control_message_type::<handshake::WebrtcReadyHandshake>(
+            .register_backend_handshake_message_type::<handshake::WebrtcReadyHandshake>(
                 "bevy_ensemble_webrtc/ReadyHandshake",
                 MessageAuthority::HostOnly,
             )

@@ -316,7 +316,11 @@ impl SeededRng {
     /// A generator that produces the same sequence for the same `seed`. Zero is remapped,
     /// because a zero xorshift state never leaves zero.
     pub fn new(seed: u64) -> Self {
-        Self(if seed == 0 { 0x2545_f491_4f6c_dd1d } else { seed })
+        Self(if seed == 0 {
+            0x2545_f491_4f6c_dd1d
+        } else {
+            seed
+        })
     }
 
     pub fn next_u64(&mut self) -> u64 {
@@ -335,7 +339,11 @@ impl SeededRng {
 
     /// Uniform in `0..bound`; `0` when `bound` is `0`.
     pub fn below(&mut self, bound: u64) -> u64 {
-        if bound == 0 { 0 } else { self.next_u64() % bound }
+        if bound == 0 {
+            0
+        } else {
+            self.next_u64() % bound
+        }
     }
 }
 
@@ -371,7 +379,11 @@ impl SentPacket {
     /// Whether `needle` occurs anywhere in the payload. The test for "this secret never left the
     /// host" is one `iter().any(|p| p.contains(secret))`.
     pub fn contains(&self, needle: &[u8]) -> bool {
-        !needle.is_empty() && self.bytes.windows(needle.len()).any(|window| window == needle)
+        !needle.is_empty()
+            && self
+                .bytes
+                .windows(needle.len())
+                .any(|window| window == needle)
     }
 
     pub fn was_delivered(&self) -> bool {
@@ -694,7 +706,10 @@ impl LoopbackNetwork {
         if let Some(lobby) = self.peers[peer.0].lobby.take() {
             self.peers[peer.0].app.world_mut().despawn(lobby);
         }
-        self.peers[peer.0].app.world_mut().remove_resource::<HostUuid>();
+        self.peers[peer.0]
+            .app
+            .world_mut()
+            .remove_resource::<HostUuid>();
         self.despawn_lobby_client(uuid);
     }
 
@@ -937,7 +952,9 @@ impl LoopbackNetwork {
     /// Bytes handed to the network from `from` to `to` since creation, delivered or not. Counted
     /// whether or not tracing is on.
     pub fn bytes_sent(&self, from: PeerId, to: PeerId) -> u64 {
-        self.sent.get(&(from.0, to.0)).map_or(0, |(_, bytes)| *bytes)
+        self.sent
+            .get(&(from.0, to.0))
+            .map_or(0, |(_, bytes)| *bytes)
     }
 
     /// Packets handed to the network from `from` to `to` since creation.

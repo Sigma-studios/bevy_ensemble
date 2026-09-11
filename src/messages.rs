@@ -143,6 +143,15 @@ pub trait EnsembleAppExt {
         wire_name: &'static str,
         authority: MessageAuthority,
     ) -> &mut Self;
+
+    /// Register a backend's ready handshake: the control message that promotes a pending
+    /// lobby. Decoded before the sender's protocol has been compared, because the protocol
+    /// handshake is announced on the promotion; every other type waits for the comparison.
+    fn register_backend_handshake_message_type<T: EnsembleMessage>(
+        &mut self,
+        wire_name: &'static str,
+        authority: MessageAuthority,
+    ) -> &mut Self;
 }
 
 impl EnsembleAppExt for App {
@@ -167,6 +176,20 @@ impl EnsembleAppExt for App {
         authority: MessageAuthority,
     ) -> &mut Self {
         register::<T>(self, wire_name, authority, false)
+    }
+
+    fn register_backend_handshake_message_type<T: EnsembleMessage>(
+        &mut self,
+        wire_name: &'static str,
+        authority: MessageAuthority,
+    ) -> &mut Self {
+        self.init_resource::<EnsembleMessageRegistry>()
+            .add_message::<ReceivedEnsembleMessage<T>>()
+            .add_observer(observers::encode_lobby_message::<T>)
+            .add_observer(observers::encode_lobby_client_message::<T>);
+        let mut registry = self.world_mut().resource_mut::<EnsembleMessageRegistry>();
+        registry.register_pre_verification::<T>(wire_name, authority);
+        self
     }
 }
 

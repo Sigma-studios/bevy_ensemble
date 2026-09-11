@@ -9,41 +9,64 @@
 //! the registration trait, and core identity types.
 
 pub use crate::{
-    // Plugin
-    EnsemblePlugin, LobbyBroadcastPlugin,
-
     // Broadcast
-    BroadcastLobbyMessage, LobbyBroadcastAppExt,
+    BroadcastLobbyMessage,
+    // Messages & events
+    EnsembleAppExt,
+    // Plugin
+    EnsemblePlugin,
+    // Transport
+    EnsembleTransportAppExt,
+    // Lobby components
+    Host,
+    // Session requests
+    JoinLobby,
+    LeaveLobby,
+    Lobby,
+    LobbyBroadcastAppExt,
 
-    // Player data
-    PlayerData, PlayerDataPlugin, SetPlayerData,
+    LobbyBroadcastPlugin,
+
+    LobbyClient,
+    LobbyJoinFailed,
+    LobbyMessage,
+    // Participant components
+    LobbyParticipant,
+    LobbyParticipantOf,
+    LobbyParticipants,
 
     // Identity
-    LocalMultiplayerPlayerId, PlayerUUID,
+    LocalMultiplayerPlayerId,
+    // Ping
+    PeerLastPong,
+    PeerRoute,
+    PeerRtt,
+    PeerRttJitter,
+    PeerWireRtt,
 
-    // Lobby components
-    Host, Lobby, LobbyClient, PendingLobby,
+    PendingLobby,
 
-    // Participant components
-    LobbyParticipant, LobbyParticipantOf, LobbyParticipants,
+    // Player data
+    PlayerData,
+    PlayerDataPlugin,
+    // Ownership
+    PlayerOwned,
+    PlayerOwnedEntities,
+
+    PlayerUUID,
 
     // Lobby discovery
-    PublicLobbies, PublicLobbyInfo,
+    PublicLobbies,
+    PublicLobbyInfo,
 
-    // Ownership
-    PlayerOwned, PlayerOwnedEntities,
+    ReceivedEnsembleMessage,
+    RefreshLobbies,
+    SendMode,
+    SetPlayerData,
 
-    // Ping
-    PeerLastPong, PeerRoute, PeerRtt, PeerRttJitter, PeerWireRtt,
+    StartHosting,
 
-    // Messages & events
-    EnsembleAppExt, LobbyMessage, ReceivedEnsembleMessage, SendMode, StartHosting,
-
-    // Transport
-    EnsembleTransportAppExt, TransportBackend,
-
-    // Session requests
-    JoinLobby, LeaveLobby, LobbyJoinFailed, RefreshLobbies,
+    TransportBackend,
 };
 
 // Network metrics (feature `netmetrics`).

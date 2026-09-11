@@ -31,7 +31,9 @@ async fn main() {
             eprintln!("Connection closed before Welcome");
             std::process::exit(1);
         };
-        let Message::Binary(bytes) = msg else { continue };
+        let Message::Binary(bytes) = msg else {
+            continue;
+        };
         match decode::<ServerMessage>(&bytes) {
             Ok(ServerMessage::Welcome { player_uuid }) => {
                 eprintln!("Authenticated (uuid: {player_uuid})");
@@ -57,7 +59,9 @@ async fn main() {
             eprintln!("Connection closed before LobbyList");
             std::process::exit(1);
         };
-        let Message::Binary(bytes) = msg else { continue };
+        let Message::Binary(bytes) = msg else {
+            continue;
+        };
         match decode::<ServerMessage>(&bytes) {
             Ok(ServerMessage::LobbyList { lobbies }) => {
                 if lobbies.is_empty() {
