@@ -4,6 +4,61 @@ One section per phase of the netcode overhaul, in the order they landed. Each na
 what to change in a consumer, and why. Both peers of a session must be built from the same
 commit; the join handshake enforces it from phase E2 onward.
 
+## E3 — ICE restart and connection state
+
+Nothing on the wire changed. A WebRTC session now survives a network path change — a phone
+moving from Wi-Fi to cellular, a NAT rebinding a mapping — by restarting ICE and renegotiating
+through the signalling server with the data channels kept. Before, ICE `disconnected` was logged
+and hoped about, and `failed` ended the session.
+
+### `PeerState` gained `Connecting` and `Reconnecting`
+
+**Before** `PeerState` was `Connected | Disconnected | Failed`.
+**After** `Connecting | Connected | Reconnecting | Disconnected | Failed`. `Connecting` is
+reported once, first, for every peer. `Reconnecting` is reported from `Connected` when ICE loses
+the path and is restarting; `Connected` follows when a new pair is nominated, `Failed` if none is
+found within `ICE_RESTART_TIMEOUT` (15 s) or after `MAX_ICE_RESTARTS` (3) — both `pub const` in
+`bevy_ensemble_sockets`. Nothing is reported after `Failed`.
+**What to change** An exhaustive `match` on `PeerState` needs the two new arms. The right
+reaction to `Reconnecting` is to do nothing: the channels are open, sends are queued by SCTP and
+delivered when the path is back, and the socket will say `Connected` or `Failed`. Tearing down
+on it turns a two-second blip into a lost session.
+**Watch** `connected_peers()` now includes `Reconnecting` peers, since their channels are open.
+Code that used it to mean "ICE has a pair right now" should track `update_peers` itself.
+
+### `EnsembleSocket::restart_ice(peer)`
+
+New. Restarts ICE on demand — for a "reconnect" button, or a test. Only the side that made the
+original offer (the host, in the WebRTC backend) can restart, because a restart is an offer and
+the other side's offers are refused; on the answerer it logs and does nothing, and the offerer's
+ICE agent notices the same loss on its own. Counts against `MAX_ICE_RESTARTS`.
+
+### What a game sees
+
+On the host, a client whose path changes stays a `LobbyClient` throughout; on the client, the
+lobby stands. `poll_socket_peers` logs `Reconnecting` at info and does nothing else. The only
+new outcome is `Failed` *after* a session was up, when the restart finds no path in time: the
+same teardown as `Disconnected` (`LobbyLeft { HostGone }` on the client, the `LobbyClient`
+despawned on the host) plus a `LobbyJoinFailed` whose reason says the connection was lost rather
+than never made.
+
+`EnsembleSocket::discarded_candidates()` is new too: a count of remote ICE candidates the
+transport refused, zero on a healthy socket, for soak tests to assert on. The native backend now
+holds its own candidates until the offer or answer they belong to has been sent, so that a
+restart's regathered candidates cannot arrive ahead of the offer that carries its credentials.
+
+### `LivenessGrace`: the liveness check waits for the restart
+
+New component in `bevy_ensemble`. `PeerTimeout` (default 5 s) would otherwise end the session a
+restart was about to save: ICE takes a few seconds to notice a lost path and a restart a few
+more. While a peer is `Reconnecting`, the WebRTC backend inserts
+`LivenessGrace { extra: ICE_RESTART_TIMEOUT }` on that peer's entity (the `LobbyClient` on the
+host, the lobby on a client) and removes it on `Connected`; `detect_dead_peers` adds `extra` to
+the timeout while it is present. The grace adds, it does not replace: a peer that never comes
+back is dropped after timeout plus grace, and a restart that fails reports `Failed` and tears
+down on its own before that. A game or another backend with its own reason to expect silence
+(a suspended tab it was told about) may insert it too.
+
 ## E2 — protocol v2: named types, a join handshake, framed datagrams, real latency
 
 **This is a wire-format change.** Every peer of a session must be built from this commit or

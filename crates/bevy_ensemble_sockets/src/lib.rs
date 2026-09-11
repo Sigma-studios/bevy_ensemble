@@ -1,15 +1,23 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
+mod recovery;
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Monotonic clock used to stamp received messages (works natively and on wasm).
 pub use web_time::Instant;
 
 /// Signal data exchanged between peers via the signalling server.
+///
+/// A second `Offer` on a connection that exists is a renegotiation — in this crate, always an
+/// ICE restart — and is answered like the first. Nothing new on the wire for that: an offer is
+/// an offer, and the SDP inside it is what says the ICE credentials changed.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum PeerSignal {
     Offer(String),
@@ -17,17 +25,59 @@ pub enum PeerSignal {
     IceCandidate(String),
 }
 
-/// Peer connection state.
+/// How long a peer may stay [`Reconnecting`](PeerState::Reconnecting) before it is
+/// [`Failed`](PeerState::Failed).
+///
+/// Measured from the moment the loss was noticed, across however many restart offers fit in it.
+/// A network switch that is going to work is done in a second or two — gather, one round of
+/// checks, a nominated pair — so fifteen is not a budget a restart spends; it is how long a game
+/// keeps a player's seat warm before deciding they are gone.
+pub const ICE_RESTART_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How many ICE restarts one connection may make, [`restart_ice`](EnsembleSocket::restart_ice)
+/// included, before a lost path is reported [`Failed`](PeerState::Failed) instead.
+///
+/// Bounded because a restart that keeps being needed is a path that keeps going away, and a
+/// connection that spends the session reconnecting is worse to play against than one that ends.
+pub const MAX_ICE_RESTARTS: u32 = 3;
+
+/// Peer connection state, as reported by [`EnsembleSocket::update_peers`].
+///
+/// The order a connection goes through them: `Connecting`, then `Connected`; from there
+/// `Reconnecting` and back to `Connected` any number of times (bounded by [`MAX_ICE_RESTARTS`]),
+/// and finally `Disconnected` or `Failed`. Nothing is reported after `Failed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerState {
+    /// A connection has been created and nothing has happened on it yet: an offer is being made
+    /// or answered, candidates are being gathered, no pair has been checked.
+    ///
+    /// Reported once, first, for every peer. It is what lets a listener tell "this peer is on
+    /// its way" from "this peer was never heard of", which before this were the same silence.
+    Connecting,
+    /// The reliable data channel is open. Traffic flows.
     Connected,
+    /// ICE lost the path to this peer and is restarting: new candidates are being gathered and
+    /// a fresh offer/answer is going through the signalling server. The data channels are still
+    /// open, and whatever is sent meanwhile is queued by SCTP and delivered once a pair is found
+    /// again — so a game keeps sending, and keeps the player's seat.
+    ///
+    /// The usual causes are a phone switching from Wi-Fi to cellular and a NAT rebinding a
+    /// mapping mid-session. Ends in `Connected` when ICE finds a pair, or in `Failed` after
+    /// [`ICE_RESTART_TIMEOUT`] or [`MAX_ICE_RESTARTS`], whichever comes first. Only the side
+    /// that made the original offer restarts; the other side reports this state while it waits
+    /// for the restart offer.
+    Reconnecting,
+    /// A connection that was open has ended: the data channel closed, or the peer was
+    /// disconnected on purpose.
     Disconnected,
-    /// The connection will not be happening: ICE found no working pair, or the transport gave up.
+    /// The connection is over and will not be coming back: ICE found no working pair, the
+    /// transport gave up, or a restart did not find a path in time.
     ///
     /// Distinct from [`Disconnected`](PeerState::Disconnected), which means a connection that
-    /// existed has ended. This one never opened, and the difference matters to whoever is
-    /// listening: a peer that drops mid-session was playing a moment ago, where a peer that
-    /// fails to connect leaves somebody waiting on a screen that will never change.
+    /// existed has ended cleanly. This one either never opened or was lost and could not be
+    /// restored, and the difference matters to whoever is listening: a peer that drops
+    /// mid-session was playing a moment ago, where a peer that fails to connect leaves somebody
+    /// waiting on a screen that will never change.
     Failed,
 }
 
@@ -137,6 +187,15 @@ pub struct EnsembleSocket {
     peers: HashMap<u128, wasm::WasmPeerConnection>,
     states: HashMap<u128, PeerState>,
     routes: HashMap<u128, PeerRoute>,
+    /// When each peer currently `Reconnecting` was first reported so, for [`ICE_RESTART_TIMEOUT`].
+    ///
+    /// Checked from [`update_peers`](EnsembleSocket::update_peers) rather than by a timer task,
+    /// because the game already calls that every frame on both platforms, and a deadline that
+    /// is polled needs no runtime, no `setTimeout`, and nothing to cancel when the peer goes.
+    reconnecting_since: HashMap<u128, Instant>,
+    /// Remote candidates the transport refused, over the socket's lifetime. See
+    /// [`discarded_candidates`](EnsembleSocket::discarded_candidates).
+    discarded_candidates: Arc<AtomicU64>,
     ice_servers: IceServers,
     #[cfg(not(target_arch = "wasm32"))]
     runtime_handle: tokio::runtime::Handle,
@@ -161,6 +220,8 @@ impl EnsembleSocket {
             peers: HashMap::new(),
             states: HashMap::new(),
             routes: HashMap::new(),
+            reconnecting_since: HashMap::new(),
+            discarded_candidates: Arc::new(AtomicU64::new(0)),
             ice_servers: IceServers::default(),
             runtime_handle,
         }
@@ -184,6 +245,8 @@ impl EnsembleSocket {
             peers: HashMap::new(),
             states: HashMap::new(),
             routes: HashMap::new(),
+            reconnecting_since: HashMap::new(),
+            discarded_candidates: Arc::new(AtomicU64::new(0)),
             ice_servers: IceServers::default(),
         }
     }
@@ -209,14 +272,16 @@ impl EnsembleSocket {
         {
             let pc = native::create_peer_connection(
                 peer_id,
+                recovery::Role::Offerer,
                 self.signal_tx.clone(),
                 self.peer_state_tx.clone(),
                 self.route_tx.clone(),
                 self.message_tx.clone(),
                 &self.ice_servers,
+                Arc::clone(&self.discarded_candidates),
                 self.runtime_handle.clone(),
             );
-            native::create_offer(&pc, peer_id, self.signal_tx.clone(), &self.runtime_handle);
+            native::create_offer(&pc, false);
             self.peers.insert(peer_id, pc);
         }
 
@@ -224,15 +289,52 @@ impl EnsembleSocket {
         {
             let pc = wasm::create_peer_connection(
                 peer_id,
+                recovery::Role::Offerer,
                 self.signal_tx.clone(),
                 self.peer_state_tx.clone(),
                 self.route_tx.clone(),
                 self.message_tx.clone(),
                 &self.ice_servers,
+                Arc::clone(&self.discarded_candidates),
             );
-            wasm::create_offer(&pc, peer_id, self.signal_tx.clone());
+            wasm::create_offer(&pc, false);
             self.peers.insert(peer_id, pc);
         }
+    }
+
+    /// Restart ICE on the connection to `peer`: gather candidates afresh and renegotiate through
+    /// the signalling server, keeping the data channels and whatever is queued on them.
+    ///
+    /// What the socket does by itself when ICE reports the path lost; public so that a game's
+    /// "reconnect" button can do it on demand — a player who knows they just changed networks
+    /// need not wait for ICE to notice. `Reconnecting` is reported, then `Connected` when the new
+    /// pair is nominated, or `Failed` after [`ICE_RESTART_TIMEOUT`].
+    ///
+    /// Only the side that made the original offer can restart, because a restart *is* an offer
+    /// and this protocol refuses offers from the other side. On the answerer this logs and does
+    /// nothing: the offerer's ICE agent notices the same loss and restarts on its own.
+    ///
+    /// Counts against [`MAX_ICE_RESTARTS`]; past it, the peer is reported `Failed`.
+    pub fn restart_ice(&mut self, peer: u128) {
+        let Some(pc) = self.peers.get(&peer) else {
+            log::warn!("peer {peer:#x}: cannot restart ICE, no connection to it exists");
+            return;
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        native::restart_ice(pc);
+        #[cfg(target_arch = "wasm32")]
+        wasm::restart_ice(pc);
+    }
+
+    /// How many remote ICE candidates the transport has refused since this socket was made.
+    ///
+    /// A candidate is an address the peer will not send again, so each one refused is a route
+    /// that can never be tried, and losing every candidate on both sides is a connection that
+    /// gathers happily and never pairs. The count is zero on a healthy socket; the candidates
+    /// that arrive before the description they belong to are held, not refused. Exposed so
+    /// that a soak test can assert that, rather than grep a log for it.
+    pub fn discarded_candidates(&self) -> u64 {
+        self.discarded_candidates.load(Ordering::Relaxed)
     }
 
     /// Handle an incoming signal from a remote peer.
@@ -251,11 +353,28 @@ impl EnsembleSocket {
     pub fn receive_signal(&mut self, sender: u128, signal: PeerSignal) {
         match signal {
             PeerSignal::Offer(sdp) => {
-                if self.peers.contains_key(&sender) {
-                    log::warn!(
-                        "peer {sender:#x}: ignoring a second offer; a connection to it already \
-                         exists. Both sides may believe they are the offerer."
-                    );
+                if let Some(pc) = self.peers.get(&sender) {
+                    // A second offer from the peer this side answered is a renegotiation, which
+                    // here means its ICE restarted (see `restart_ice`). Answered like the first;
+                    // the transport reads the new credentials out of the SDP and restarts its
+                    // own agent to match. A second offer from a peer this side *offered to* is
+                    // glare, and stays refused.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let answerer = native::role(pc) == recovery::Role::Answerer;
+                    #[cfg(target_arch = "wasm32")]
+                    let answerer = wasm::role(pc) == recovery::Role::Answerer;
+                    if !answerer {
+                        log::warn!(
+                            "peer {sender:#x}: ignoring a second offer; a connection to it \
+                             already exists. Both sides may believe they are the offerer."
+                        );
+                        return;
+                    }
+                    log::info!("peer {sender:#x}: applying a new offer from it, restarting ICE");
+                    #[cfg(not(target_arch = "wasm32"))]
+                    native::accept_offer(pc, &sdp);
+                    #[cfg(target_arch = "wasm32")]
+                    wasm::accept_offer(pc, &sdp);
                     return;
                 }
                 log::info!("peer {sender:#x}: applying its offer, answering as the callee");
@@ -264,11 +383,13 @@ impl EnsembleSocket {
                 {
                     let pc = native::create_peer_connection(
                         sender,
+                        recovery::Role::Answerer,
                         self.signal_tx.clone(),
                         self.peer_state_tx.clone(),
                         self.route_tx.clone(),
                         self.message_tx.clone(),
                         &self.ice_servers,
+                        Arc::clone(&self.discarded_candidates),
                         self.runtime_handle.clone(),
                     );
                     native::accept_offer(&pc, &sdp);
@@ -279,13 +400,15 @@ impl EnsembleSocket {
                 {
                     let pc = wasm::create_peer_connection(
                         sender,
+                        recovery::Role::Answerer,
                         self.signal_tx.clone(),
                         self.peer_state_tx.clone(),
                         self.route_tx.clone(),
                         self.message_tx.clone(),
                         &self.ice_servers,
+                        Arc::clone(&self.discarded_candidates),
                     );
-                    wasm::accept_offer(&pc, sender, &sdp, self.signal_tx.clone());
+                    wasm::accept_offer(&pc, &sdp);
                     self.peers.insert(sender, pc);
                 }
             }
@@ -301,7 +424,7 @@ impl EnsembleSocket {
                 #[cfg(not(target_arch = "wasm32"))]
                 native::set_remote_answer(pc, &sdp);
                 #[cfg(target_arch = "wasm32")]
-                wasm::set_remote_answer(pc, sender, &sdp);
+                wasm::set_remote_answer(pc, &sdp);
             }
             PeerSignal::IceCandidate(candidate) => {
                 let Some(pc) = self.peers.get(&sender) else {
@@ -335,20 +458,71 @@ impl EnsembleSocket {
     /// `Disconnected` keeps its old meaning deliberately: a close on a channel that never opened
     /// says nothing a listener can act on, and reporting it would turn one failure into two
     /// events describing it differently.
+    ///
+    /// # Reconnecting, and the deadline on it
+    ///
+    /// `Reconnecting` is reported only from `Connected`: a restart is something that happens to
+    /// a connection that existed. It is also where [`ICE_RESTART_TIMEOUT`] starts — armed here
+    /// whether or not the report is passed on, so that a restart nobody was told about is still
+    /// bounded — and a peer still reconnecting when it runs out is reported `Failed` from this
+    /// method, on whichever call first finds it late.
+    ///
+    /// Nothing is reported after `Failed`. The transport may well find a pair a moment after the
+    /// deadline, and a `Connected` that follows a `Failed` would put a peer back into a session
+    /// that has already been torn down around it.
     pub fn update_peers(&mut self) -> Vec<(u128, PeerState)> {
         let mut changes = Vec::new();
         while let Ok((peer, state)) = self.peer_state_rx.try_recv() {
-            let report = match (self.states.get(&peer).copied(), state) {
+            let previous = self.states.get(&peer).copied();
+            match state {
+                PeerState::Reconnecting => {
+                    self.reconnecting_since
+                        .entry(peer)
+                        .or_insert_with(Instant::now);
+                }
+                PeerState::Connecting => {}
+                PeerState::Connected | PeerState::Disconnected | PeerState::Failed => {
+                    self.reconnecting_since.remove(&peer);
+                }
+            }
+            let report = match (previous, state) {
                 (Some(previous), current) if previous == current => false,
+                (Some(PeerState::Failed), _) => false,
+                (None, PeerState::Connecting) => true,
+                (Some(_), PeerState::Connecting) => false,
                 (_, PeerState::Connected) => true,
                 (_, PeerState::Failed) => true,
-                (Some(PeerState::Connected), PeerState::Disconnected) => true,
+                (Some(PeerState::Connected), PeerState::Reconnecting) => true,
+                (_, PeerState::Reconnecting) => false,
+                (Some(PeerState::Connected | PeerState::Reconnecting), PeerState::Disconnected) => {
+                    true
+                }
                 (_, PeerState::Disconnected) => false,
             };
             if report {
                 self.states.insert(peer, state);
                 changes.push((peer, state));
             }
+        }
+
+        let now = Instant::now();
+        let late: Vec<u128> = self
+            .reconnecting_since
+            .iter()
+            .filter(|(_, since)| now.duration_since(**since) >= ICE_RESTART_TIMEOUT)
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in late {
+            self.reconnecting_since.remove(&peer);
+            if self.states.get(&peer) == Some(&PeerState::Failed) {
+                continue;
+            }
+            log::warn!(
+                "peer {peer:#x}: ICE has not found a path again in {}s; giving up on it",
+                ICE_RESTART_TIMEOUT.as_secs()
+            );
+            self.states.insert(peer, PeerState::Failed);
+            changes.push((peer, PeerState::Failed));
         }
         changes
     }
@@ -376,11 +550,18 @@ impl EnsembleSocket {
         self.routes.get(&peer).copied()
     }
 
-    /// Currently connected peer IDs.
+    /// The peers whose data channels are open: `Connected`, and `Reconnecting` too.
+    ///
+    /// A peer whose ICE is restarting still has its channels, and a send to it is queued by
+    /// SCTP and delivered when the new pair is up — which is what a game wants, since the
+    /// pings and inputs sent during those seconds are what make the reconnect seamless rather
+    /// than a freeze followed by a catch-up. Leaving such a peer out here would make every
+    /// consumer that gates its sends on this list go silent for exactly the window that
+    /// decides whether the session survives.
     pub fn connected_peers(&self) -> impl Iterator<Item = u128> + '_ {
         self.states
             .iter()
-            .filter(|&(_, &state)| state == PeerState::Connected)
+            .filter(|&(_, &state)| matches!(state, PeerState::Connected | PeerState::Reconnecting))
             .map(|(&id, _)| id)
     }
 
@@ -435,6 +616,7 @@ impl EnsembleSocket {
         if self.peers.remove(&peer).is_some() {
             self.states.remove(&peer);
             self.routes.remove(&peer);
+            self.reconnecting_since.remove(&peer);
         }
     }
 
@@ -443,5 +625,6 @@ impl EnsembleSocket {
         self.peers.clear();
         self.states.clear();
         self.routes.clear();
+        self.reconnecting_since.clear();
     }
 }
