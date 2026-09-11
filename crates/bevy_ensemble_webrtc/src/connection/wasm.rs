@@ -38,6 +38,7 @@ impl WsHandlerBuilder {
                 Ok(pair) => pair,
                 Err(e) => {
                     error!("Failed to connect to signaling server at {server_url}: {e}");
+                    let _ = lobby_event_tx.send(LobbyEvent::SignallingClosed);
                     return;
                 }
             };
@@ -53,13 +54,18 @@ impl WsHandlerBuilder {
             };
             if ws_sink.send(WsMessage::Binary(auth_bytes)).await.is_err() {
                 error!("Failed to send authentication message");
+                let _ = lobby_event_tx.send(LobbyEvent::SignallingClosed);
                 return;
             }
 
+            // Whether the loop ended because the server went away, as opposed to the plugin
+            // dropping its end of the command channel to rebuild. Only the former is news.
+            let mut lost = false;
             loop {
                 futures_util::select! {
                     msg = ws_source.next() => {
-                        let Some(msg) = msg else { break; };
+                        // `None` is the socket closing, however it closed.
+                        let Some(msg) = msg else { lost = true; break; };
                         let bytes = match msg {
                             WsMessage::Binary(b) => b,
                             WsMessage::Text(_) => continue,
@@ -78,12 +84,17 @@ impl WsHandlerBuilder {
                             continue;
                         };
                         if ws_sink.send(WsMessage::Binary(bytes)).await.is_err() {
+                            lost = true;
                             break;
                         }
                     }
 
                     complete => break,
                 }
+            }
+            if lost {
+                warn!("the connection to the signaling server at {server_url} was lost");
+                let _ = lobby_event_tx.send(LobbyEvent::SignallingClosed);
             }
         });
     }

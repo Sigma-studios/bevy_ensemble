@@ -4,7 +4,9 @@ use bevy_ensemble::{
     PendingLobby, ReceivedEnsembleMessage, encode_ensemble_message,
 };
 
-use crate::{EnsembleSocketRes, LobbyClientWebrtcUuid, LobbyWebrtcId, PendingWebrtcLobbyClient};
+use crate::{
+    EnsembleSocketRes, LobbyClientWebrtcUuid, LobbyHostUuid, LobbyWebrtcId, PendingWebrtcLobbyClient,
+};
 
 /// How often a peer restates its readiness handshake, in seconds.
 ///
@@ -86,25 +88,58 @@ pub(crate) fn send_host_handshakes(
     }
 }
 
+/// Promote a client's pending lobby once its *host* says it is ready.
+///
+/// "Its host" is the peer the signalling server named in `LobbyJoined`, held on the lobby as
+/// [`LobbyHostUuid`]. A handshake claiming `from_host` from any other peer is ignored: the claim
+/// is a byte in a packet anybody can send, and acting on it would let whoever sent it first
+/// decide when this client believes it is in a session. The registry refuses such a packet before
+/// it is decoded (`HostOnly`); this is the same rule applied where the decision is made.
 pub(crate) fn promote_client_lobby_on_host_handshake(
     mut commands: Commands,
     mut messages: MessageReader<ReceivedEnsembleMessage<WebrtcReadyHandshake>>,
-    pending_client_lobbies: Query<Entity, (With<PendingLobby>, Without<Lobby>, Without<Host>)>,
+    pending_client_lobbies: Query<
+        (Entity, Option<&LobbyHostUuid>),
+        (With<PendingLobby>, Without<Lobby>, Without<Host>),
+    >,
 ) {
     for message in messages.read() {
         if !message.message.from_host {
             continue;
         }
 
-        let Some(entity) = pending_client_lobbies.iter().next() else {
+        let Some((entity, host)) = pending_client_lobbies.iter().next() else {
             continue;
         };
+        let Some(host) = host else {
+            debug!(
+                "ignoring a host handshake from {:#x?}: this client has not been told who its \
+                 host is yet",
+                message.sender
+            );
+            continue;
+        };
+        if !handshake_is_from_host(host.0, message.sender) {
+            warn!(
+                "ignoring a handshake claiming to be from the host: it came from {:#x?} and the \
+                 host is {:#x}",
+                message.sender, host.0
+            );
+            continue;
+        }
 
         commands
             .entity(entity)
             .remove::<PendingLobby>()
             .insert(Lobby);
     }
+}
+
+/// Whether a handshake that claims `from_host` actually came from `host`.
+///
+/// `None` is a locally self-delivered message, which is not the host either.
+pub(crate) fn handshake_is_from_host(host: u128, sender: Option<u128>) -> bool {
+    sender == Some(host)
 }
 
 pub(crate) fn promote_host_client_on_client_handshake(
@@ -143,5 +178,79 @@ pub(crate) fn promote_host_client_on_client_handshake(
             .entity(entity)
             .remove::<PendingWebrtcLobbyClient>()
             .insert(LobbyClient);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::prelude::*;
+    use bevy_ensemble::{
+        EnsembleAppExt, EnsemblePlugin, Host, HostUuid, Lobby, MessageAuthority, PendingLobby,
+        ReceivedEnsembleMessage,
+    };
+
+    use super::{WebrtcReadyHandshake, handshake_is_from_host, promote_client_lobby_on_host_handshake};
+    use crate::{LobbyHostUuid, LobbyWebrtcId};
+
+    const HOST: u128 = 0xA;
+    const OTHER: u128 = 0xB;
+
+    /// The promotion path with no socket under it: the handshake is written straight into the
+    /// message queue, as the decode step would after a packet came off a data channel.
+    fn app_with_a_pending_join() -> App {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, EnsemblePlugin))
+            .register_control_message_type::<WebrtcReadyHandshake>(MessageAuthority::HostOnly)
+            .add_systems(Update, promote_client_lobby_on_host_handshake)
+            .insert_resource(HostUuid(HOST));
+        app.world_mut()
+            .spawn((PendingLobby, LobbyWebrtcId(1), LobbyHostUuid(HOST)));
+        app
+    }
+
+    fn write_host_handshake(app: &mut App, sender: u128) {
+        app.world_mut()
+            .write_message(ReceivedEnsembleMessage {
+                sender: Some(sender),
+                message: WebrtcReadyHandshake { from_host: true },
+                received_at: std::time::Duration::ZERO,
+            });
+    }
+
+    fn lobby_is_promoted(app: &mut App) -> bool {
+        let world = app.world_mut();
+        let promoted = world
+            .query_filtered::<(), (With<Lobby>, Without<PendingLobby>, Without<Host>)>()
+            .iter(world)
+            .count();
+        let pending = world
+            .query_filtered::<(), (With<PendingLobby>, Without<Host>)>()
+            .iter(world)
+            .count();
+        assert_eq!(promoted + pending, 1, "the lobby entity should still exist, once");
+        promoted == 1
+    }
+
+    #[test]
+    fn a_handshake_claiming_host_from_another_peer_is_ignored() {
+        let mut app = app_with_a_pending_join();
+
+        write_host_handshake(&mut app, OTHER);
+        app.update();
+        assert!(
+            !lobby_is_promoted(&mut app),
+            "a `from_host` handshake from a peer that is not the host must not promote the lobby"
+        );
+
+        write_host_handshake(&mut app, HOST);
+        app.update();
+        assert!(lobby_is_promoted(&mut app), "the host's own handshake promotes it");
+    }
+
+    #[test]
+    fn the_host_check_is_on_the_sender_not_the_claim() {
+        assert!(handshake_is_from_host(HOST, Some(HOST)));
+        assert!(!handshake_is_from_host(HOST, Some(OTHER)));
+        assert!(!handshake_is_from_host(HOST, None));
     }
 }

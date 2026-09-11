@@ -27,7 +27,7 @@ use bevy::prelude::*;
 #[cfg(feature = "client")]
 pub use bevy_ensemble::PeerRtt;
 #[cfg(feature = "client")]
-use bevy_ensemble::{EnsembleAppExt, EnsembleTransportAppExt};
+use bevy_ensemble::{EnsembleAppExt, EnsembleTransportAppExt, MessageAuthority};
 #[cfg(feature = "client")]
 pub use bevy_ensemble_sockets::{IceServer, IceServers};
 
@@ -270,6 +270,15 @@ pub struct LobbyWebrtcId(pub u64);
 #[derive(Component)]
 pub struct LobbyClientWebrtcUuid(pub u128);
 
+/// On a client's lobby entity, the uuid of the peer hosting it, as the signalling server said.
+///
+/// The same fact as the [`HostUuid`](bevy_ensemble::HostUuid) resource, kept on the entity so the
+/// systems that answer "is this packet, offer or disconnect from my host?" can read it next to the
+/// lobby it belongs to. Inserted from `LobbyJoined`, before any data channel to the host exists.
+#[cfg(feature = "client")]
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LobbyHostUuid(pub u128);
+
 /// Temporary marker for lobby client entities awaiting handshake completion.
 #[cfg(feature = "client")]
 #[derive(Component)]
@@ -352,6 +361,7 @@ impl WebrtcRuntime {
             event_rx: std::sync::Mutex::new(lobby_event_rx),
             signal_rx: std::sync::Mutex::new(signal_rx),
             local_player_uuid: None,
+            signalling_lost: false,
         };
 
         (EnsembleSocketRes(socket), lobby_connection)
@@ -385,7 +395,13 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
             .add_message::<JoinWebrtcLobby>()
             .add_message::<JoinWebrtcLobbyByCode>()
             .add_message::<RefreshLobbyList>()
-            .register_ensemble_message_type::<handshake::WebrtcReadyHandshake>()
+            // A control message: never relayed through the broadcast path, and on a client
+            // taken only from the host. `from_host: true` from anybody else is refused before it
+            // is decoded, on top of the sender check in `promote_client_lobby_on_host_handshake`.
+            .register_control_message_type::<handshake::WebrtcReadyHandshake>(
+                MessageAuthority::HostOnly,
+            )
+            .init_resource::<systems::UntrustedPacketDrops>()
             .add_systems(
                 Update,
                 (
@@ -404,13 +420,21 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
                     systems::refresh_lobby_list,
                     systems::poll_socket_peers,
                     systems::poll_peer_routes,
-                    systems::pump_socket_signals,
+                    // After the lobby events so that, on the frame a client's `LobbyJoined` and
+                    // its host's offer both arrive, the host is known before the offer is judged.
+                    // The signalling server sends them in that order and the WebSocket task
+                    // forwards them in that order; this keeps it so across the two channels.
+                    systems::pump_socket_signals.after(systems::apply_lobby_events),
+                    systems::send_keep_alives,
                     handshake::send_client_handshakes,
                     handshake::send_host_handshakes,
                     handshake::promote_client_lobby_on_host_handshake,
                     handshake::promote_host_client_on_client_handshake,
                     systems::time_out_pending_lobbies,
-                    systems::detect_lobby_leave,
+                    // Leaving rebuilds the signalling connection; the reconnect below only
+                    // steps in when no leave is going to. Ordered so it can tell.
+                    systems::detect_lobby_leave.after(systems::apply_lobby_events),
+                    systems::reconnect_signalling.after(systems::detect_lobby_leave),
                 ),
             )
             // Drain the socket in PreUpdate so every Update reader (core and game) sees

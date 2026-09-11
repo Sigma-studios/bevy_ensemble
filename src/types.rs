@@ -4,13 +4,8 @@
 /// duration of their session. Platform backends are responsible for mapping their
 /// native player identifiers (e.g. Steam IDs) to this type.
 ///
-/// The special value [`LOCAL_PLAYER_UUID`] is used as a placeholder before the
-/// platform backend assigns a real identity.
+/// There is no placeholder value. A peer that does not yet know its identity has no
+/// [`LocalMultiplayerPlayerId`](crate::LocalMultiplayerPlayerId) resource at all, so code that
+/// needs one waits for it instead of adopting a stand-in — which is what a host once did, and
+/// took the host role under a uuid of zero.
 pub type PlayerUUID = u128;
-
-/// Placeholder identity used when no platform backend has assigned a real player UUID.
-///
-/// This value is set on the host's [`LocalMultiplayerPlayerId`](crate::LocalMultiplayerPlayerId)
-/// resource when [`StartHosting`](crate::StartHosting) is processed. The platform backend
-/// is expected to overwrite it with the real player identity once the lobby is created.
-pub const LOCAL_PLAYER_UUID: PlayerUUID = 0;
