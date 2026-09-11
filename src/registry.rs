@@ -57,7 +57,11 @@ impl EnsembleMessageRegistry {
         self.type_indices.insert(type_id, next_index);
     }
 
-    fn index_of<T: EnsembleMessage>(&self) -> Option<u16> {
+    /// The wire index `T` travels under, or `None` if it was never registered.
+    ///
+    /// Public so a test can pin a registry's shape without decoding it off the wire: one consumer
+    /// encoded a value of every type and read the two-byte prefix back, because this was private.
+    pub fn index_of<T: EnsembleMessage>(&self) -> Option<u16> {
         self.type_indices.get(&TypeId::of::<T>()).copied()
     }
 
