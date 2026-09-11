@@ -54,7 +54,7 @@ fn peer(uuid: u128) -> App {
         .insert_resource(TimeUpdateStrategy::ManualDuration(FRAME))
         .add_plugins((EnsemblePlugin, LoopbackTransportPlugin, LobbyBroadcastPlugin))
         .add_plugins(PlayerDataPlugin::<Name>::default())
-        .register_broadcast_message::<Chat>()
+        .register_broadcast_message::<Chat>("Chat")
         .insert_resource(LocalMultiplayerPlayerId(uuid))
         .init_resource::<Heard>()
         .init_resource::<Departures>()
@@ -86,6 +86,15 @@ fn refused(net: &LoopbackNetwork, peer: PeerId) -> u64 {
         .world()
         .get_resource::<RefusedPackets>()
         .map_or(0, RefusedPackets::total)
+}
+
+/// Packets `peer` is holding from `sender`, unread, because `sender` never verified a protocol
+/// with it.
+fn held_from(net: &LoopbackNetwork, peer: PeerId, sender: u128) -> usize {
+    net.app(peer)
+        .world()
+        .resource::<bevy_ensemble::HeldUntilVerified>()
+        .held_for(sender)
 }
 
 fn participants(net: &mut LoopbackNetwork, peer: PeerId) -> Vec<(u128, bool)> {
@@ -219,7 +228,8 @@ fn a_roster_sync_from_a_non_host_is_ignored() {
     net.deliver_raw(a, 3, bytes);
     net.run(4);
     assert_eq!(participants(&mut net, a), before, "no phantom host appeared");
-    assert!(refused(&net, a) > 0);
+    // B never verified a protocol with A — B is not A's host — so A holds B's bytes unread.
+    assert_eq!(held_from(&net, a, 3), 1);
 }
 
 #[test]
@@ -229,7 +239,7 @@ fn a_removal_from_a_non_host_does_not_remove_anyone() {
     net.deliver_raw(a, 3, bytes);
     net.run(4);
     assert!(has_lobby(&mut net, a), "A was told to leave by somebody who may not say so");
-    assert!(refused(&net, a) > 0);
+    assert_eq!(held_from(&net, a, 3), 1, "and never read what B said");
 }
 
 #[test]
@@ -273,7 +283,7 @@ fn player_data_on_a_client_is_taken_only_from_the_host() {
     net.deliver_raw(a, 3, bytes);
     net.run(4);
     assert_eq!(name_of(&mut net, a, 3), None);
-    assert!(refused(&net, a) > 0);
+    assert_eq!(held_from(&net, a, 3), 1);
 }
 
 #[test]
@@ -301,6 +311,7 @@ fn an_unsolicited_pong_is_ignored_and_an_absurd_one_cannot_poison_the_estimate()
             a,
             &EnsemblePong {
                 seq: seq.wrapping_mul(7919),
+                reliable: false,
                 dwell_micros: u32::MAX,
             },
         );

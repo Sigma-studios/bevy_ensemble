@@ -93,6 +93,8 @@ mod netdebug;
 mod netmetrics;
 #[cfg(feature = "netdebug")]
 pub mod netsim;
+pub mod outbound;
+pub mod handshake;
 pub(crate) mod observers;
 mod ping;
 mod player_data;
@@ -113,12 +115,20 @@ pub use netdebug::{NetDebugConfig, NetDebugExtras, NetDebugPlugin};
 pub use netmetrics::{NetMetrics, NetMetricsPlugin};
 #[cfg(feature = "netdebug")]
 pub use netsim::{ChannelModel, NetPreset, NetSim, NetSimClock, NetSimConfig, NetSimPlugin};
-pub use ping::{EnsemblePing, EnsemblePong, PeerLastPong, PeerRtt, PeerRttJitter, PeerTimeout, PeerWireRtt};
+pub use ping::{
+    EnsemblePing, EnsemblePong, PeerLastPong, PeerReliableRtt, PeerRtt, PeerRttJitter, PeerTimeout,
+    PeerWireRtt,
+};
 pub use player_data::{PlayerData, PlayerDataPlugin, SetPlayerData, SyncPlayerData};
 pub use registry::{
-    EnsembleMessageRegistry, RefusedPackets, decode_ensemble_packet, encode_ensemble_message,
-    packet_index,
+    EnsembleMessageRegistry, HANDSHAKE_INDEX, HeldUntilVerified, PROTOCOL_VERSION, RefusedPackets,
+    decode_ensemble_packet,
+    encode_ensemble_message, frame_packets, packet_index, unframe_packet,
 };
+pub use outbound::{MAX_DATAGRAM_BYTES, OutboundBatches, UNRELIABLE_ADVISORY_BYTES};
+pub use handshake::{HandshakeVerified, ProtocolHandshake};
+/// An `Instant` that also works on wasm. Every packet is stamped with one at the socket seam.
+pub use web_time::Instant;
 pub use route::PeerRoute;
 pub use session::{JoinLobby, LeaveLobby, LobbyJoinFailed, LobbyLeft, LobbyLeftReason, RefreshLobbies};
 pub use transport::{EnsembleTransportAppExt, TransportBackend};
@@ -157,23 +167,49 @@ pub enum EnsembleSet {
 impl Plugin for EnsemblePlugin {
     fn build(&self, app: &mut App) {
         session::register_session_messages(app);
+        // A client verifies its host's protocol and nobody else's. Pinned outside the sorted
+        // index space, so it decodes on a peer whose other indices disagree with ours.
+        messages::register_handshake::<handshake::ProtocolHandshake>(
+            app,
+            "bevy_ensemble/ProtocolHandshake",
+            MessageAuthority::HostOnly,
+        );
 
         app.init_resource::<EnsembleMessageRegistry>()
             .init_resource::<registry::RefusedPackets>()
             .init_resource::<ping::PeerTimeout>()
             .init_resource::<ping::OutstandingPings>()
+            .init_resource::<outbound::OutboundBatches>()
+            .init_resource::<registry::HeldUntilVerified>()
             .add_message::<StartHosting>()
             // Roster changes are the host's to make: a client accepts them only from its host.
-            .register_control_message_type::<SyncLobbyParticipant>(MessageAuthority::HostOnly)
-            .register_control_message_type::<RemoveLobbyParticipant>(MessageAuthority::HostOnly)
+            .register_control_message_type::<SyncLobbyParticipant>(
+                "bevy_ensemble/SyncLobbyParticipant",
+                MessageAuthority::HostOnly,
+            )
+            .register_control_message_type::<RemoveLobbyParticipant>(
+                "bevy_ensemble/RemoveLobbyParticipant",
+                MessageAuthority::HostOnly,
+            )
             // Pings go both ways; they are control traffic all the same, so the relay will not
             // carry one.
-            .register_control_message_type::<ping::EnsemblePing>(MessageAuthority::Any)
-            .register_control_message_type::<ping::EnsemblePong>(MessageAuthority::Any)
+            .register_control_message_type::<ping::EnsemblePing>(
+                "bevy_ensemble/Ping",
+                MessageAuthority::Any,
+            )
+            .register_control_message_type::<ping::EnsemblePong>(
+                "bevy_ensemble/Pong",
+                MessageAuthority::Any,
+            )
             .add_observer(observers::on_lobby_client_removed)
+            .add_observer(handshake::replay_held_packets)
+            // Everything encoded during the frame leaves as one packet per peer and channel.
+            .add_systems(Last, outbound::flush_outbound)
             .add_systems(
                 Update,
                 (
+                    handshake::announce_protocol,
+                    handshake::verify_protocol,
                     systems::spawn_host_lobby,
                     systems::publish_host_uuid,
                     systems::add_host_lobby_participant,

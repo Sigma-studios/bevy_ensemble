@@ -111,13 +111,26 @@ pub enum MessageAuthority {
     HostOnly,
 }
 
+/// Registering a message type gives it a **wire name**, and the wire name is what the type
+/// travels under.
+///
+/// The index in every packet is the type's rank among the sorted names of everything registered,
+/// so plugin order does not matter and two peers agree on every index exactly when they
+/// registered the same names. The name must be the same string on every peer and must not change
+/// once a build is in anybody's hands: renaming the Rust type is free, renaming the wire name is
+/// a protocol change (the join handshake will say so). Use `"<crate>/<Type>"` for anything a
+/// library registers, and the plain type name for a game's own messages.
 pub trait EnsembleAppExt {
     /// Register a message type that any peer may send. See [`MessageAuthority::Any`].
-    fn register_ensemble_message_type<T: EnsembleMessage>(&mut self) -> &mut Self;
+    fn register_ensemble_message_type<T: EnsembleMessage>(
+        &mut self,
+        wire_name: &'static str,
+    ) -> &mut Self;
 
     /// Register a message type with a stated [`MessageAuthority`].
     fn register_ensemble_message_type_with<T: EnsembleMessage>(
         &mut self,
+        wire_name: &'static str,
         authority: MessageAuthority,
     ) -> &mut Self;
 
@@ -127,42 +140,63 @@ pub trait EnsembleAppExt {
     /// deliver it to everyone as if the host had said it.
     fn register_control_message_type<T: EnsembleMessage>(
         &mut self,
+        wire_name: &'static str,
         authority: MessageAuthority,
     ) -> &mut Self;
 }
 
 impl EnsembleAppExt for App {
-    fn register_ensemble_message_type<T: EnsembleMessage>(&mut self) -> &mut Self {
-        self.register_ensemble_message_type_with::<T>(MessageAuthority::Any)
+    fn register_ensemble_message_type<T: EnsembleMessage>(
+        &mut self,
+        wire_name: &'static str,
+    ) -> &mut Self {
+        self.register_ensemble_message_type_with::<T>(wire_name, MessageAuthority::Any)
     }
 
     fn register_ensemble_message_type_with<T: EnsembleMessage>(
         &mut self,
+        wire_name: &'static str,
         authority: MessageAuthority,
     ) -> &mut Self {
-        register::<T>(self, authority, true)
+        register::<T>(self, wire_name, authority, true)
     }
 
     fn register_control_message_type<T: EnsembleMessage>(
         &mut self,
+        wire_name: &'static str,
         authority: MessageAuthority,
     ) -> &mut Self {
-        register::<T>(self, authority, false)
+        register::<T>(self, wire_name, authority, false)
     }
 }
 
-fn register<T: EnsembleMessage>(
+/// The handshake alone: pinned outside the sorted index space so it decodes on any peer.
+pub(crate) fn register_handshake<T: EnsembleMessage>(
     app: &mut App,
+    wire_name: &'static str,
+    authority: MessageAuthority,
+) {
+    app.init_resource::<EnsembleMessageRegistry>()
+        .add_message::<ReceivedEnsembleMessage<T>>()
+        .add_observer(observers::encode_lobby_message::<T>)
+        .add_observer(observers::encode_lobby_client_message::<T>);
+    let mut registry = app.world_mut().resource_mut::<EnsembleMessageRegistry>();
+    registry.register_fixed::<T>(wire_name, crate::registry::HANDSHAKE_INDEX, authority);
+}
+
+fn register<'a, T: EnsembleMessage>(
+    app: &'a mut App,
+    wire_name: &'static str,
     authority: MessageAuthority,
     relayable: bool,
-) -> &mut App {
+) -> &'a mut App {
     app.init_resource::<EnsembleMessageRegistry>()
         .add_message::<ReceivedEnsembleMessage<T>>()
         .add_observer(observers::encode_lobby_message::<T>)
         .add_observer(observers::encode_lobby_client_message::<T>);
 
     let mut registry = app.world_mut().resource_mut::<EnsembleMessageRegistry>();
-    registry.register::<T>(authority, relayable);
+    registry.register::<T>(wire_name, authority, relayable);
 
     app
 }
@@ -231,11 +265,11 @@ pub struct RemoveLobbyParticipant {
 pub struct ReceivedEnsembleMessage<T: EnsembleMessage> {
     pub sender: Option<PlayerUUID>,
     pub message: T,
-    /// Local [`Time`](bevy::time::Time) elapsed when this packet came off the socket
-    /// (i.e. at the inbound decode seam). This is the earliest moment the app can observe
-    /// the packet — used by the ping/RTT machinery to measure how long a peer held a
-    /// message before replying. `Duration::ZERO` for locally self-delivered messages.
-    pub received_at: std::time::Duration,
+    /// When the packet came off the socket, stamped by the backend on its receiving task — the
+    /// earliest moment anything in this process saw the bytes. The ping machinery measures a
+    /// peer's dwell and the round trip from it. `Instant::now()` at delivery for a message that
+    /// never touched a socket.
+    pub received_at: crate::Instant,
 }
 
 /// Entity event to broadcast a message from a lobby.

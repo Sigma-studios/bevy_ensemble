@@ -4,6 +4,79 @@ One section per phase of the netcode overhaul, in the order they landed. Each na
 what to change in a consumer, and why. Both peers of a session must be built from the same
 commit; the join handshake enforces it from phase E2 onward.
 
+## E2 — protocol v2: named types, a join handshake, framed datagrams, real latency
+
+**This is a wire-format change.** Every peer of a session must be built from this commit or
+later; the join handshake refuses anything else, and says which registration differs.
+
+### Every message type is registered under a wire name
+
+**Before**
+```rust
+app.register_ensemble_message_type::<ChatMessage>()
+   .register_broadcast_message::<Wave>();
+```
+**After**
+```rust
+app.register_ensemble_message_type::<ChatMessage>("ChatMessage")
+   .register_broadcast_message::<Wave>("Wave");
+```
+**Why** The index a type travels under is now its rank among the *sorted* wire names, not the
+order plugins happened to register in. Two peers agree on every index exactly when they
+registered the same names, and plugin order stops being a wire format. `wire_hash()` is the
+number the handshake compares; `wire_names()` is the list. Renaming the Rust type is free;
+renaming the wire name is a protocol change. Libraries use `"<crate>/<Type>"`.
+**Delete** Golden tests that pin registration order; the `ProtocolEpoch` phantom component
+bevy_kart registered to fold this registry's shape into another handshake; any comment saying
+"plugin add order is part of the wire format".
+**Watch** Registration after the first message has been encoded or decoded panics with the
+latecomer's name. Register in `build`.
+
+### The join handshake
+
+The core sends a `ProtocolHandshake` (version, hash, sorted names) on every new `Lobby` and
+`LobbyClient`. A match inserts `HandshakeVerified` on the client's lobby entity and on the host's
+`LobbyClient`; anything that must not send to an unverified peer waits for it. A mismatch ends the
+join on both sides: the client gets `LobbyLeft { reason: ProtocolMismatch(text) }` and
+`LobbyJoinFailed`, the host despawns the `LobbyClient` and gets `LobbyJoinFailed`, and `text`
+names the first differing registration. Backends' own ready handshakes are unchanged.
+
+### One datagram per peer per channel per frame
+
+Every message encoded during a frame is batched and flushed in `Last` as one
+`SerializedLobbyPacket` per `(peer, channel)`, framed under a reserved type index. A single
+message is not framed and costs what it did. `ReliableNoDelay` goes alone. Frames never exceed
+`MAX_DATAGRAM_BYTES` (60 000); an unreliable frame past `UNRELIABLE_ADVISORY_BYTES` (1 200) is
+logged once. `NetMetrics` gained `tx_messages`, `rx_messages` and `largest_unreliable_packet`;
+`tx_packets`/`rx_packets` now count datagrams.
+**Watch** A backend observing `SerializedLobbyPacket` sees it at the end of the frame, not at
+the trigger. A packet addressed to an entity despawned earlier in the frame (the kick
+notification) no longer resolves on backends that look the entity up; the loopback backend
+remembers recent clients and still delivers it.
+
+### `received_at` is an `Instant`
+
+`ReceivedEnsembleMessage::received_at` is `bevy_ensemble::Instant` (a `web_time::Instant`, so it
+works on wasm), stamped by the backend on its receiving task — not `Time::elapsed()` at decode.
+`decode_ensemble_packet` takes it as a fourth argument. Peer dwell is now the time an app really
+held a ping, and `PeerWireRtt` is no longer identical to `PeerRtt`. Backends that construct
+`ReceivedEnsembleMessage` themselves pass `Instant::now()`.
+
+### Pings on both channels
+
+`EnsemblePing`/`EnsemblePong` carry `reliable: bool`; one of each goes out per interval. The new
+`PeerReliableRtt` is the round trip on the reliable, ordered channel — retransmits and
+head-of-line blocking included — which is what a lockstep buffer has to cover. `PeerRtt`,
+`PeerWireRtt` and `PeerRttJitter` keep their meaning (unreliable channel).
+
+### What to delete in consumers
+
+| Consumer | Delete | Use instead |
+|---|---|---|
+| bevy_kart `src/main.rs`, `src/wire_format.rs` | `ProtocolEpoch`, "plugin add order is the wire format" | `wire_hash()`, the handshake |
+| squiggles `tests/wire_format.rs` | pinning every index | `wire_names()` |
+| bevy_ticked lockstep adaptive buffer | sizing from `PeerRtt` | `PeerReliableRtt` |
+
 ## E1 — the trust boundary, liveness, and no placeholder identity
 
 Nothing on the wire changed shape. What changed is who is believed.

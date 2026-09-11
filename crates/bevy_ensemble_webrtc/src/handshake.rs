@@ -200,7 +200,10 @@ mod tests {
     fn app_with_a_pending_join() -> App {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, EnsemblePlugin))
-            .register_control_message_type::<WebrtcReadyHandshake>(MessageAuthority::HostOnly)
+            .register_control_message_type::<WebrtcReadyHandshake>(
+                "bevy_ensemble_webrtc/ReadyHandshake",
+                MessageAuthority::HostOnly,
+            )
             .add_systems(Update, promote_client_lobby_on_host_handshake)
             .insert_resource(HostUuid(HOST));
         app.world_mut()
@@ -213,7 +216,7 @@ mod tests {
             .write_message(ReceivedEnsembleMessage {
                 sender: Some(sender),
                 message: WebrtcReadyHandshake { from_host: true },
-                received_at: std::time::Duration::ZERO,
+                received_at: bevy_ensemble::Instant::now(),
             });
     }
 
