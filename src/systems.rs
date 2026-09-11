@@ -191,7 +191,7 @@ pub(crate) fn sync_host_lobby_participant_identity(
                 continue;
             }
 
-            commands.entity(participant_entity).insert(LobbyParticipant {
+            commands.entity(participant_entity).try_insert(LobbyParticipant {
                 player_uuid: local_player_id.0,
                 is_host: true,
             });
@@ -278,7 +278,7 @@ pub(crate) fn apply_received_lobby_participants(
                         && existing.player_uuid == message.message.player_uuid
                 })
         {
-            commands.entity(participant_entity).insert(participant);
+            commands.entity(participant_entity).try_insert(participant);
             continue;
         }
 
@@ -289,7 +289,7 @@ pub(crate) fn apply_received_lobby_participants(
             .iter()
             .find(|(player_uuid, _)| *player_uuid == message.message.player_uuid)
         {
-            commands.entity(*participant_entity).insert(participant);
+            commands.entity(*participant_entity).try_insert(participant);
             continue;
         }
 

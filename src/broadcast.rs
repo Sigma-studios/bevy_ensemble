@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     Host, Lobby, LocalMultiplayerPlayerId, PlayerUUID, SendMode,
     messages::{EnsembleAppExt, EnsembleMessage, LobbyMessage, MessageAuthority, ReceivedEnsembleMessage},
-    registry::{EnsembleMessageRegistry, decode_ensemble_packet, encode_ensemble_message, packet_index, refuse},
+    registry::{EnsembleMessageRegistry, decode_verified_packet, encode_ensemble_message, packet_index, refuse},
 };
 
 /// Internal envelope that wraps a serialized broadcast message with its original sender.
@@ -85,12 +85,12 @@ impl<T: EnsembleMessage> BroadcastLobbyMessage<T> {
 ///    .register_broadcast_message::<ChatMessage>();
 /// ```
 pub trait LobbyBroadcastAppExt {
-    fn register_broadcast_message<T: EnsembleMessage>(&mut self) -> &mut Self;
+    fn register_broadcast_message<T: EnsembleMessage>(&mut self, wire_name: &'static str) -> &mut Self;
 }
 
 impl LobbyBroadcastAppExt for App {
-    fn register_broadcast_message<T: EnsembleMessage>(&mut self) -> &mut Self {
-        self.register_ensemble_message_type::<T>()
+    fn register_broadcast_message<T: EnsembleMessage>(&mut self, wire_name: &'static str) -> &mut Self {
+        self.register_ensemble_message_type::<T>(wire_name)
             .add_observer(encode_broadcast_message::<T>);
         self
     }
@@ -115,7 +115,10 @@ impl Plugin for LobbyBroadcastPlugin {
         // Second receive stage: decode broadcast envelopes into their inner messages. Runs
         // in PreUpdate right after the socket drain so the inner `ReceivedEnsembleMessage`s
         // reach Update readers the same frame — matching direct (non-broadcast) messages.
-        app.register_control_message_type::<LobbyBroadcastEnvelope>(MessageAuthority::HostOnly)
+        app.register_control_message_type::<LobbyBroadcastEnvelope>(
+            "bevy_ensemble/BroadcastEnvelope",
+            MessageAuthority::HostOnly,
+        )
             .add_systems(
                 PreUpdate,
                 relay_broadcast_envelopes.after(crate::EnsembleSet::ReceivePackets),
@@ -150,12 +153,11 @@ fn encode_broadcast_message<T: EnsembleMessage>(
     let is_host = host_lobbies.get(message.entity).is_ok();
 
     if is_host {
-        // Locally self-delivered (never touched the socket), so there is no wire receive
-        // time to record.
+        // Locally self-delivered (never touched the socket): it arrived now.
         local_writer.write(ReceivedEnsembleMessage {
             sender: Some(sender),
             message: message.message.clone(),
-            received_at: std::time::Duration::ZERO,
+            received_at: crate::Instant::now(),
         });
     }
 
@@ -200,8 +202,16 @@ fn relay_broadcast_envelopes(world: &mut World) {
     };
 
     for envelope in &envelopes {
+        let received_at = envelope.received_at;
         let Some(lobby) = host_entity else {
-            decode_ensemble_packet(world, Some(envelope.message.sender), &envelope.message.payload);
+            // The envelope came from the verified host, which vouches for the inner sender;
+            // the payload is not held for a verification the inner sender will never get here.
+            decode_verified_packet(
+                world,
+                Some(envelope.message.sender),
+                &envelope.message.payload,
+                received_at,
+            );
             continue;
         };
 
@@ -231,6 +241,6 @@ fn relay_broadcast_envelopes(world: &mut World) {
             send_mode,
         });
 
-        decode_ensemble_packet(world, Some(sender), &envelope.message.payload);
+        decode_verified_packet(world, Some(sender), &envelope.message.payload, received_at);
     }
 }

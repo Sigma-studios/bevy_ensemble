@@ -114,7 +114,11 @@ impl<T: EnsembleMessage> Default for PlayerDataPlugin<T> {
 impl<T: EnsembleMessage> Plugin for PlayerDataPlugin<T> {
     fn build(&self, app: &mut App) {
         app.init_resource::<PendingPlayerData<T>>()
-            .register_control_message_type::<SyncPlayerData<T>>(MessageAuthority::HostOnly)
+            .register_control_message_type::<SyncPlayerData<T>>(
+                // One name per data type, or two `PlayerDataPlugin`s would collide.
+                std::any::type_name::<SyncPlayerData<T>>(),
+                MessageAuthority::HostOnly,
+            )
             .add_observer(handle_set_player_data::<T>)
             .add_systems(
                 Update,

@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 use bevy_ensemble::{
-    EnsembleAppExt, EnsembleTransportAppExt, Host, HostUuid, Lobby, LobbyClient,
+    EnsembleAppExt, EnsembleTransportAppExt, Host, HostUuid, Instant, Lobby, LobbyClient,
     LobbyClientPlayerUuid, LobbyJoinFailed, LobbyLeft, LobbyLeftReason, LobbyParticipantOf,
     LocalMultiplayerPlayerId, MessageAuthority, PendingLobby, RequestLobby, SerializedLobbyPacket,
     decode_ensemble_packet, encode_ensemble_message,
@@ -169,7 +169,10 @@ impl Plugin for BevyEnsembleSteamPlugin {
         // A control message: never relayed by the broadcast path, and on a client only taken
         // from the host. That only restricts what a *client* accepts, so the client -> host
         // half of the handshake is unaffected.
-        .register_control_message_type::<SteamReadyHandshake>(MessageAuthority::HostOnly)
+        .register_control_message_type::<SteamReadyHandshake>(
+            "bevy_ensemble_steam/ReadyHandshake",
+            MessageAuthority::HostOnly,
+        )
         .init_resource::<CurrentSteamLobby>()
         .add_systems(Startup, (announce_local_identity, setup_join_policy))
         .add_observer(forget_lobby)
@@ -746,6 +749,9 @@ fn read_messages(world: &mut World, mut refused: Local<u64>) {
                 .networking_messages()
                 .receive_messages_on_channel(0, BATCH_SIZE)
         };
+        // Steam is polled, so this is the earliest point the bytes are known to have
+        // arrived: one stamp for the whole drained batch.
+        let received_at = Instant::now();
 
         let count = messages.len();
 
@@ -768,7 +774,12 @@ fn read_messages(world: &mut World, mut refused: Local<u64>) {
             if gate.role == PeerRole::Host {
                 ensure_pending_lobby_client_for_remote_world(world, steam_id);
             }
-            decode_ensemble_packet(world, Some(u128::from(steam_id.raw())), msg.data());
+            decode_ensemble_packet(
+                world,
+                Some(u128::from(steam_id.raw())),
+                msg.data(),
+                received_at,
+            );
         }
 
         if count < BATCH_SIZE {

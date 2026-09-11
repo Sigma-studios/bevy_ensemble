@@ -992,6 +992,7 @@ dependencies = [
  "bevy",
  "postcard",
  "serde",
+ "web-time",
 ]
 
 [[package]]
@@ -1017,6 +1018,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "web-time",
  "webrtc",
 ]
 

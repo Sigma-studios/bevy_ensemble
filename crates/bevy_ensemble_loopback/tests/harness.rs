@@ -14,6 +14,7 @@ use bevy_ensemble::prelude::*;
 use bevy_ensemble::{
     EnsembleMessageRegistry, EnsemblePlugin, Host, Lobby, LobbyClient, LobbyClientPlayerUuid,
     LobbyMessage, LocalMultiplayerPlayerId, PendingLobby, ReceivedEnsembleMessage, SendMode,
+    unframe_packet,
 };
 use bevy_ensemble_loopback::{
     Link, LoopbackNetwork, LoopbackTransportPlugin, PacketFate, PeerId, SeededRng, SentPacket,
@@ -40,18 +41,20 @@ fn peer(uuid: u128) -> App {
     app.add_plugins(MinimalPlugins)
         .insert_resource(TimeUpdateStrategy::ManualDuration(FRAME))
         .add_plugins((EnsemblePlugin, LoopbackTransportPlugin))
-        .register_ensemble_message_type::<Ping>()
+        .register_ensemble_message_type::<Ping>("Ping")
         .insert_resource(LocalMultiplayerPlayerId(uuid))
         .init_resource::<Received>()
         .add_systems(Update, collect);
     app
 }
 
-/// A host and one client, both attached and connected.
+/// A host and one client, attached, connected, and past the protocol handshake — which is
+/// what a real join looks like by the time a game sends anything.
 fn pair() -> (LoopbackNetwork, PeerId, PeerId) {
     let mut net = LoopbackNetwork::new(FRAME);
     let host = net.add_host(1, peer(1));
     let client = net.add_client(2, peer(2));
+    net.run(4);
     (net, host, client)
 }
 
@@ -85,7 +88,9 @@ fn values(net: &LoopbackNetwork, peer: PeerId) -> Vec<u32> {
 }
 
 /// The traced packets that carry a `Ping` from `from` to `to`. `bevy_ensemble` keeps its own
-/// traffic on the wire (roster sync, pings), so a test about one packet must pick it out.
+/// traffic on the wire (roster sync, pings) and batches everything sent to one peer on one
+/// channel in a frame into one packet, so a test about one message must find the packet it rode
+/// in.
 fn pings(net: &LoopbackNetwork, from: PeerId, to: PeerId) -> Vec<SentPacket> {
     let index = net
         .app(from)
@@ -94,9 +99,13 @@ fn pings(net: &LoopbackNetwork, from: PeerId, to: PeerId) -> Vec<SentPacket> {
         .index_of::<Ping>()
         .expect("registered")
         .to_le_bytes();
+    let carries_ping = |bytes: &[u8]| match unframe_packet(bytes) {
+        Some(inner) => inner.iter().any(|m| m.starts_with(&index)),
+        None => bytes.starts_with(&index),
+    };
     net.trace()
         .iter()
-        .filter(|p| p.from == from && p.to == to && p.bytes.starts_with(&index))
+        .filter(|p| p.from == from && p.to == to && carries_ping(&p.bytes))
         .cloned()
         .collect()
 }
@@ -117,10 +126,10 @@ fn has<C: Component>(net: &mut LoopbackNetwork, peer: PeerId) -> bool {
 #[test]
 fn one_step_is_exactly_one_frame() {
     let (mut net, host, _client) = pair();
-    assert_eq!(net.frame(), 0);
+    let before = net.frame();
     net.step();
     net.step();
-    assert_eq!(net.frame(), 2);
+    assert_eq!(net.frame(), before + 2);
     let delta = net.app(host).world().resource::<Time>().delta();
     assert_eq!(delta, FRAME, "the app's clock must move by the frame the network models");
 }
@@ -160,10 +169,13 @@ fn an_unreliable_packet_can_be_duplicated() {
 #[test]
 fn an_unreliable_packet_can_be_reordered() {
     let (mut net, host, client) = pair();
-    net.set_link(Link::perfect().with_reorder(1.0));
+    // Two messages sent in one frame share a datagram, so an overtake needs the first packet
+    // still in flight when the second is sent: a few frames of delay on the link.
+    net.set_link(Link::delayed(FRAME * 3).with_reorder(1.0));
     send(&mut net, client, host, Ping(1), SendMode::Unreliable);
+    net.step();
     send(&mut net, client, host, Ping(2), SendMode::Unreliable);
-    net.run(4);
+    net.run(8);
     assert_eq!(values(&net, host), vec![2, 1], "the second overtook the first");
 }
 
@@ -233,7 +245,7 @@ fn a_half_open_peer_receives_but_is_never_heard() {
 
     net.reconnect(client);
     send(&mut net, client, host, Ping(3), SendMode::Reliable);
-    net.run(3);
+    net.run(6);
     assert_eq!(values(&net, host), vec![3]);
 }
 
@@ -248,16 +260,21 @@ fn a_pending_client_is_not_in_the_roster_until_promoted() {
     assert!(!has::<Lobby>(&mut net, client));
     assert_eq!(lobby_clients(&mut net, host), 0, "the host has not been told");
 
-    // The data channel is up before the join is finished: the client's packets already flow.
+    // The data channel is up before the join is finished: the client's packets already flow —
+    // and are held at the host until the join finishes and the protocol is verified, because
+    // until then the host has no idea what its bytes mean.
     send(&mut net, client, host, Ping(1), SendMode::Reliable);
     net.run(3);
-    assert_eq!(values(&net, host), vec![1]);
+    assert!(values(&net, host).is_empty(), "held, not read");
+    assert_eq!(net.app(host).world().resource::<bevy_ensemble::HeldUntilVerified>().held_for(2), 1);
 
     net.promote(client);
     assert!(net.is_connected(client));
     assert!(!has::<PendingLobby>(&mut net, client));
     assert!(has::<Lobby>(&mut net, client));
     assert_eq!(lobby_clients(&mut net, host), 1);
+    net.run(4);
+    assert_eq!(values(&net, host), vec![1], "replayed once verified");
     send(&mut net, host, client, Ping(2), SendMode::Reliable);
     net.run(3);
     assert_eq!(values(&net, client), vec![2]);
@@ -291,7 +308,7 @@ fn a_peer_can_leave_and_rejoin_with_the_same_identity() {
     assert_eq!(lobby_clients(&mut net, host), 1);
     assert_eq!(net.uuid(client), 2);
     send(&mut net, client, host, Ping(5), SendMode::Reliable);
-    net.run(3);
+    net.run(6);
     assert_eq!(received(&net, host), vec![(2, 5)]);
 }
 
@@ -314,7 +331,7 @@ fn rehosting_moves_the_lobby_and_everyone_has_to_rejoin() {
     net.rejoin(old_host);
     assert_eq!(lobby_clients(&mut net, a), 2);
     send(&mut net, b, a, Ping(8), SendMode::Reliable);
-    net.run(3);
+    net.run(6);
     assert_eq!(received(&net, a), vec![(3, 8)]);
 }
 
@@ -335,6 +352,9 @@ fn a_frozen_peer_neither_sends_nor_reads_until_it_runs_again() {
 #[test]
 fn the_trace_records_bytes_and_fates() {
     let (mut net, host, client) = pair();
+    // Counters run from creation; the trace from when it is switched on. Compare deltas.
+    let packets_before = net.packets_sent(client, host);
+    let bytes_before = net.bytes_sent(client, host);
     net.trace_packets(true);
     send(&mut net, client, host, Ping(0xAB), SendMode::Reliable);
     net.run(2);
@@ -351,9 +371,9 @@ fn the_trace_records_bytes_and_fates() {
         .iter()
         .filter(|p| p.from == client && p.to == host)
         .collect();
-    assert_eq!(net.packets_sent(client, host), all.len() as u64);
+    assert_eq!(net.packets_sent(client, host) - packets_before, all.len() as u64);
     assert_eq!(
-        net.bytes_sent(client, host),
+        net.bytes_sent(client, host) - bytes_before,
         all.iter().map(|p| p.bytes.len() as u64).sum::<u64>()
     );
     let taken = net.take_trace().len();
@@ -365,15 +385,25 @@ fn drop_next_loses_exactly_the_packets_asked_for() {
     let (mut net, host, client) = pair();
     net.trace_packets(true);
     net.drop_next(client, host, 2);
+    // One message per frame, so each is its own datagram (give or take a control message that
+    // shares the frame with it).
     for value in 0..4 {
         send(&mut net, client, host, Ping(value), SendMode::Unreliable);
+        net.step();
     }
     net.run(3);
-    assert_eq!(values(&net, host), vec![2, 3]);
     let sent = pings(&net, client, host);
-    assert_eq!(sent[0].fate, PacketFate::Dropped);
-    assert_eq!(sent[1].fate, PacketFate::Dropped);
-    assert!(sent[2].was_delivered());
+    let dropped = sent.iter().filter(|p| p.fate == PacketFate::Dropped).count();
+    let delivered: Vec<u32> = values(&net, host);
+    assert_eq!(sent.len(), 4);
+    assert_eq!(delivered.len() + dropped, 4, "every ping was either dropped or delivered");
+    assert!(dropped <= 2);
+    let all_dropped = net
+        .trace()
+        .iter()
+        .filter(|p| p.from == client && p.to == host && p.fate == PacketFate::Dropped)
+        .count();
+    assert_eq!(all_dropped, 2, "exactly two datagrams were lost on the link");
 }
 
 #[test]
@@ -381,6 +411,7 @@ fn corrupt_next_rewrites_one_packet_and_the_decoder_survives_it() {
     let (mut net, host, client) = pair();
     net.corrupt_next(client, host, |bytes| bytes.truncate(1));
     send(&mut net, client, host, Ping(1), SendMode::Reliable);
+    net.step();
     send(&mut net, client, host, Ping(2), SendMode::Reliable);
     net.run(3);
     assert_eq!(values(&net, host), vec![2], "the truncated one is refused, the next is fine");
@@ -395,9 +426,10 @@ fn deliver_raw_puts_bytes_in_front_of_the_decoder() {
         let bytes: Vec<u8> = (0..len).map(|_| rng.next_u64() as u8).collect();
         net.deliver_raw(host, net.uuid(client), bytes);
     }
+    let before = net.frame();
     net.run(2);
     // No panic is the assertion; anything that happened to decode as a `Ping` is fine too.
-    assert!(net.frame() == 2);
+    assert_eq!(net.frame(), before + 2);
 }
 
 #[test]
@@ -432,7 +464,7 @@ fn a_disconnected_peer_is_gone_from_the_host_and_can_reconnect() {
     net.reconnect(client);
     assert_eq!(lobby_clients(&mut net, host), 1);
     send(&mut net, host, client, Ping(4), SendMode::Reliable);
-    net.run(3);
+    net.run(6);
     assert_eq!(values(&net, client), vec![4]);
 }
 

@@ -4,8 +4,8 @@ use std::time::Duration;
 use bevy::prelude::*;
 
 use crate::{
-    Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LocalMultiplayerPlayerId, PendingLobby,
-    ReceivedEnsembleMessage, SendMode,
+    Host, Instant, Lobby, LobbyClient, LobbyClientPlayerUuid, LocalMultiplayerPlayerId,
+    PendingLobby, ReceivedEnsembleMessage, SendMode,
     messages::{LobbyClientMessage, LobbyMessage},
     session::{LobbyLeft, LobbyLeftReason},
 };
@@ -40,6 +40,11 @@ const MAX_ROUND_TRIP_SECS: f64 = 30.0;
 #[derive(Message, Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EnsemblePing {
     pub seq: u32,
+    /// Sent on the reliable, ordered channel rather than the unreliable one. Each interval one of
+    /// each goes out, because the two channels are two different paths: the reliable one carries
+    /// retransmits and head-of-line blocking that a lockstep stream has to cover, and pinging
+    /// only the unreliable one told a buffer sized from it that those did not exist.
+    pub reliable: bool,
 }
 
 /// Internal pong response: the ping's sequence number plus how long the responder held it.
@@ -47,6 +52,7 @@ pub struct EnsemblePing {
 #[derive(Message, Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EnsemblePong {
     pub seq: u32,
+    pub reliable: bool,
     /// `t3 - t2` in microseconds: how long the responder spent between the ping coming off its
     /// socket seam and this pong leaving, on the responder's clock. Subtracting it from the
     /// round trip cancels the responder's clock offset and its in-app time. Clamped by the
@@ -58,12 +64,12 @@ pub struct EnsemblePong {
 /// The pings this peer has sent and would still accept an answer to: `(seq, sent_at)`.
 #[derive(Resource, Debug, Default)]
 pub(crate) struct OutstandingPings {
-    sent: VecDeque<(u32, f64)>,
+    sent: VecDeque<(u32, Instant)>,
     next_seq: u32,
 }
 
 impl OutstandingPings {
-    fn issue(&mut self, now: f64) -> u32 {
+    fn issue(&mut self, now: Instant) -> u32 {
         self.next_seq = self.next_seq.wrapping_add(1);
         let seq = self.next_seq;
         self.sent.push_back((seq, now));
@@ -77,7 +83,7 @@ impl OutstandingPings {
     ///
     /// Not removed on match: a host's ping goes to every client with one sequence number, and
     /// every client's pong for it is a measurement.
-    fn sent_at(&self, seq: u32) -> Option<f64> {
+    fn sent_at(&self, seq: u32) -> Option<Instant> {
         self.sent
             .iter()
             .find(|(sent_seq, _)| *sent_seq == seq)
@@ -103,6 +109,14 @@ pub struct PeerRtt(pub f64);
 /// genuine network RTT. Added alongside [`PeerRtt`].
 #[derive(Component, Debug, Clone, Copy)]
 pub struct PeerWireRtt(pub f64);
+
+/// Round trip measured on the reliable, ordered channel, in seconds.
+///
+/// Includes whatever retransmission and head-of-line delay that channel is carrying, which
+/// [`PeerRtt`] — measured on the unreliable channel — cannot see. A buffer that has to cover a
+/// reliable stream, as a lockstep action stream is, sizes itself from this one.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct PeerReliableRtt(pub f64);
 
 /// How much a peer's round trip varies, in seconds: an EMA of each raw sample's absolute
 /// deviation from the smoothed mean.
@@ -180,14 +194,29 @@ pub(crate) fn send_pings(
     }
     *cooldown = PING_INTERVAL_SECS;
 
-    let seq = outstanding.issue(time.elapsed_secs_f64());
+    let seq = outstanding.issue(Instant::now());
     for lobby in lobbies.iter() {
         commands
             .entity(lobby)
             .trigger(move |entity| LobbyMessage {
                 entity,
-                message: EnsemblePing { seq },
+                message: EnsemblePing {
+                    seq,
+                    reliable: false,
+                },
                 send_mode: SendMode::Unreliable,
+            });
+        // The reliable twin goes with no delay: a ping held to be packed with the next message
+        // measures the packing, not the path.
+        commands
+            .entity(lobby)
+            .trigger(move |entity| LobbyMessage {
+                entity,
+                message: EnsemblePing {
+                    seq,
+                    reliable: true,
+                },
+                send_mode: SendMode::ReliableNoDelay,
             });
     }
 }
@@ -200,7 +229,6 @@ pub(crate) fn send_pings(
 pub(crate) fn respond_to_pings(
     mut commands: Commands,
     mut messages: MessageReader<ReceivedEnsembleMessage<EnsemblePing>>,
-    time: Res<Time>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
     client_lobby: Option<Single<Entity, (With<Lobby>, Without<Host>)>>,
     lobby_clients: Query<(Entity, &LobbyClientPlayerUuid), With<LobbyClient>>,
@@ -209,13 +237,21 @@ pub(crate) fn respond_to_pings(
         let Some(sender) = message.sender else {
             continue;
         };
-        // t2 = when the ping came off our socket; t3 = now (as we emit the pong).
-        let t2 = message.received_at.as_secs_f64();
-        let t3 = time.elapsed_secs_f64();
-        let dwell = (t3 - t2).max(0.0);
+        // t2 = when the ping came off our socket; t3 = now, as we emit the pong. Both are
+        // instants, so the dwell is the time this app actually held the packet — a frame's
+        // worth on a game at 60 Hz — and not, as it was when both reads came from the same
+        // frame's `Time`, identically zero.
+        let t2 = message.received_at;
+        let dwell = Instant::now().saturating_duration_since(t2);
+        let send_mode = if message.message.reliable {
+            SendMode::ReliableNoDelay
+        } else {
+            SendMode::Unreliable
+        };
         let pong = EnsemblePong {
             seq: message.message.seq,
-            dwell_micros: (dwell * 1_000_000.0).min(f64::from(u32::MAX)) as u32,
+            reliable: message.message.reliable,
+            dwell_micros: dwell.as_micros().min(u128::from(u32::MAX)) as u32,
         };
 
         if host_lobby.is_some() {
@@ -228,7 +264,7 @@ pub(crate) fn respond_to_pings(
                     .trigger(move |entity| LobbyClientMessage {
                         entity,
                         message: pong,
-                        send_mode: SendMode::Unreliable,
+                        send_mode,
                     });
             }
         } else if let Some(lobby) = client_lobby.as_ref() {
@@ -238,7 +274,7 @@ pub(crate) fn respond_to_pings(
                 .trigger(move |entity| LobbyMessage {
                     entity,
                     message: pong,
-                    send_mode: SendMode::Unreliable,
+                    send_mode,
                 });
         }
     }
@@ -288,11 +324,11 @@ struct Sample {
 fn sample_from(
     outstanding: &OutstandingPings,
     pong: &EnsemblePong,
-    received_at: f64,
+    received_at: Instant,
 ) -> Option<Sample> {
     let sent_at = outstanding.sent_at(pong.seq)?;
-    let e2e = received_at - sent_at;
-    if !e2e.is_finite() || !(0.0..=MAX_ROUND_TRIP_SECS).contains(&e2e) {
+    let e2e = received_at.checked_duration_since(sent_at)?.as_secs_f64();
+    if !e2e.is_finite() || e2e > MAX_ROUND_TRIP_SECS {
         return None;
     }
     let dwell = (f64::from(pong.dwell_micros) / 1_000_000.0).clamp(0.0, e2e);
@@ -320,6 +356,7 @@ pub(crate) fn receive_pongs(
             Option<&PeerRtt>,
             Option<&PeerWireRtt>,
             Option<&PeerRttJitter>,
+            Option<&PeerReliableRtt>,
             Option<&PeerLastPongSeq>,
         ),
         With<LobbyClient>,
@@ -329,78 +366,75 @@ pub(crate) fn receive_pongs(
             Option<&PeerRtt>,
             Option<&PeerWireRtt>,
             Option<&PeerRttJitter>,
+            Option<&PeerReliableRtt>,
             Option<&PeerLastPongSeq>,
         ),
         (With<Lobby>, Without<Host>),
     >,
 ) {
-    // A peer may answer one sequence number once. Tracked per run as well as per entity, because
-    // two pongs in one frame both see the pre-run component.
-    let mut accepted_this_run: Vec<(u128, u32)> = Vec::new();
+    // A peer may answer one sequence number once per channel. Tracked per run as well as per
+    // entity, because two pongs in one frame both see the pre-run component.
+    let mut accepted_this_run: Vec<(u128, u32, bool)> = Vec::new();
 
     for message in messages.read() {
         let pong = message.message;
         let Some(sender) = message.sender else {
             continue;
         };
-        let Some(sample) = sample_from(&outstanding, &pong, message.received_at.as_secs_f64())
-        else {
+        let Some(sample) = sample_from(&outstanding, &pong, message.received_at) else {
             debug!("ignoring a pong from {sender:#x} that answers no ping this peer sent");
             continue;
         };
-        if accepted_this_run.contains(&(sender, pong.seq)) {
+        if accepted_this_run.contains(&(sender, pong.seq, pong.reliable)) {
             continue;
         }
 
-        // Host side: find the LobbyClient entity for this sender
-        if host_lobby.is_some() {
-            if let Some((entity, _, prev_rtt, prev_wire, prev_jitter, prev_seq)) = lobby_clients
-                .iter()
-                .find(|(_, uuid, ..)| uuid.0 == sender)
-            {
-                if prev_seq.is_some_and(|last| pong.seq <= last.0) {
+        let (entity, prev_rtt, prev_wire, prev_jitter, prev_reliable, prev_seq) =
+            if host_lobby.is_some() {
+                let Some((entity, _, prev_rtt, prev_wire, prev_jitter, prev_reliable, prev_seq)) =
+                    lobby_clients.iter().find(|(_, uuid, ..)| uuid.0 == sender)
+                else {
                     continue;
-                }
-                accepted_this_run.push((sender, pong.seq));
-                let previous_mean = prev_rtt.map(|p| p.0);
-                commands.entity(entity).insert((
-                    PeerRtt(smooth(previous_mean, sample.e2e)),
-                    PeerWireRtt(smooth(prev_wire.map(|p| p.0), sample.wire)),
-                    // Folded from the raw `e2e` against the mean as it stood *before* this sample.
-                    PeerRttJitter(smooth_jitter(
-                        prev_jitter.map(|p| p.0),
-                        previous_mean,
-                        sample.e2e,
-                    )),
-                    PeerLastPong(0.0),
-                    PeerLastPongSeq(pong.seq),
-                ));
-            }
+                };
+                (entity, prev_rtt, prev_wire, prev_jitter, prev_reliable, prev_seq)
+            } else if let Some(lobby_entity) = client_lobby.as_ref() {
+                let (prev_rtt, prev_wire, prev_jitter, prev_reliable, prev_seq) = client_lobby_rtt
+                    .get(**lobby_entity)
+                    .unwrap_or((None, None, None, None, None));
+                (**lobby_entity, prev_rtt, prev_wire, prev_jitter, prev_reliable, prev_seq)
+            } else {
+                continue;
+            };
+
+        // The reliable and unreliable pongs for one sequence number arrive separately and both
+        // count; a second pong on the *same* channel for a sequence already folded does not.
+        // The sequence high-water mark is per channel pair, kept on the unreliable one.
+        if !pong.reliable && prev_seq.is_some_and(|last| pong.seq <= last.0) {
+            continue;
+        }
+        accepted_this_run.push((sender, pong.seq, pong.reliable));
+
+        if pong.reliable {
+            commands.entity(entity).insert((
+                PeerReliableRtt(smooth(prev_reliable.map(|p| p.0), sample.e2e)),
+                PeerLastPong(0.0),
+            ));
             continue;
         }
 
-        // Client side: store on the lobby entity
-        if let Some(lobby_entity) = client_lobby.as_ref() {
-            let (prev_rtt, prev_wire, prev_jitter, prev_seq) = client_lobby_rtt
-                .get(**lobby_entity)
-                .unwrap_or((None, None, None, None));
-            if prev_seq.is_some_and(|last| pong.seq <= last.0) {
-                continue;
-            }
-            accepted_this_run.push((sender, pong.seq));
-            let previous_mean = prev_rtt.map(|p| p.0);
-            commands.entity(**lobby_entity).insert((
-                PeerRtt(smooth(previous_mean, sample.e2e)),
-                PeerWireRtt(smooth(prev_wire.map(|p| p.0), sample.wire)),
-                PeerRttJitter(smooth_jitter(
-                    prev_jitter.map(|p| p.0),
-                    previous_mean,
-                    sample.e2e,
-                )),
-                PeerLastPong(0.0),
-                PeerLastPongSeq(pong.seq),
-            ));
-        }
+        let previous_mean = prev_rtt.map(|p| p.0);
+        commands.entity(entity).insert((
+            PeerRtt(smooth(previous_mean, sample.e2e)),
+            PeerWireRtt(smooth(prev_wire.map(|p| p.0), sample.wire)),
+            // Folded from the raw `e2e` against the mean as it stood *before* this sample.
+            PeerRttJitter(smooth_jitter(
+                prev_jitter.map(|p| p.0),
+                previous_mean,
+                sample.e2e,
+            )),
+            PeerLastPong(0.0),
+            PeerLastPongSeq(pong.seq),
+        ));
     }
 }
 
@@ -553,70 +587,79 @@ mod tests {
         );
     }
 
-    fn outstanding_at(times: &[f64]) -> OutstandingPings {
+    fn epoch() -> Instant {
+        Instant::now()
+    }
+
+    fn after(base: Instant, secs: f64) -> Instant {
+        base + Duration::from_secs_f64(secs)
+    }
+
+    fn outstanding_at(base: Instant, offsets: &[f64]) -> OutstandingPings {
         let mut outstanding = OutstandingPings::default();
-        for at in times {
-            outstanding.issue(*at);
+        for at in offsets {
+            outstanding.issue(after(base, *at));
         }
         outstanding
     }
 
+    fn pong(seq: u32, dwell_micros: u32) -> EnsemblePong {
+        EnsemblePong {
+            seq,
+            reliable: false,
+            dwell_micros,
+        }
+    }
+
     #[test]
     fn an_unsolicited_pong_is_not_a_sample() {
-        let outstanding = outstanding_at(&[1.0]);
-        let pong = EnsemblePong {
-            seq: 999,
-            dwell_micros: 0,
-        };
-        assert!(sample_from(&outstanding, &pong, 1.05).is_none());
+        let base = epoch();
+        let outstanding = outstanding_at(base, &[1.0]);
+        assert!(sample_from(&outstanding, &pong(999, 0), after(base, 1.05)).is_none());
     }
 
     #[test]
     fn a_pong_answering_a_real_ping_is_measured_from_our_own_clock() {
-        let outstanding = outstanding_at(&[1.0]);
-        let pong = EnsemblePong {
-            seq: 1,
-            dwell_micros: 10_000,
-        };
-        let sample = sample_from(&outstanding, &pong, 1.05).expect("a real ping");
-        assert!((sample.e2e - 0.05).abs() < 1e-9);
-        assert!((sample.wire - 0.04).abs() < 1e-9);
+        let base = epoch();
+        let outstanding = outstanding_at(base, &[1.0]);
+        let sample =
+            sample_from(&outstanding, &pong(1, 10_000), after(base, 1.05)).expect("a real ping");
+        assert!((sample.e2e - 0.05).abs() < 1e-6);
+        assert!((sample.wire - 0.04).abs() < 1e-6);
     }
 
     #[test]
     fn a_claimed_dwell_cannot_exceed_the_round_trip() {
         // The peer controls the dwell it reports. A dwell longer than the round trip would make
         // the wire estimate negative, and a huge one used to zero it for the rest of the session.
-        let outstanding = outstanding_at(&[1.0]);
-        let pong = EnsemblePong {
-            seq: 1,
-            dwell_micros: u32::MAX,
-        };
-        let sample = sample_from(&outstanding, &pong, 1.05).expect("still a real ping");
+        let base = epoch();
+        let outstanding = outstanding_at(base, &[1.0]);
+        let sample = sample_from(&outstanding, &pong(1, u32::MAX), after(base, 1.05))
+            .expect("still a real ping");
         assert_eq!(sample.wire, 0.0);
-        assert!((sample.e2e - 0.05).abs() < 1e-9);
+        assert!((sample.e2e - 0.05).abs() < 1e-6);
     }
 
     #[test]
     fn an_absurd_round_trip_is_not_a_sample() {
-        let outstanding = outstanding_at(&[1.0]);
-        let pong = EnsemblePong {
-            seq: 1,
-            dwell_micros: 0,
-        };
-        assert!(sample_from(&outstanding, &pong, 1.0 + MAX_ROUND_TRIP_SECS + 1.0).is_none());
+        let base = epoch();
+        let outstanding = outstanding_at(base, &[1.0]);
         assert!(
-            sample_from(&outstanding, &pong, 0.5).is_none(),
+            sample_from(&outstanding, &pong(1, 0), after(base, 1.0 + MAX_ROUND_TRIP_SECS + 1.0))
+                .is_none()
+        );
+        assert!(
+            sample_from(&outstanding, &pong(1, 0), after(base, 0.5)).is_none(),
             "answered before it was sent"
         );
-        assert!(sample_from(&outstanding, &pong, f64::NAN).is_none());
     }
 
     #[test]
     fn old_pings_are_forgotten() {
+        let base = epoch();
         let mut outstanding = OutstandingPings::default();
         for i in 0..(OUTSTANDING_PINGS as u32 + 5) {
-            outstanding.issue(f64::from(i));
+            outstanding.issue(after(base, f64::from(i)));
         }
         assert!(
             outstanding.sent_at(1).is_none(),
