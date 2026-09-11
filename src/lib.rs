@@ -116,7 +116,7 @@ pub use netmetrics::{NetMetrics, NetMetricsPlugin};
 #[cfg(feature = "netdebug")]
 pub use netsim::{ChannelModel, NetPreset, NetSim, NetSimClock, NetSimConfig, NetSimPlugin};
 pub use ping::{
-    EnsemblePing, EnsemblePong, PeerLastPong, PeerReliableRtt, PeerRtt, PeerRttJitter, PeerTimeout,
+    EnsemblePing, EnsemblePong, LivenessGrace, PeerLastPong, PeerReliableRtt, PeerRtt, PeerRttJitter, PeerTimeout,
     PeerWireRtt,
 };
 pub use player_data::{PlayerData, PlayerDataPlugin, SetPlayerData, SyncPlayerData};

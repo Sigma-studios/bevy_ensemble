@@ -168,6 +168,20 @@ pub(crate) struct PeerLastPongSeq(pub u32);
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct PeerTimeout(pub Option<Duration>);
 
+/// Extra time a peer may go without a pong before [`PeerTimeout`] acts on it.
+///
+/// A transport that knows the silence has a cause and an end -- an ICE restart in flight, a
+/// tab the OS has told it is suspended -- inserts this on the peer's entity (the `LobbyClient`
+/// on a host, the lobby on a client) and removes it when the path is back. Without it a
+/// five-second liveness check would end the session before a restart that takes ten had a
+/// chance, and the restart would be pointless. Capped: the extra is added to the timeout, not
+/// substituted for it, so a peer that never comes back still goes.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct LivenessGrace {
+    /// Added to [`PeerTimeout`] while present.
+    pub extra: Duration,
+}
+
 impl Default for PeerTimeout {
     fn default() -> Self {
         Self(Some(Duration::from_secs(5)))
@@ -471,20 +485,26 @@ pub(crate) fn detect_dead_peers(
     mut commands: Commands,
     timeout: Res<PeerTimeout>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
-    clients: Query<(Entity, &LobbyClientPlayerUuid, &PeerLastPong), With<LobbyClient>>,
+    clients: Query<
+        (Entity, &LobbyClientPlayerUuid, &PeerLastPong, Option<&LivenessGrace>),
+        With<LobbyClient>,
+    >,
     client_lobbies: Query<
-        (Entity, &PeerLastPong),
+        (Entity, &PeerLastPong, Option<&LivenessGrace>),
         (Or<(With<Lobby>, With<PendingLobby>)>, Without<Host>),
     >,
     mut left: MessageWriter<LobbyLeft>,
 ) {
-    let Some(limit) = timeout.0 else {
+    let Some(base) = timeout.0 else {
         return;
     };
-    let limit = limit.as_secs_f64();
+    let limit_for = |grace: Option<&LivenessGrace>| {
+        (base + grace.map_or(Duration::ZERO, |grace| grace.extra)).as_secs_f64()
+    };
 
     if host_lobby.is_some() {
-        for (entity, uuid, last_pong) in clients.iter() {
+        for (entity, uuid, last_pong, grace) in clients.iter() {
+            let limit = limit_for(grace);
             if last_pong.0 > limit {
                 info!(
                     "dropping client {:#x}: no pong for {:.1}s (limit {limit:.1}s)",
@@ -496,7 +516,8 @@ pub(crate) fn detect_dead_peers(
         return;
     }
 
-    for (entity, last_pong) in client_lobbies.iter() {
+    for (entity, last_pong, grace) in client_lobbies.iter() {
+        let limit = limit_for(grace);
         if last_pong.0 > limit {
             warn!(
                 "leaving the session: the host has not answered a ping for {:.1}s (limit \
