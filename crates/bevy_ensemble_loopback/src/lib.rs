@@ -118,7 +118,7 @@
 
 use bevy::prelude::*;
 use bevy_ensemble::{
-    EnsembleSet, EnsembleTransportAppExt, Host, HostUuid, Lobby, LobbyClient,
+    EnsembleSet, EnsembleTransportAppExt, Host, HostUuid, Instant, Lobby, LobbyClient,
     LobbyClientPlayerUuid, LobbyParticipantOf, LocalMultiplayerPlayerId, NetPreset, PeerRtt,
     PeerRttJitter, PendingLobby, PlayerUUID, SendMode, SerializedLobbyPacket,
     decode_ensemble_packet,
@@ -164,7 +164,7 @@ fn capture_outbound_packet(packet: On<SerializedLobbyPacket>, mut outbox: ResMut
 fn drain_inbox(world: &mut World) {
     let packets = std::mem::take(&mut world.resource_mut::<Inbox>().0);
     for (sender, bytes) in packets {
-        decode_ensemble_packet(world, Some(sender), &bytes);
+        decode_ensemble_packet(world, Some(sender), &bytes, Instant::now());
     }
 }
 
@@ -947,8 +947,9 @@ impl LoopbackNetwork {
             .map_or(0, |(packets, _)| *packets)
     }
 
-    /// Lose exactly the next `count` packets from `from` to `to`, whatever the link would have
-    /// done. Reliable packets are retransmitted rather than lost, as on the link.
+    /// Lose exactly the next `count` **unreliable** packets from `from` to `to`, whatever the
+    /// link would have done. Reliable packets pass untouched: a reliable transport retransmits
+    /// rather than loses, and [`Link::loss`] already models what that costs.
     pub fn drop_next(&mut self, from: PeerId, to: PeerId, count: usize) {
         *self.pending_drops.entry((from.0, to.0)).or_insert(0) += count;
     }
@@ -1254,7 +1255,7 @@ impl LoopbackNetwork {
         }
 
         let forced_drop = match self.pending_drops.get_mut(&(from, to)) {
-            Some(remaining) if *remaining > 0 => {
+            Some(remaining) if *remaining > 0 && !reliable => {
                 *remaining -= 1;
                 true
             }

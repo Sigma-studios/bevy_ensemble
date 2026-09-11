@@ -14,6 +14,8 @@ members = [
 [dependencies]
 bevy = { version = "0.19", default-features = false, features = ["std", "serialize", "bevy_log"] }
 postcard = { version = "1", features = ["alloc"] }
+# `Instant` that works on wasm too, for stamping packets at the socket seam.
+web-time = "1"
 serde = { version = "1", features = ["derive"] }
 
 # Both network features are on by default (release included) so the tooling is

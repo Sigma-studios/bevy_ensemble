@@ -38,7 +38,7 @@
 
 use bevy::prelude::*;
 
-use crate::{PlayerUUID, registry::decode_ensemble_packet_now};
+use crate::{Instant, PlayerUUID, registry::decode_ensemble_packet_now};
 
 /// Installs the simulator and its drain system, and nothing else.
 ///
@@ -234,6 +234,7 @@ struct Delayed {
     seq: u64,
     sender: Option<PlayerUUID>,
     bytes: Vec<u8>,
+    received_at: Instant,
 }
 
 /// The network simulator resource. Present only under `netdebug`; defaults to
@@ -316,7 +317,13 @@ impl NetSim {
     ///
     /// Under [`ChannelModel::Reliable`] the release is clamped to this sender's previous
     /// one, so arrival order survives an unlucky jitter sample.
-    fn enqueue(&mut self, sender: Option<PlayerUUID>, bytes: Vec<u8>, mut release: f64) {
+    fn enqueue(
+        &mut self,
+        sender: Option<PlayerUUID>,
+        bytes: Vec<u8>,
+        mut release: f64,
+        received_at: Instant,
+    ) {
         if self.channel == ChannelModel::Reliable {
             match self.last_release.iter_mut().find(|(s, _)| *s == sender) {
                 Some((_, last)) => {
@@ -334,6 +341,7 @@ impl NetSim {
             seq,
             sender,
             bytes,
+            received_at,
         });
     }
 
@@ -341,7 +349,7 @@ impl NetSim {
     /// Sorting by release time is what turns per-packet jitter into real reordering;
     /// the `seq` tiebreak keeps packets clamped to the same release — and packets the
     /// caller queued at one instant — in the order they arrived.
-    fn take_due(&mut self, now: f64) -> Vec<(Option<PlayerUUID>, Vec<u8>)> {
+    fn take_due(&mut self, now: f64) -> Vec<(Option<PlayerUUID>, Vec<u8>, Instant)> {
         let mut due: Vec<Delayed> = Vec::new();
         let mut i = 0;
         while i < self.queue.len() {
@@ -357,7 +365,9 @@ impl NetSim {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.seq.cmp(&b.seq))
         });
-        due.into_iter().map(|d| (d.sender, d.bytes)).collect()
+        due.into_iter()
+            .map(|d| (d.sender, d.bytes, d.received_at))
+            .collect()
     }
 }
 
@@ -375,7 +385,12 @@ pub(crate) enum SimVerdict {
 ///
 /// Returns a verdict the caller uses only to update counters; the packet bytes are
 /// taken ownership of here when delayed, and later replayed by [`drain_netsim`].
-pub(crate) fn offer_inbound(world: &mut World, sender: Option<PlayerUUID>, packet: &[u8]) -> SimVerdict {
+pub(crate) fn offer_inbound(
+    world: &mut World,
+    sender: Option<PlayerUUID>,
+    packet: &[u8],
+    received_at: Instant,
+) -> SimVerdict {
     let Some(now) = clock_now(world) else {
         return SimVerdict::PassThrough;
     };
@@ -410,14 +425,14 @@ pub(crate) fn offer_inbound(world: &mut World, sender: Option<PlayerUUID>, packe
     };
 
     let release = schedule(&mut sim);
-    sim.enqueue(sender, packet.to_vec(), release);
+    sim.enqueue(sender, packet.to_vec(), release, received_at);
 
     let mut duplicated = 0;
     // A reliable channel deduplicates, so a duplicate never reaches the decode seam.
     if channel == ChannelModel::Unreliable && config.duplicate > 0.0 && sim.roll() < config.duplicate
     {
         let release = schedule(&mut sim);
-        sim.enqueue(sender, packet.to_vec(), release);
+        sim.enqueue(sender, packet.to_vec(), release, received_at);
         duplicated = 1;
     }
 
@@ -430,8 +445,8 @@ pub(crate) fn drain_netsim(world: &mut World) {
         return;
     };
     let due = world.resource_mut::<NetSim>().take_due(now);
-    for (sender, bytes) in due {
-        decode_ensemble_packet_now(world, sender, &bytes);
+    for (sender, bytes, received_at) in due {
+        decode_ensemble_packet_now(world, sender, &bytes, received_at);
     }
 }
 
@@ -443,9 +458,9 @@ mod tests {
     /// Payloads are the arrival index, so the returned bytes spell out the delivery order.
     fn drain_in_order(sim: &mut NetSim, sender: Option<PlayerUUID>, releases: &[f64]) -> Vec<u8> {
         for (i, release) in releases.iter().enumerate() {
-            sim.enqueue(sender, vec![i as u8], *release);
+            sim.enqueue(sender, vec![i as u8], *release, Instant::now());
         }
-        sim.take_due(f64::MAX).into_iter().map(|(_, b)| b[0]).collect()
+        sim.take_due(f64::MAX).into_iter().map(|(_, b, _)| b[0]).collect()
     }
 
     #[test]
@@ -510,8 +525,8 @@ mod tests {
         // nothing behind a late packet arrives before it.
         let mut sim = NetSim::default();
         sim.set_channel_model(ChannelModel::Reliable);
-        sim.enqueue(Some(1), vec![0], 1.0);
-        sim.enqueue(Some(1), vec![1], 0.1);
+        sim.enqueue(Some(1), vec![0], 1.0, Instant::now());
+        sim.enqueue(Some(1), vec![1], 0.1, Instant::now());
 
         assert!(
             sim.take_due(0.5).is_empty(),
@@ -525,10 +540,10 @@ mod tests {
         // Nothing in either transport orders one peer's stream against another's.
         let mut sim = NetSim::default();
         sim.set_channel_model(ChannelModel::Reliable);
-        sim.enqueue(Some(1), vec![0], 1.0);
-        sim.enqueue(Some(2), vec![1], 0.5);
+        sim.enqueue(Some(1), vec![0], 1.0, Instant::now());
+        sim.enqueue(Some(2), vec![1], 0.5, Instant::now());
 
-        let due: Vec<u8> = sim.take_due(0.6).into_iter().map(|(_, b)| b[0]).collect();
+        let due: Vec<u8> = sim.take_due(0.6).into_iter().map(|(_, b, _)| b[0]).collect();
         assert_eq!(due, vec![1], "peer 2 was held back by a packet of peer 1's");
     }
 
@@ -554,7 +569,7 @@ mod tests {
         let mut dropped = 0;
         let mut duplicated = 0;
         for _ in 0..count {
-            match offer_inbound(&mut world, Some(1), &[0u8]) {
+            match offer_inbound(&mut world, Some(1), &[0u8], Instant::now()) {
                 SimVerdict::Dropped => dropped += 1,
                 SimVerdict::Delayed { duplicated: d } => duplicated += d as usize,
                 SimVerdict::PassThrough => unreachable!("the preset is active"),
@@ -595,7 +610,7 @@ mod tests {
             sim.set_channel_model(channel);
             world.insert_resource(sim);
             for _ in 0..200 {
-                offer_inbound(&mut world, Some(1), &[0u8]);
+                offer_inbound(&mut world, Some(1), &[0u8], Instant::now());
             }
             // One-way delay is 300ms; a resend adds a 600ms round trip on top.
             let sim = world.resource::<NetSim>();

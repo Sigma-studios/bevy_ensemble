@@ -71,8 +71,8 @@ struct CircleSyncPlugin;
 
 impl Plugin for CircleSyncPlugin {
     fn build(&self, app: &mut App) {
-        app.register_ensemble_message_type::<MoveIntent>()
-            .register_ensemble_message_type::<PlayerPosition>()
+        app.register_ensemble_message_type::<MoveIntent>("MoveIntent")
+            .register_ensemble_message_type::<PlayerPosition>("PlayerPosition")
             .add_systems(Startup, setup)
             .add_systems(
                 Update,

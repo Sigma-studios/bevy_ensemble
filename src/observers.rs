@@ -4,7 +4,7 @@ use crate::{
     Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipant, LobbyParticipantOf,
     RemoveLobbyParticipant, SendMode,
     components::LobbyParticipants,
-    messages::{EnsembleMessage, LobbyClientMessage, LobbyMessage, SerializedLobbyPacket},
+    messages::{EnsembleMessage, LobbyClientMessage, LobbyMessage},
     registry::{EnsembleMessageRegistry, encode_ensemble_message},
 };
 
@@ -82,14 +82,19 @@ pub(crate) fn on_lobby_client_removed(
 
     let player_uuid = player_uuid.0;
 
-    // Notify the kicked peer directly (the backend will transmit this via its transport)
-    commands
-        .entity(trigger.event_target())
-        .trigger(move |entity| LobbyClientMessage::<RemoveLobbyParticipant> {
-            entity,
+    // Notify the kicked peer directly (the backend will transmit this via its transport).
+    //
+    // Triggered on the world, not through `commands.entity(..)`: by the time the command runs
+    // the entity is gone, and an entity command on a despawned entity is an error — one that
+    // panics outright when the entity's index has already been handed to a newcomer.
+    let removed = trigger.event_target();
+    commands.queue(move |world: &mut World| {
+        world.trigger(LobbyClientMessage::<RemoveLobbyParticipant> {
+            entity: removed,
             message: RemoveLobbyParticipant { player_uuid },
             send_mode: SendMode::Reliable,
         });
+    });
 
     // Broadcast to remaining clients
     if let Ok(mut lobby_commands) = commands.get_entity(lobby) {
@@ -108,19 +113,22 @@ pub(crate) fn on_lobby_client_removed(
     }
 }
 
-/// Serializes a [`LobbyClientMessage`] into a [`SerializedLobbyPacket`].
+/// Serializes a [`LobbyClientMessage`] and queues it for the end of the frame.
 ///
-/// Uses the [`EnsembleMessageRegistry`] to encode the message with its type index
-/// and postcard payload, then triggers a [`SerializedLobbyPacket`] on the same entity
-/// for the platform backend to transmit.
+/// Uses the [`EnsembleMessageRegistry`] to encode the message with its type index and postcard
+/// payload, then appends it to [`OutboundBatches`](crate::OutboundBatches). `flush_outbound`
+/// turns every batch into one [`SerializedLobbyPacket`](crate::SerializedLobbyPacket) per peer
+/// and channel in `Last`, which is where the platform backend picks it up.
 pub(crate) fn encode_lobby_client_message<T: EnsembleMessage>(
     message: On<LobbyClientMessage<T>>,
     registry: Res<EnsembleMessageRegistry>,
-    mut commands: Commands,
+    mut batches: ResMut<crate::outbound::OutboundBatches>,
+    #[cfg(feature = "netmetrics")] metrics: Option<ResMut<crate::netmetrics::NetMetrics>>,
 ) {
     let packet = encode_ensemble_message(&registry, &message.message);
-    let send_mode = message.send_mode;
-    commands
-        .entity(message.entity)
-        .trigger(move |entity| SerializedLobbyPacket { entity, packet, send_mode });
+    #[cfg(feature = "netmetrics")]
+    if let Some(mut metrics) = metrics {
+        metrics.tx_messages += 1;
+    }
+    batches.push(message.entity, message.send_mode, packet);
 }

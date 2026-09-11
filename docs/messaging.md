@@ -1,6 +1,6 @@
 # Messaging
 
-`bevy_ensemble` provides a type-safe message system for sending custom data over the network. Messages are serialized with CBOR, indexed by type for compact wire format, and delivered through Bevy's message system.
+`bevy_ensemble` provides a type-safe message system for sending custom data over the network. Messages are serialized with postcard, indexed by wire name for a compact wire format, and delivered through Bevy's message system.
 
 ## Defining a Message
 
@@ -117,7 +117,7 @@ LobbyMessage<T>              (triggered by your code on a lobby entity)
 LobbyClientMessage<T>        (routed to individual client entities)
        │
        ▼
-SerializedLobbyPacket         (CBOR-encoded bytes, ready for transport)
+SerializedLobbyPacket         (postcard-encoded bytes, framed per peer and channel, ready for transport)
        │
        ▼
 Platform Backend              (sends bytes over the network)
@@ -139,6 +139,6 @@ ReceivedEnsembleMessage<T>    (read by your systems via MessageReader)
 
 Each packet is:
 - **2 bytes**: Little-endian `u16` type index (assigned by registration order)
-- **N bytes**: CBOR-encoded message payload
+- **N bytes**: postcard-encoded message payload
 
 This keeps packets compact while supporting arbitrary custom types.

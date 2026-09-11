@@ -82,8 +82,8 @@ impl Plugin for MinimalLobbyExamplePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ChatLog>()
             .init_resource::<FastLoop>()
-            .register_broadcast_message::<ChatMessage>()
-            .register_ensemble_message_type::<WaveAction>()
+            .register_broadcast_message::<ChatMessage>("ChatMessage")
+            .register_ensemble_message_type::<WaveAction>("WaveAction")
             .add_systems(Startup, setup_camera)
             .add_systems(
                 Update,
