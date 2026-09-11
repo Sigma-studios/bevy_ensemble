@@ -6,6 +6,8 @@
 // lower-risk alternative if we want to move sooner.
 use std::sync::Arc;
 
+use web_time::Instant;
+
 use tokio::sync::mpsc;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::RTCDataChannel;
@@ -92,7 +94,7 @@ pub(crate) fn create_peer_connection(
     signal_tx: mpsc::UnboundedSender<OutgoingSignal>,
     peer_state_tx: mpsc::UnboundedSender<(u128, PeerState)>,
     route_tx: mpsc::UnboundedSender<(u128, PeerRoute)>,
-    message_tx: mpsc::UnboundedSender<(u128, Box<[u8]>)>,
+    message_tx: mpsc::UnboundedSender<(u128, Box<[u8]>, Instant)>,
     ice_servers: &IceServers,
     handle: tokio::runtime::Handle,
 ) -> NativePeerConnection {
@@ -305,7 +307,8 @@ pub(crate) fn create_peer_connection(
     {
         let msg_tx = message_tx.clone();
         reliable_channel.on_message(Box::new(move |msg| {
-            let _ = msg_tx.send((peer_id, msg.data.to_vec().into_boxed_slice()));
+            let received_at = Instant::now();
+            let _ = msg_tx.send((peer_id, msg.data.to_vec().into_boxed_slice(), received_at));
             Box::pin(async {})
         }));
     }
@@ -313,7 +316,8 @@ pub(crate) fn create_peer_connection(
     {
         let msg_tx = message_tx;
         unreliable_channel.on_message(Box::new(move |msg| {
-            let _ = msg_tx.send((peer_id, msg.data.to_vec().into_boxed_slice()));
+            let received_at = Instant::now();
+            let _ = msg_tx.send((peer_id, msg.data.to_vec().into_boxed_slice(), received_at));
             Box::pin(async {})
         }));
     }

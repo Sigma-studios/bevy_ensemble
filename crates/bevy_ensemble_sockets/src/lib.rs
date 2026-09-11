@@ -6,6 +6,9 @@ mod wasm;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
+/// Monotonic clock used to stamp received messages (works natively and on wasm).
+pub use web_time::Instant;
+
 /// Signal data exchanged between peers via the signalling server.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum PeerSignal {
@@ -126,8 +129,8 @@ pub struct EnsembleSocket {
     peer_state_rx: mpsc::UnboundedReceiver<(u128, PeerState)>,
     route_tx: mpsc::UnboundedSender<(u128, PeerRoute)>,
     route_rx: mpsc::UnboundedReceiver<(u128, PeerRoute)>,
-    message_tx: mpsc::UnboundedSender<(u128, Box<[u8]>)>,
-    message_rx: mpsc::UnboundedReceiver<(u128, Box<[u8]>)>,
+    message_tx: mpsc::UnboundedSender<(u128, Box<[u8]>, Instant)>,
+    message_rx: mpsc::UnboundedReceiver<(u128, Box<[u8]>, Instant)>,
     #[cfg(not(target_arch = "wasm32"))]
     peers: HashMap<u128, native::NativePeerConnection>,
     #[cfg(target_arch = "wasm32")]
@@ -400,7 +403,10 @@ impl EnsembleSocket {
     }
 
     /// Receive all pending messages from all peers.
-    pub fn receive(&mut self) -> Vec<(u128, Box<[u8]>)> {
+    ///
+    /// Each entry carries the [`Instant`] at which the bytes came off the data channel
+    /// (stamped in the `on_message` callback, not when this method is called).
+    pub fn receive(&mut self) -> Vec<(u128, Box<[u8]>, Instant)> {
         let mut messages = Vec::new();
         while let Ok(msg) = self.message_rx.try_recv() {
             messages.push(msg);

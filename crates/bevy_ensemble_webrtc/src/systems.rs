@@ -833,7 +833,7 @@ pub(crate) fn read_peer_messages(world: &mut World) {
         Vec::new()
     };
 
-    for (sender_uuid, payload) in packets {
+    for (sender_uuid, payload, received_at) in packets {
         if !accept_packet_from(role, host, &known_clients, sender_uuid) {
             let count = {
                 let mut drops = world.get_resource_or_insert_with(UntrustedPacketDrops::default);
@@ -852,7 +852,7 @@ pub(crate) fn read_peer_messages(world: &mut World) {
             }
             continue;
         }
-        if !decode_ensemble_packet(world, Some(sender_uuid), &payload) {
+        if !decode_ensemble_packet(world, Some(sender_uuid), &payload, received_at) {
             warn!("Failed to decode ensemble packet from peer {sender_uuid}");
         }
     }

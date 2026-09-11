@@ -52,6 +52,13 @@ pub struct NetMetrics {
     pub tx_bytes: u64,
     /// Total outbound packets since startup.
     pub tx_packets: u64,
+    /// Messages decoded since startup. A packet is a datagram; it may carry several messages.
+    pub rx_messages: u64,
+    /// Messages encoded since startup, before batching.
+    pub tx_messages: u64,
+    /// The largest packet sent on the unreliable channel since startup, in bytes. Past the
+    /// path's fragment size an unreliable datagram is lost whole if any fragment is.
+    pub largest_unreliable_packet: usize,
     /// Inbound packets dropped by the network simulator (`netdebug` only).
     pub sim_dropped: u64,
     /// Inbound packets duplicated by the network simulator (`netdebug` only).
@@ -84,6 +91,10 @@ pub(crate) fn count_outbound(packet: On<SerializedLobbyPacket>, metrics: Option<
     if let Some(mut metrics) = metrics {
         metrics.tx_bytes += packet.packet.len() as u64;
         metrics.tx_packets += 1;
+        if !packet.send_mode.is_reliable() {
+            metrics.largest_unreliable_packet =
+                metrics.largest_unreliable_packet.max(packet.packet.len());
+        }
     }
 }
 

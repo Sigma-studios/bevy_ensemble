@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex};
 
+use web_time::Instant;
+
 use tokio::sync::mpsc;
 use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::JsFuture;
@@ -93,7 +95,7 @@ pub(crate) fn create_peer_connection(
     signal_tx: mpsc::UnboundedSender<OutgoingSignal>,
     peer_state_tx: mpsc::UnboundedSender<(u128, PeerState)>,
     route_tx: mpsc::UnboundedSender<(u128, PeerRoute)>,
-    message_tx: mpsc::UnboundedSender<(u128, Box<[u8]>)>,
+    message_tx: mpsc::UnboundedSender<(u128, Box<[u8]>, Instant)>,
     ice_servers: &IceServers,
 ) -> WasmPeerConnection {
     let config = RtcConfiguration::new();
@@ -271,9 +273,10 @@ pub(crate) fn create_peer_connection(
     let msg_tx_reliable = message_tx.clone();
     let onmessage_reliable: Closure<dyn FnMut(MessageEvent)> =
         Closure::wrap(Box::new(move |event: MessageEvent| {
+            let received_at = Instant::now();
             if let Ok(buf) = event.data().dyn_into::<js_sys::ArrayBuffer>() {
                 let arr = js_sys::Uint8Array::new(&buf);
-                let _ = msg_tx_reliable.send((peer_id, arr.to_vec().into_boxed_slice()));
+                let _ = msg_tx_reliable.send((peer_id, arr.to_vec().into_boxed_slice(), received_at));
             }
         }));
     reliable_dc.set_onmessage(Some(onmessage_reliable.as_ref().unchecked_ref()));
@@ -282,9 +285,10 @@ pub(crate) fn create_peer_connection(
     let msg_tx_unreliable = message_tx;
     let onmessage_unreliable: Closure<dyn FnMut(MessageEvent)> =
         Closure::wrap(Box::new(move |event: MessageEvent| {
+            let received_at = Instant::now();
             if let Ok(buf) = event.data().dyn_into::<js_sys::ArrayBuffer>() {
                 let arr = js_sys::Uint8Array::new(&buf);
-                let _ = msg_tx_unreliable.send((peer_id, arr.to_vec().into_boxed_slice()));
+                let _ = msg_tx_unreliable.send((peer_id, arr.to_vec().into_boxed_slice(), received_at));
             }
         }));
     unreliable_dc.set_onmessage(Some(onmessage_unreliable.as_ref().unchecked_ref()));
