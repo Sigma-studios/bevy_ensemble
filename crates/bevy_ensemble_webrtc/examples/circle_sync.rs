@@ -1,9 +1,9 @@
 use bevy::prelude::*;
 use bevy_ensemble::{
-    EnsembleAppExt, EnsemblePlugin, Host, Lobby, LobbyClient, LobbyClientPlayerUuid,
-    LobbyMessage, LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId, PeerRtt,
-    PendingLobby, PlayerData, PlayerDataPlugin, PublicLobbies, ReceivedEnsembleMessage,
-    SetPlayerData, StartHosting,
+    EnsembleAppExt, EnsemblePlugin, Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyMessage,
+    LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId, PeerRtt, PendingLobby,
+    PlayerData, PlayerDataPlugin, PublicLobbies, ReceivedEnsembleMessage, SetPlayerData,
+    StartHosting,
 };
 use bevy_ensemble_webrtc::{BevyEnsembleWebrtcPlugin, JoinWebrtcLobby, RefreshLobbyList};
 use serde::{Deserialize, Serialize};
@@ -318,9 +318,8 @@ fn handle_number_keys(
         kickable.sort();
 
         if let Some(&target_uuid) = kickable.get(pressed_index) {
-            if let Some((client_entity, _)) = lobby_clients
-                .iter()
-                .find(|(_, uuid)| uuid.0 == target_uuid)
+            if let Some((client_entity, _)) =
+                lobby_clients.iter().find(|(_, uuid)| uuid.0 == target_uuid)
             {
                 commands.entity(client_entity).try_despawn();
             }
@@ -458,20 +457,20 @@ fn handle_wasd_input(
 
     if let Some(host_lobby) = host_lobbies.iter().next() {
         let player_uuid = local_player.0;
-        commands
-            .entity(host_lobby)
-            .trigger(move |entity| LobbyMessage::new_unreliable(entity, PlayerPosition {
-                player_uuid,
-                x: pos_x,
-                y: pos_y,
-            }));
+        commands.entity(host_lobby).trigger(move |entity| {
+            LobbyMessage::new_unreliable(
+                entity,
+                PlayerPosition {
+                    player_uuid,
+                    x: pos_x,
+                    y: pos_y,
+                },
+            )
+        });
     } else if let Some(client_lobby) = client_lobbies.iter().next() {
-        commands
-            .entity(client_lobby)
-            .trigger(move |entity| LobbyMessage::new_unreliable(entity, MoveIntent {
-                x: pos_x,
-                y: pos_y,
-            }));
+        commands.entity(client_lobby).trigger(move |entity| {
+            LobbyMessage::new_unreliable(entity, MoveIntent { x: pos_x, y: pos_y })
+        });
     }
 }
 
@@ -510,13 +509,9 @@ fn relay_moves_on_host(
             spawned_this_frame.push(player_uuid);
         }
 
-        commands
-            .entity(host_lobby)
-            .trigger(move |entity| LobbyMessage::new_unreliable(entity, PlayerPosition {
-                player_uuid,
-                x,
-                y,
-            }));
+        commands.entity(host_lobby).trigger(move |entity| {
+            LobbyMessage::new_unreliable(entity, PlayerPosition { player_uuid, x, y })
+        });
     }
 }
 
@@ -539,8 +534,7 @@ fn receive_player_positions(
             }
         }
 
-        if let Some((_, mut transform)) = circles.iter_mut().find(|(c, _)| c.0 == pos.player_uuid)
-        {
+        if let Some((_, mut transform)) = circles.iter_mut().find(|(c, _)| c.0 == pos.player_uuid) {
             transform.translation.x = pos.x;
             transform.translation.y = pos.y;
         } else if !spawned_this_frame.contains(&pos.player_uuid) {

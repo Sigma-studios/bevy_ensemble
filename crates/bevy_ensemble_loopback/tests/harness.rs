@@ -120,7 +120,11 @@ fn lobby_clients(net: &mut LoopbackNetwork, host: PeerId) -> usize {
 
 fn has<C: Component>(net: &mut LoopbackNetwork, peer: PeerId) -> bool {
     let world = net.app_mut(peer).world_mut();
-    world.query_filtered::<(), With<C>>().iter(world).next().is_some()
+    world
+        .query_filtered::<(), With<C>>()
+        .iter(world)
+        .next()
+        .is_some()
 }
 
 #[test]
@@ -131,7 +135,10 @@ fn one_step_is_exactly_one_frame() {
     net.step();
     assert_eq!(net.frame(), before + 2);
     let delta = net.app(host).world().resource::<Time>().delta();
-    assert_eq!(delta, FRAME, "the app's clock must move by the frame the network models");
+    assert_eq!(
+        delta, FRAME,
+        "the app's clock must move by the frame the network models"
+    );
 }
 
 #[test]
@@ -140,8 +147,16 @@ fn packets_actually_cross_the_link() {
     send(&mut net, client, host, Ping(7), SendMode::Reliable);
     send(&mut net, host, client, Ping(9), SendMode::Reliable);
     net.run(3);
-    assert_eq!(received(&net, host), vec![(2, 7)], "the host hears the client, as the client");
-    assert_eq!(received(&net, client), vec![(1, 9)], "the client hears the host, as the host");
+    assert_eq!(
+        received(&net, host),
+        vec![(2, 7)],
+        "the host hears the client, as the client"
+    );
+    assert_eq!(
+        received(&net, client),
+        vec![(1, 9)],
+        "the client hears the host, as the host"
+    );
 }
 
 #[test]
@@ -150,7 +165,10 @@ fn a_perfect_link_delivers_on_the_next_frame() {
     send(&mut net, client, host, Ping(1), SendMode::Reliable);
     // The packet is in the client's outbox; the step collects it and the next step delivers it.
     net.step();
-    assert!(values(&net, host).is_empty(), "nothing arrives on the frame it was sent");
+    assert!(
+        values(&net, host).is_empty(),
+        "nothing arrives on the frame it was sent"
+    );
     net.step();
     assert_eq!(values(&net, host), vec![1]);
 }
@@ -162,8 +180,15 @@ fn an_unreliable_packet_can_be_duplicated() {
     net.trace_packets(true);
     send(&mut net, client, host, Ping(3), SendMode::Unreliable);
     net.run(4);
-    assert_eq!(values(&net, host), vec![3, 3], "delivered twice, one frame apart");
-    assert!(matches!(pings(&net, client, host)[0].fate, PacketFate::Duplicated { .. }));
+    assert_eq!(
+        values(&net, host),
+        vec![3, 3],
+        "delivered twice, one frame apart"
+    );
+    assert!(matches!(
+        pings(&net, client, host)[0].fate,
+        PacketFate::Duplicated { .. }
+    ));
 }
 
 #[test]
@@ -176,7 +201,11 @@ fn an_unreliable_packet_can_be_reordered() {
     net.step();
     send(&mut net, client, host, Ping(2), SendMode::Unreliable);
     net.run(8);
-    assert_eq!(values(&net, host), vec![2, 1], "the second overtook the first");
+    assert_eq!(
+        values(&net, host),
+        vec![2, 1],
+        "the second overtook the first"
+    );
 }
 
 #[test]
@@ -215,17 +244,15 @@ fn an_oversize_unreliable_packet_is_dropped_and_a_reliable_one_is_not() {
 #[test]
 fn links_can_differ_per_direction() {
     let (mut net, host, client) = pair();
-    net.set_link_pair(
-        client,
-        host,
-        Link::perfect(),
-        Link::delayed(FRAME * 10),
-    );
+    net.set_link_pair(client, host, Link::perfect(), Link::delayed(FRAME * 10));
     send(&mut net, client, host, Ping(1), SendMode::Reliable);
     send(&mut net, host, client, Ping(2), SendMode::Reliable);
     net.run(3);
     assert_eq!(values(&net, host), vec![1], "the uplink is instant");
-    assert!(values(&net, client).is_empty(), "the downlink is ten frames long");
+    assert!(
+        values(&net, client).is_empty(),
+        "the downlink is ten frames long"
+    );
     net.run(10);
     assert_eq!(values(&net, client), vec![2]);
 }
@@ -241,7 +268,11 @@ fn a_half_open_peer_receives_but_is_never_heard() {
     assert!(values(&net, host).is_empty());
     assert_eq!(values(&net, client), vec![2]);
     assert_eq!(pings(&net, client, host)[0].fate, PacketFate::Unreachable);
-    assert_eq!(lobby_clients(&mut net, host), 1, "the transport has not noticed anything");
+    assert_eq!(
+        lobby_clients(&mut net, host),
+        1,
+        "the transport has not noticed anything"
+    );
 
     net.reconnect(client);
     send(&mut net, client, host, Ping(3), SendMode::Reliable);
@@ -258,7 +289,11 @@ fn a_pending_client_is_not_in_the_roster_until_promoted() {
     assert!(net.is_pending(client));
     assert!(has::<PendingLobby>(&mut net, client));
     assert!(!has::<Lobby>(&mut net, client));
-    assert_eq!(lobby_clients(&mut net, host), 0, "the host has not been told");
+    assert_eq!(
+        lobby_clients(&mut net, host),
+        0,
+        "the host has not been told"
+    );
 
     // The data channel is up before the join is finished: the client's packets already flow —
     // and are held at the host until the join finishes and the protocol is verified, because
@@ -266,7 +301,13 @@ fn a_pending_client_is_not_in_the_roster_until_promoted() {
     send(&mut net, client, host, Ping(1), SendMode::Reliable);
     net.run(3);
     assert!(values(&net, host).is_empty(), "held, not read");
-    assert_eq!(net.app(host).world().resource::<bevy_ensemble::HeldUntilVerified>().held_for(2), 1);
+    assert_eq!(
+        net.app(host)
+            .world()
+            .resource::<bevy_ensemble::HeldUntilVerified>()
+            .held_for(2),
+        1
+    );
 
     net.promote(client);
     assert!(net.is_connected(client));
@@ -285,10 +326,18 @@ fn the_local_id_can_be_withheld_and_granted_later() {
     let mut net = LoopbackNetwork::new(FRAME);
     let host = net.add_host(1, peer(1));
     net.set_local_id(host, None);
-    assert!(net.app(host).world().get_resource::<LocalMultiplayerPlayerId>().is_none());
+    assert!(
+        net.app(host)
+            .world()
+            .get_resource::<LocalMultiplayerPlayerId>()
+            .is_none()
+    );
     net.set_local_id(host, Some(42));
     assert_eq!(
-        net.app(host).world().resource::<LocalMultiplayerPlayerId>().0,
+        net.app(host)
+            .world()
+            .resource::<LocalMultiplayerPlayerId>()
+            .0,
         42
     );
 }
@@ -344,7 +393,10 @@ fn a_frozen_peer_neither_sends_nor_reads_until_it_runs_again() {
     for _ in 0..5 {
         net.step_only(&[host]);
     }
-    assert!(values(&net, client).is_empty(), "a frozen peer reads nothing");
+    assert!(
+        values(&net, client).is_empty(),
+        "a frozen peer reads nothing"
+    );
     net.step();
     assert_eq!(values(&net, client), vec![1], "and catches up when it runs");
 }
@@ -371,7 +423,10 @@ fn the_trace_records_bytes_and_fates() {
         .iter()
         .filter(|p| p.from == client && p.to == host)
         .collect();
-    assert_eq!(net.packets_sent(client, host) - packets_before, all.len() as u64);
+    assert_eq!(
+        net.packets_sent(client, host) - packets_before,
+        all.len() as u64
+    );
     assert_eq!(
         net.bytes_sent(client, host) - bytes_before,
         all.iter().map(|p| p.bytes.len() as u64).sum::<u64>()
@@ -393,17 +448,27 @@ fn drop_next_loses_exactly_the_packets_asked_for() {
     }
     net.run(3);
     let sent = pings(&net, client, host);
-    let dropped = sent.iter().filter(|p| p.fate == PacketFate::Dropped).count();
+    let dropped = sent
+        .iter()
+        .filter(|p| p.fate == PacketFate::Dropped)
+        .count();
     let delivered: Vec<u32> = values(&net, host);
     assert_eq!(sent.len(), 4);
-    assert_eq!(delivered.len() + dropped, 4, "every ping was either dropped or delivered");
+    assert_eq!(
+        delivered.len() + dropped,
+        4,
+        "every ping was either dropped or delivered"
+    );
     assert!(dropped <= 2);
     let all_dropped = net
         .trace()
         .iter()
         .filter(|p| p.from == client && p.to == host && p.fate == PacketFate::Dropped)
         .count();
-    assert_eq!(all_dropped, 2, "exactly two datagrams were lost on the link");
+    assert_eq!(
+        all_dropped, 2,
+        "exactly two datagrams were lost on the link"
+    );
 }
 
 #[test]
@@ -414,7 +479,11 @@ fn corrupt_next_rewrites_one_packet_and_the_decoder_survives_it() {
     net.step();
     send(&mut net, client, host, Ping(2), SendMode::Reliable);
     net.run(3);
-    assert_eq!(values(&net, host), vec![2], "the truncated one is refused, the next is fine");
+    assert_eq!(
+        values(&net, host),
+        vec![2],
+        "the truncated one is refused, the next is fine"
+    );
 }
 
 #[test]

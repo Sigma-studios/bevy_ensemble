@@ -429,7 +429,9 @@ pub(crate) fn offer_inbound(
 
     let mut duplicated = 0;
     // A reliable channel deduplicates, so a duplicate never reaches the decode seam.
-    if channel == ChannelModel::Unreliable && config.duplicate > 0.0 && sim.roll() < config.duplicate
+    if channel == ChannelModel::Unreliable
+        && config.duplicate > 0.0
+        && sim.roll() < config.duplicate
     {
         let release = schedule(&mut sim);
         sim.enqueue(sender, packet.to_vec(), release, received_at);
@@ -460,7 +462,10 @@ mod tests {
         for (i, release) in releases.iter().enumerate() {
             sim.enqueue(sender, vec![i as u8], *release, Instant::now());
         }
-        sim.take_due(f64::MAX).into_iter().map(|(_, b, _)| b[0]).collect()
+        sim.take_due(f64::MAX)
+            .into_iter()
+            .map(|(_, b, _)| b[0])
+            .collect()
     }
 
     #[test]
@@ -507,7 +512,10 @@ mod tests {
         // overtakes the one in front of it -- what an unreliable channel really does.
         let mut sim = NetSim::default();
         assert_eq!(sim.channel_model(), ChannelModel::Unreliable);
-        assert_eq!(drain_in_order(&mut sim, Some(1), &[0.3, 0.1, 0.2]), vec![1, 2, 0]);
+        assert_eq!(
+            drain_in_order(&mut sim, Some(1), &[0.3, 0.1, 0.2]),
+            vec![1, 2, 0]
+        );
     }
 
     #[test]
@@ -516,7 +524,10 @@ mod tests {
         // order however unlucky the jitter samples were.
         let mut sim = NetSim::default();
         sim.set_channel_model(ChannelModel::Reliable);
-        assert_eq!(drain_in_order(&mut sim, Some(1), &[0.3, 0.1, 0.2]), vec![0, 1, 2]);
+        assert_eq!(
+            drain_in_order(&mut sim, Some(1), &[0.3, 0.1, 0.2]),
+            vec![0, 1, 2]
+        );
     }
 
     #[test]
@@ -543,7 +554,11 @@ mod tests {
         sim.enqueue(Some(1), vec![0], 1.0, Instant::now());
         sim.enqueue(Some(2), vec![1], 0.5, Instant::now());
 
-        let due: Vec<u8> = sim.take_due(0.6).into_iter().map(|(_, b, _)| b[0]).collect();
+        let due: Vec<u8> = sim
+            .take_due(0.6)
+            .into_iter()
+            .map(|(_, b, _)| b[0])
+            .collect();
         assert_eq!(due, vec![1], "peer 2 was held back by a packet of peer 1's");
     }
 
@@ -593,7 +608,10 @@ mod tests {
         // The other half of the contract: the default model still models a wire.
         let (dropped, duplicated) = offer_many(NetPreset::BadWifi, ChannelModel::Unreliable, 500);
         assert!(dropped > 0, "3% loss over 500 packets dropped none");
-        assert!(duplicated > 0, "1% duplication over 500 packets duplicated none");
+        assert!(
+            duplicated > 0,
+            "1% duplication over 500 packets duplicated none"
+        );
     }
 
     #[test]

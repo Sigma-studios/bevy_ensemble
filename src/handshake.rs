@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     EnsembleMessageRegistry, Host, HostUuid, Lobby, LobbyClient, LobbyClientPlayerUuid,
-    LobbyJoinFailed, LobbyLeft, LobbyLeftReason, LocalMultiplayerPlayerId,
-    ReceivedEnsembleMessage, SendMode,
+    LobbyJoinFailed, LobbyLeft, LobbyLeftReason, LocalMultiplayerPlayerId, ReceivedEnsembleMessage,
+    SendMode,
     messages::{LobbyClientMessage, LobbyMessage},
     registry::{HeldUntilVerified, PROTOCOL_VERSION, decode_verified_packet},
 };
@@ -81,6 +81,16 @@ impl ProtocolHandshake {
 /// understand anything you send.
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct HandshakeVerified;
+
+/// Peers whose protocol matched before this side had an entity to mark: a client's handshake
+/// that reached the host in the frame before the host promoted it, or a host's that reached
+/// the client while its lobby was still pending. Consumed by [`verify_promoted_peers`].
+///
+/// Without it a join could fail on timing alone. The handshake is sent once, on promotion;
+/// the two promotions happen in whichever order the two ready handshakes land, and a
+/// handshake that found no seat was dropped and never resent.
+#[derive(Resource, Debug, Default)]
+pub(crate) struct ProtocolMatched(std::collections::HashSet<u128>);
 
 /// State our protocol to each new peer, once.
 pub(crate) fn announce_protocol(
@@ -142,12 +152,38 @@ pub(crate) fn replay_held_packets(
     });
 }
 
+/// A seat that appears after its peer's handshake already matched is verified now.
+pub(crate) fn verify_promoted_peers(
+    mut commands: Commands,
+    mut matched: ResMut<ProtocolMatched>,
+    promoted_clients: Query<(Entity, &LobbyClientPlayerUuid), Added<LobbyClient>>,
+    promoted_lobbies: Query<Entity, (Added<Lobby>, Without<Host>)>,
+    host: Option<Res<HostUuid>>,
+) {
+    if matched.0.is_empty() {
+        return;
+    }
+    for (client, uuid) in promoted_clients.iter() {
+        if matched.0.remove(&uuid.0) {
+            commands.entity(client).try_insert(HandshakeVerified);
+        }
+    }
+    if let Some(host) = host {
+        for lobby in promoted_lobbies.iter() {
+            if matched.0.remove(&host.0) {
+                commands.entity(lobby).try_insert(HandshakeVerified);
+            }
+        }
+    }
+}
+
 /// Compare what arrived against what we hold; verify on a match, end the join otherwise.
 pub(crate) fn verify_protocol(
     mut commands: Commands,
     registry: Res<EnsembleMessageRegistry>,
     mut messages: MessageReader<ReceivedEnsembleMessage<ProtocolHandshake>>,
     mut held: ResMut<HeldUntilVerified>,
+    mut matched: ResMut<ProtocolMatched>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
     client_lobby: Option<Single<Entity, (With<Lobby>, Without<Host>)>>,
     lobby_clients: Query<(Entity, &LobbyClientPlayerUuid), With<LobbyClient>>,
@@ -164,12 +200,18 @@ pub(crate) fn verify_protocol(
 
         if theirs.version == ours.version && theirs.hash == ours.hash {
             if host_lobby.is_some() {
-                if let Some((client, _)) = lobby_clients.iter().find(|(_, uuid)| uuid.0 == sender)
-                {
-                    commands.entity(client).try_insert(HandshakeVerified);
+                match lobby_clients.iter().find(|(_, uuid)| uuid.0 == sender) {
+                    Some((client, _)) => {
+                        commands.entity(client).try_insert(HandshakeVerified);
+                    }
+                    None => {
+                        matched.0.insert(sender);
+                    }
                 }
             } else if let Some(lobby) = client_lobby.as_ref() {
                 commands.entity(**lobby).try_insert(HandshakeVerified);
+            } else {
+                matched.0.insert(sender);
             }
             continue;
         }
@@ -220,8 +262,14 @@ mod tests {
     fn the_difference_names_the_first_registration_that_differs() {
         let ours = handshake(&["A", "B", "C"]);
         let theirs = handshake(&["A", "C"]);
-        assert_eq!(ours.difference(&theirs), "`B` is registered here and not there");
-        assert_eq!(theirs.difference(&ours), "`B` is registered there and not here");
+        assert_eq!(
+            ours.difference(&theirs),
+            "`B` is registered here and not there"
+        );
+        assert_eq!(
+            theirs.difference(&ours),
+            "`B` is registered there and not here"
+        );
     }
 
     #[test]

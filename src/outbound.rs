@@ -157,7 +157,11 @@ mod tests {
         batches.push(entity(1), SendMode::Unreliable, vec![2, 0]);
         batches.push(entity(1), SendMode::Reliable, vec![3, 0]);
         let taken = batches.take();
-        assert_eq!(taken.len(), 2, "reliable messages rejoin their batch; unreliable has its own");
+        assert_eq!(
+            taken.len(),
+            2,
+            "reliable messages rejoin their batch; unreliable has its own"
+        );
         assert_eq!(taken[0].packets.len(), 2);
     }
 
@@ -177,7 +181,11 @@ mod tests {
         batches.push(entity(1), SendMode::Reliable, big.clone());
         batches.push(entity(1), SendMode::Reliable, big);
         let taken = batches.take();
-        assert_eq!(taken.len(), 3, "two halves plus framing exceed the limit, so each goes alone");
+        assert_eq!(
+            taken.len(),
+            3,
+            "two halves plus framing exceed the limit, so each goes alone"
+        );
         assert!(taken.iter().all(|b| b.bytes <= MAX_DATAGRAM_BYTES));
     }
 }

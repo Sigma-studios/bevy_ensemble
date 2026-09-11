@@ -5,7 +5,8 @@ use bevy_ensemble::{
 };
 
 use crate::{
-    EnsembleSocketRes, LobbyClientWebrtcUuid, LobbyHostUuid, LobbyWebrtcId, PendingWebrtcLobbyClient,
+    EnsembleSocketRes, LobbyClientWebrtcUuid, LobbyHostUuid, LobbyWebrtcId,
+    PendingWebrtcLobbyClient,
 };
 
 /// How often a peer restates its readiness handshake, in seconds.
@@ -189,7 +190,9 @@ mod tests {
         ReceivedEnsembleMessage,
     };
 
-    use super::{WebrtcReadyHandshake, handshake_is_from_host, promote_client_lobby_on_host_handshake};
+    use super::{
+        WebrtcReadyHandshake, handshake_is_from_host, promote_client_lobby_on_host_handshake,
+    };
     use crate::{LobbyHostUuid, LobbyWebrtcId};
 
     const HOST: u128 = 0xA;
@@ -200,7 +203,7 @@ mod tests {
     fn app_with_a_pending_join() -> App {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, EnsemblePlugin))
-            .register_control_message_type::<WebrtcReadyHandshake>(
+            .register_backend_handshake_message_type::<WebrtcReadyHandshake>(
                 "bevy_ensemble_webrtc/ReadyHandshake",
                 MessageAuthority::HostOnly,
             )
@@ -212,12 +215,11 @@ mod tests {
     }
 
     fn write_host_handshake(app: &mut App, sender: u128) {
-        app.world_mut()
-            .write_message(ReceivedEnsembleMessage {
-                sender: Some(sender),
-                message: WebrtcReadyHandshake { from_host: true },
-                received_at: bevy_ensemble::Instant::now(),
-            });
+        app.world_mut().write_message(ReceivedEnsembleMessage {
+            sender: Some(sender),
+            message: WebrtcReadyHandshake { from_host: true },
+            received_at: bevy_ensemble::Instant::now(),
+        });
     }
 
     fn lobby_is_promoted(app: &mut App) -> bool {
@@ -230,7 +232,11 @@ mod tests {
             .query_filtered::<(), (With<PendingLobby>, Without<Host>)>()
             .iter(world)
             .count();
-        assert_eq!(promoted + pending, 1, "the lobby entity should still exist, once");
+        assert_eq!(
+            promoted + pending,
+            1,
+            "the lobby entity should still exist, once"
+        );
         promoted == 1
     }
 
@@ -247,7 +253,10 @@ mod tests {
 
         write_host_handshake(&mut app, HOST);
         app.update();
-        assert!(lobby_is_promoted(&mut app), "the host's own handshake promotes it");
+        assert!(
+            lobby_is_promoted(&mut app),
+            "the host's own handshake promotes it"
+        );
     }
 
     #[test]

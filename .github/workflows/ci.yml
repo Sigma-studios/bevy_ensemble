@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main, "phase/**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+      # Steam needs the Steamworks SDK on the linker path; it is checked, not tested, here.
+      - run: cargo test --workspace --exclude bevy_ensemble_steam
+      - run: cargo check -p bevy_ensemble_steam
+
+  guards:
+    name: guards (clippy, fmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --exclude bevy_ensemble_steam --all-targets -- -D warnings -A clippy::collapsible_if -A clippy::type_complexity -A clippy::too_many_arguments
+
+  wasm:
+    name: wasm (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --target wasm32-unknown-unknown -p bevy_ensemble_sockets -p bevy_ensemble_webrtc
