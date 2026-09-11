@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = { version = "0.19", default-features = false, features = ["std", "serialize"] }
+bevy = { version = "0.19", default-features = false, features = ["std", "serialize", "bevy_log"] }
 # `netdebug` carries netsim, which `use_netsim` drives. It is on by default upstream;
 # naming it here means a game that strips it from its own build does not break this crate.
 bevy_ensemble = { path = "../..", features = ["netdebug"] }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
