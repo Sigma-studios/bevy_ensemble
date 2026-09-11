@@ -88,5 +88,34 @@ pub(crate) fn register_session_messages(app: &mut App) {
     app.add_message::<RefreshLobbies>()
         .add_message::<JoinLobby>()
         .add_message::<LeaveLobby>()
-        .add_message::<LobbyJoinFailed>();
+        .add_message::<LobbyJoinFailed>()
+        .add_message::<LobbyLeft>();
+}
+
+/// A session this peer was in has ended, and why.
+///
+/// Written by whoever tears the lobby down — the core when a client is kicked or its host stops
+/// answering, a backend when the host disconnects or the signalling server goes — so a game has
+/// one place to learn that it is no longer in a session, and can tell a kick from a crash. Until
+/// this existed a departing peer had to watch `RemovedComponents<Lobby>`, which never fires for a
+/// join that was refused, and could not tell "you were kicked" from "the host left".
+#[derive(Message, Debug, Clone, PartialEq, Eq)]
+pub struct LobbyLeft {
+    pub reason: LobbyLeftReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LobbyLeftReason {
+    /// This peer asked to leave.
+    Left,
+    /// The host removed this peer.
+    Kicked,
+    /// The host's connection ended.
+    HostGone,
+    /// The host stopped answering pings for longer than [`PeerTimeout`](crate::PeerTimeout).
+    PeerTimeout,
+    /// The signalling connection closed, so no new peer could ever be reached.
+    SignallingLost,
+    /// The two builds do not speak the same protocol; the text names the difference.
+    ProtocolMismatch(String),
 }

@@ -93,24 +93,78 @@ impl<T> EnsembleMessage for T where
 /// app.register_ensemble_message_type::<MyMessage>()
 ///     .register_ensemble_message_type::<AnotherMessage>();
 /// ```
+/// Who a peer accepts a message type from.
+///
+/// The transport says who sent a packet; this says whether that sender is allowed to. The host
+/// is the authority in this stack, so the only question that needs answering is on a client:
+/// does it take this type from anyone, or only from its host?
+///
+/// A host accepts every registered type from any connected peer — it is the one deciding what
+/// to do with them — and a client's own outgoing traffic is never restricted by this.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MessageAuthority {
+    /// Any peer. Chat, inputs, requests to the host.
+    #[default]
+    Any,
+    /// On a client, only the host (as identified by [`HostUuid`](crate::HostUuid)); a copy from
+    /// any other peer is dropped and logged. Roster changes, kicks, authoritative state.
+    HostOnly,
+}
+
 pub trait EnsembleAppExt {
+    /// Register a message type that any peer may send. See [`MessageAuthority::Any`].
     fn register_ensemble_message_type<T: EnsembleMessage>(&mut self) -> &mut Self;
+
+    /// Register a message type with a stated [`MessageAuthority`].
+    fn register_ensemble_message_type_with<T: EnsembleMessage>(
+        &mut self,
+        authority: MessageAuthority,
+    ) -> &mut Self;
+
+    /// Register a message type that is part of the protocol rather than of the game: a
+    /// handshake, a roster sync, a ping. Such a type is never relayed through the broadcast
+    /// path, so a client cannot wrap a control message in an envelope and have the host
+    /// deliver it to everyone as if the host had said it.
+    fn register_control_message_type<T: EnsembleMessage>(
+        &mut self,
+        authority: MessageAuthority,
+    ) -> &mut Self;
 }
 
 impl EnsembleAppExt for App {
     fn register_ensemble_message_type<T: EnsembleMessage>(&mut self) -> &mut Self {
-        self.init_resource::<EnsembleMessageRegistry>()
-            .add_message::<ReceivedEnsembleMessage<T>>()
-            .add_observer(observers::encode_lobby_message::<T>)
-            .add_observer(observers::encode_lobby_client_message::<T>);
-
-        let mut registry = self
-            .world_mut()
-            .resource_mut::<EnsembleMessageRegistry>();
-        registry.register::<T>();
-
-        self
+        self.register_ensemble_message_type_with::<T>(MessageAuthority::Any)
     }
+
+    fn register_ensemble_message_type_with<T: EnsembleMessage>(
+        &mut self,
+        authority: MessageAuthority,
+    ) -> &mut Self {
+        register::<T>(self, authority, true)
+    }
+
+    fn register_control_message_type<T: EnsembleMessage>(
+        &mut self,
+        authority: MessageAuthority,
+    ) -> &mut Self {
+        register::<T>(self, authority, false)
+    }
+}
+
+fn register<T: EnsembleMessage>(
+    app: &mut App,
+    authority: MessageAuthority,
+    relayable: bool,
+) -> &mut App {
+    app.init_resource::<EnsembleMessageRegistry>()
+        .add_message::<ReceivedEnsembleMessage<T>>()
+        .add_observer(observers::encode_lobby_message::<T>)
+        .add_observer(observers::encode_lobby_client_message::<T>);
+
+    let mut registry = app.world_mut().resource_mut::<EnsembleMessageRegistry>();
+    registry.register::<T>(authority, relayable);
+
+    app
 }
 
 /// Request to start hosting a new lobby.

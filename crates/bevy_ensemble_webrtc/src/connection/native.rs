@@ -39,6 +39,7 @@ impl WsHandlerBuilder {
                 Ok(pair) => pair,
                 Err(e) => {
                     error!("Failed to connect to signaling server at {server_url}: {e}");
+                    let _ = lobby_event_tx.send(LobbyEvent::SignallingClosed);
                     return;
                 }
             };
@@ -58,16 +59,24 @@ impl WsHandlerBuilder {
                 .is_err()
             {
                 error!("Failed to send authentication message");
+                let _ = lobby_event_tx.send(LobbyEvent::SignallingClosed);
                 return;
             }
 
+            // Whether the loop ended because the server went away, as opposed to the plugin
+            // dropping its end of the command channel to rebuild. Only the former is news.
+            let mut lost = false;
             loop {
                 tokio::select! {
-                    Some(msg) = ws_source.next() => {
-                        let Ok(msg) = msg else { break; };
+                    msg = ws_source.next() => {
+                        // `None` is the stream ending without a close frame -- a server that
+                        // was killed, a TCP reset. Matching `Some(..)` in the pattern would
+                        // merely disable this branch and leave the task waiting on commands,
+                        // with nobody told.
+                        let Some(Ok(msg)) = msg else { lost = true; break; };
                         let bytes = match msg {
                             Message::Binary(b) => b,
-                            Message::Close(_) => break,
+                            Message::Close(_) => { lost = true; break; }
                             _ => continue,
                         };
                         let Ok(server_msg) = decode::<ServerMessage>(&bytes) else {
@@ -77,18 +86,22 @@ impl WsHandlerBuilder {
                         dispatch_server_message(server_msg, &signal_tx, &lobby_event_tx);
                     }
 
-                    Some(cmd) = lobby_command_rx.recv() => {
+                    cmd = lobby_command_rx.recv() => {
+                        let Some(cmd) = cmd else { break; };
                         let Some(bytes) = encode(&cmd) else {
                             warn!("Failed to serialize command");
                             continue;
                         };
                         if ws_sink.send(Message::Binary(bytes.into())).await.is_err() {
+                            lost = true;
                             break;
                         }
                     }
-
-                    else => break,
                 }
+            }
+            if lost {
+                warn!("the connection to the signaling server at {server_url} was lost");
+                let _ = lobby_event_tx.send(LobbyEvent::SignallingClosed);
             }
         });
     }

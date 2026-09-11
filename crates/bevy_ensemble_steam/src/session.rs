@@ -8,13 +8,14 @@
 
 use bevy::prelude::*;
 use bevy_ensemble::{
-    Host, JoinLobby, LeaveLobby, Lobby, LobbyClient, PendingLobby, PublicLobbies, PublicLobbyInfo,
-    RefreshLobbies,
+    Host, JoinLobby, LeaveLobby, Lobby, LobbyClient, LobbyLeft, LobbyLeftReason, PendingLobby,
+    PublicLobbies, PublicLobbyInfo, RefreshLobbies,
 };
 use bevy_steamworks::Client;
 
 use crate::{
-    JoinSteamLobby, LobbyClientSteamId, LobbySteamId, MAX_LOBBY_PLAYERS, SteamFriendLobbies,
+    JoinSteamLobby, LobbyClientSteamId, LobbyHostSteamId, LobbySteamId, MAX_LOBBY_PLAYERS,
+    SteamFriendLobbies, host_of,
 };
 
 /// Discovery restarts by dropping the cached list: `populate_friend_lobbies` refills it the
@@ -79,19 +80,30 @@ pub(crate) fn join_lobby(
 pub(crate) fn leave_lobby(
     mut commands: Commands,
     mut requests: MessageReader<LeaveLobby>,
+    mut lobby_left: MessageWriter<LobbyLeft>,
     steam_client: Res<Client>,
     host_lobbies: Query<(Entity, &LobbySteamId), (With<Lobby>, With<Host>)>,
-    client_lobbies: Query<(Entity, &LobbySteamId), (With<Lobby>, Without<Host>)>,
-    pending_lobbies: Query<Entity, With<PendingLobby>>,
+    client_lobbies: Query<
+        (Entity, &LobbySteamId, Option<&LobbyHostSteamId>),
+        (With<Lobby>, Without<Host>),
+    >,
+    pending_lobbies: Query<(Entity, Option<&LobbySteamId>), With<PendingLobby>>,
     lobby_clients: Query<(Entity, &LobbyClientSteamId), With<LobbyClient>>,
 ) {
     if requests.read().next().is_none() {
         return;
     }
 
-    for entity in pending_lobbies.iter() {
+    for (entity, lobby_id) in pending_lobbies.iter() {
+        // A pending client has already entered the Steam lobby; abandoning the entity alone
+        // would leave this peer listed as a member of a session it is not in.
+        if let Some(lobby_id) = lobby_id {
+            steam_client.matchmaking().leave_lobby(lobby_id.0);
+        }
         commands.entity(entity).try_despawn();
     }
+
+    let mut left = false;
 
     if let Some((host_entity, lobby_id)) = host_lobbies.iter().next() {
         for (client_entity, client_steam_id) in lobby_clients.iter() {
@@ -102,12 +114,20 @@ pub(crate) fn leave_lobby(
         }
         steam_client.matchmaking().leave_lobby(lobby_id.0);
         commands.entity(host_entity).try_despawn();
+        left = true;
     }
 
-    if let Some((client_entity, lobby_id)) = client_lobbies.iter().next() {
-        let host = steam_client.matchmaking().lobby_owner(lobby_id.0);
+    if let Some((client_entity, lobby_id, pinned_host)) = client_lobbies.iter().next() {
+        let host = host_of(&steam_client, lobby_id.0, pinned_host);
         steam_client.networking().close_p2p_session(host);
         steam_client.matchmaking().leave_lobby(lobby_id.0);
         commands.entity(client_entity).try_despawn();
+        left = true;
+    }
+
+    if left {
+        lobby_left.write(LobbyLeft {
+            reason: LobbyLeftReason::Left,
+        });
     }
 }

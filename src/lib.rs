@@ -104,7 +104,7 @@ mod systems;
 mod transport;
 mod types;
 
-pub use broadcast::{BroadcastLobbyMessage, LobbyBroadcastAppExt, LobbyBroadcastPlugin};
+pub use broadcast::{BroadcastLobbyMessage, LobbyBroadcastAppExt, LobbyBroadcastEnvelope, LobbyBroadcastPlugin};
 pub use components::*;
 pub use messages::*;
 #[cfg(feature = "netdebug")]
@@ -113,11 +113,14 @@ pub use netdebug::{NetDebugConfig, NetDebugExtras, NetDebugPlugin};
 pub use netmetrics::{NetMetrics, NetMetricsPlugin};
 #[cfg(feature = "netdebug")]
 pub use netsim::{ChannelModel, NetPreset, NetSim, NetSimClock, NetSimConfig, NetSimPlugin};
-pub use ping::{PeerLastPong, PeerRtt, PeerRttJitter, PeerWireRtt};
-pub use player_data::{PlayerData, PlayerDataPlugin, SetPlayerData};
-pub use registry::{EnsembleMessageRegistry, decode_ensemble_packet, encode_ensemble_message};
+pub use ping::{EnsemblePing, EnsemblePong, PeerLastPong, PeerRtt, PeerRttJitter, PeerTimeout, PeerWireRtt};
+pub use player_data::{PlayerData, PlayerDataPlugin, SetPlayerData, SyncPlayerData};
+pub use registry::{
+    EnsembleMessageRegistry, RefusedPackets, decode_ensemble_packet, encode_ensemble_message,
+    packet_index,
+};
 pub use route::PeerRoute;
-pub use session::{JoinLobby, LeaveLobby, LobbyJoinFailed, RefreshLobbies};
+pub use session::{JoinLobby, LeaveLobby, LobbyJoinFailed, LobbyLeft, LobbyLeftReason, RefreshLobbies};
 pub use transport::{EnsembleTransportAppExt, TransportBackend};
 pub use types::*;
 
@@ -156,16 +159,23 @@ impl Plugin for EnsemblePlugin {
         session::register_session_messages(app);
 
         app.init_resource::<EnsembleMessageRegistry>()
+            .init_resource::<registry::RefusedPackets>()
+            .init_resource::<ping::PeerTimeout>()
+            .init_resource::<ping::OutstandingPings>()
             .add_message::<StartHosting>()
-            .register_ensemble_message_type::<SyncLobbyParticipant>()
-            .register_ensemble_message_type::<RemoveLobbyParticipant>()
-            .register_ensemble_message_type::<ping::EnsemblePing>()
-            .register_ensemble_message_type::<ping::EnsemblePong>()
+            // Roster changes are the host's to make: a client accepts them only from its host.
+            .register_control_message_type::<SyncLobbyParticipant>(MessageAuthority::HostOnly)
+            .register_control_message_type::<RemoveLobbyParticipant>(MessageAuthority::HostOnly)
+            // Pings go both ways; they are control traffic all the same, so the relay will not
+            // carry one.
+            .register_control_message_type::<ping::EnsemblePing>(MessageAuthority::Any)
+            .register_control_message_type::<ping::EnsemblePong>(MessageAuthority::Any)
             .add_observer(observers::on_lobby_client_removed)
             .add_systems(
                 Update,
                 (
                     systems::spawn_host_lobby,
+                    systems::publish_host_uuid,
                     systems::add_host_lobby_participant,
                     systems::sync_host_lobby_participant_identity,
                     systems::add_remote_lobby_participants,
@@ -175,12 +185,14 @@ impl Plugin for EnsemblePlugin {
                         .after(systems::add_remote_lobby_participants),
                     systems::apply_received_lobby_participants,
                     systems::apply_removed_lobby_participants,
+                    ping::arm_peer_liveness,
                     ping::send_pings,
                     // Packets are drained in PreUpdate (see `EnsembleSet::ReceivePackets`),
                     // so these Update handlers already see this frame's pings/pongs.
                     ping::respond_to_pings,
                     ping::receive_pongs,
                     ping::tick_last_pong,
+                    ping::detect_dead_peers.after(ping::tick_last_pong),
                 ),
             );
 
