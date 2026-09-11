@@ -173,7 +173,7 @@ If your backend uses internal messages for handshaking or protocol purposes, reg
 ```rust,ignore
 impl Plugin for MyBackendPlugin {
     fn build(&self, app: &mut App) {
-        app.register_ensemble_message_type::<MyHandshakeMessage>();
+        app.register_ensemble_message_type::<MyHandshakeMessage>("my_backend/handshake");
     }
 }
 ```

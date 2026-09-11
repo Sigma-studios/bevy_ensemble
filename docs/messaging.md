@@ -16,13 +16,21 @@ struct ChatMessage {
 
 ## Registering Messages
 
-Every message type must be registered during app setup. Registration order must be **identical on all peers** since types are identified by sequential index on the wire:
+Every message type is registered during app setup under a wire name. The wire index is the
+name's rank among all registered names, frozen when the app finishes building, so
+registration order does not matter and two peers with the same set of names agree on every
+index. A name registered twice, or a registration after the app is built, panics. The join
+handshake (E2) compares `wire_hash()` — the hash of the sorted names — and refuses a peer
+whose set differs, naming the first difference.
 
 ```rust,ignore
-app.register_ensemble_message_type::<ChatMessage>()
-    .register_ensemble_message_type::<PlayerAction>()
-    .register_ensemble_message_type::<GameState>();
+app.register_ensemble_message_type::<ChatMessage>("chat")
+    .register_ensemble_message_type::<PlayerAction>("player_action")
+    .register_ensemble_message_type_with::<GameState>("game_state", MessageAuthority::HostOnly);
 ```
+
+`MessageAuthority::HostOnly` makes a type one that only the host may send: a client that
+receives it from anyone else drops it, and the host never relays it.
 
 ## Sending Messages
 
@@ -138,7 +146,7 @@ ReceivedEnsembleMessage<T>    (read by your systems via MessageReader)
 ## Wire Format
 
 Each packet is:
-- **2 bytes**: Little-endian `u16` type index (assigned by registration order)
+- **2 bytes**: Little-endian `u16` type index (the wire name's rank among the sorted names)
 - **N bytes**: postcard-encoded message payload
 
 This keeps packets compact while supporting arbitrary custom types.

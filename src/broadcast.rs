@@ -3,8 +3,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Host, Lobby, LocalMultiplayerPlayerId, PlayerUUID, SendMode,
-    messages::{EnsembleAppExt, EnsembleMessage, LobbyMessage, MessageAuthority, ReceivedEnsembleMessage},
-    registry::{EnsembleMessageRegistry, decode_verified_packet, encode_ensemble_message, packet_index, refuse},
+    messages::{
+        EnsembleAppExt, EnsembleMessage, LobbyMessage, MessageAuthority, ReceivedEnsembleMessage,
+    },
+    registry::{
+        EnsembleMessageRegistry, decode_verified_packet, encode_ensemble_message, packet_index,
+        refuse,
+    },
 };
 
 /// Internal envelope that wraps a serialized broadcast message with its original sender.
@@ -85,11 +90,17 @@ impl<T: EnsembleMessage> BroadcastLobbyMessage<T> {
 ///    .register_broadcast_message::<ChatMessage>();
 /// ```
 pub trait LobbyBroadcastAppExt {
-    fn register_broadcast_message<T: EnsembleMessage>(&mut self, wire_name: &'static str) -> &mut Self;
+    fn register_broadcast_message<T: EnsembleMessage>(
+        &mut self,
+        wire_name: &'static str,
+    ) -> &mut Self;
 }
 
 impl LobbyBroadcastAppExt for App {
-    fn register_broadcast_message<T: EnsembleMessage>(&mut self, wire_name: &'static str) -> &mut Self {
+    fn register_broadcast_message<T: EnsembleMessage>(
+        &mut self,
+        wire_name: &'static str,
+    ) -> &mut Self {
         self.register_ensemble_message_type::<T>(wire_name)
             .add_observer(encode_broadcast_message::<T>);
         self
@@ -119,10 +130,10 @@ impl Plugin for LobbyBroadcastPlugin {
             "bevy_ensemble/BroadcastEnvelope",
             MessageAuthority::HostOnly,
         )
-            .add_systems(
-                PreUpdate,
-                relay_broadcast_envelopes.after(crate::EnsembleSet::ReceivePackets),
-            );
+        .add_systems(
+            PreUpdate,
+            relay_broadcast_envelopes.after(crate::EnsembleSet::ReceivePackets),
+        );
     }
 }
 
@@ -235,11 +246,14 @@ fn relay_broadcast_envelopes(world: &mut World) {
         let mut relay = envelope.message.clone();
         relay.sender = sender;
         let send_mode = relay.send_mode;
-        world.commands().entity(lobby).trigger(move |entity| LobbyMessage {
-            entity,
-            message: relay,
-            send_mode,
-        });
+        world
+            .commands()
+            .entity(lobby)
+            .trigger(move |entity| LobbyMessage {
+                entity,
+                message: relay,
+                send_mode,
+            });
 
         decode_verified_packet(world, Some(sender), &envelope.message.payload, received_at);
     }

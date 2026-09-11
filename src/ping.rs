@@ -210,28 +210,24 @@ pub(crate) fn send_pings(
 
     let seq = outstanding.issue(Instant::now());
     for lobby in lobbies.iter() {
-        commands
-            .entity(lobby)
-            .trigger(move |entity| LobbyMessage {
-                entity,
-                message: EnsemblePing {
-                    seq,
-                    reliable: false,
-                },
-                send_mode: SendMode::Unreliable,
-            });
+        commands.entity(lobby).trigger(move |entity| LobbyMessage {
+            entity,
+            message: EnsemblePing {
+                seq,
+                reliable: false,
+            },
+            send_mode: SendMode::Unreliable,
+        });
         // The reliable twin goes with no delay: a ping held to be packed with the next message
         // measures the packing, not the path.
-        commands
-            .entity(lobby)
-            .trigger(move |entity| LobbyMessage {
-                entity,
-                message: EnsemblePing {
-                    seq,
-                    reliable: true,
-                },
-                send_mode: SendMode::ReliableNoDelay,
-            });
+        commands.entity(lobby).trigger(move |entity| LobbyMessage {
+            entity,
+            message: EnsemblePing {
+                seq,
+                reliable: true,
+            },
+            send_mode: SendMode::ReliableNoDelay,
+        });
     }
 }
 
@@ -410,12 +406,26 @@ pub(crate) fn receive_pongs(
                 else {
                     continue;
                 };
-                (entity, prev_rtt, prev_wire, prev_jitter, prev_reliable, prev_seq)
+                (
+                    entity,
+                    prev_rtt,
+                    prev_wire,
+                    prev_jitter,
+                    prev_reliable,
+                    prev_seq,
+                )
             } else if let Some(lobby_entity) = client_lobby.as_ref() {
                 let (prev_rtt, prev_wire, prev_jitter, prev_reliable, prev_seq) = client_lobby_rtt
                     .get(**lobby_entity)
                     .unwrap_or((None, None, None, None, None));
-                (**lobby_entity, prev_rtt, prev_wire, prev_jitter, prev_reliable, prev_seq)
+                (
+                    **lobby_entity,
+                    prev_rtt,
+                    prev_wire,
+                    prev_jitter,
+                    prev_reliable,
+                    prev_seq,
+                )
             } else {
                 continue;
             };
@@ -486,7 +496,12 @@ pub(crate) fn detect_dead_peers(
     timeout: Res<PeerTimeout>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
     clients: Query<
-        (Entity, &LobbyClientPlayerUuid, &PeerLastPong, Option<&LivenessGrace>),
+        (
+            Entity,
+            &LobbyClientPlayerUuid,
+            &PeerLastPong,
+            Option<&LivenessGrace>,
+        ),
         With<LobbyClient>,
     >,
     client_lobbies: Query<
@@ -666,8 +681,12 @@ mod tests {
         let base = epoch();
         let outstanding = outstanding_at(base, &[1.0]);
         assert!(
-            sample_from(&outstanding, &pong(1, 0), after(base, 1.0 + MAX_ROUND_TRIP_SECS + 1.0))
-                .is_none()
+            sample_from(
+                &outstanding,
+                &pong(1, 0),
+                after(base, 1.0 + MAX_ROUND_TRIP_SECS + 1.0)
+            )
+            .is_none()
         );
         assert!(
             sample_from(&outstanding, &pong(1, 0), after(base, 0.5)).is_none(),

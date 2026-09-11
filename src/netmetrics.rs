@@ -87,7 +87,10 @@ const SAMPLE_INTERVAL: f64 = 0.5;
 /// Global observer: count every serialized outbound packet.
 ///
 /// Registered on the app so it fires for packets produced by any backend.
-pub(crate) fn count_outbound(packet: On<SerializedLobbyPacket>, metrics: Option<ResMut<NetMetrics>>) {
+pub(crate) fn count_outbound(
+    packet: On<SerializedLobbyPacket>,
+    metrics: Option<ResMut<NetMetrics>>,
+) {
     if let Some(mut metrics) = metrics {
         metrics.tx_bytes += packet.packet.len() as u64;
         metrics.tx_packets += 1;

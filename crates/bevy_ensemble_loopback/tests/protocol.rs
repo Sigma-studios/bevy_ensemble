@@ -5,10 +5,9 @@ use std::time::Duration;
 use bevy::prelude::*;
 use bevy::time::TimeUpdateStrategy;
 use bevy_ensemble::{
-    EnsembleAppExt, EnsembleMessageRegistry, EnsemblePlugin, HandshakeVerified, Lobby,
-    LobbyClient, LobbyJoinFailed, LobbyLeft, LobbyLeftReason, LobbyMessage,
-    LocalMultiplayerPlayerId, PeerReliableRtt, PeerRtt, ReceivedEnsembleMessage, SendMode,
-    unframe_packet,
+    EnsembleAppExt, EnsembleMessageRegistry, EnsemblePlugin, HandshakeVerified, Lobby, LobbyClient,
+    LobbyJoinFailed, LobbyLeft, LobbyLeftReason, LobbyMessage, LocalMultiplayerPlayerId,
+    PeerReliableRtt, PeerRtt, ReceivedEnsembleMessage, SendMode, unframe_packet,
 };
 use bevy_ensemble_loopback::{LoopbackNetwork, LoopbackTransportPlugin, PeerId};
 use serde::{Deserialize, Serialize};
@@ -96,12 +95,19 @@ fn received(net: &LoopbackNetwork, peer: PeerId) -> Vec<u32> {
 
 fn has<C: Component>(net: &mut LoopbackNetwork, peer: PeerId) -> bool {
     let world = net.app_mut(peer).world_mut();
-    world.query_filtered::<(), With<C>>().iter(world).next().is_some()
+    world
+        .query_filtered::<(), With<C>>()
+        .iter(world)
+        .next()
+        .is_some()
 }
 
 fn lobby_clients(net: &mut LoopbackNetwork, host: PeerId) -> usize {
     let world = net.app_mut(host).world_mut();
-    world.query_filtered::<(), With<LobbyClient>>().iter(world).count()
+    world
+        .query_filtered::<(), With<LobbyClient>>()
+        .iter(world)
+        .count()
 }
 
 fn verified_clients(net: &mut LoopbackNetwork, host: PeerId) -> usize {
@@ -148,8 +154,15 @@ fn matching_peers_are_verified_at_the_join() {
     let host = net.add_host(1, peer(1, false));
     let client = net.add_client(2, peer(2, true));
     net.run(6);
-    assert!(has::<HandshakeVerified>(&mut net, client), "the client verified its host");
-    assert_eq!(verified_clients(&mut net, host), 1, "the host verified its client");
+    assert!(
+        has::<HandshakeVerified>(&mut net, client),
+        "the client verified its host"
+    );
+    assert_eq!(
+        verified_clients(&mut net, host),
+        1,
+        "the host verified its client"
+    );
 }
 
 #[test]
@@ -195,7 +208,10 @@ fn two_messages_to_one_peer_in_one_frame_share_a_packet() {
         .collect();
     assert_eq!(reliable.len(), 1, "one reliable datagram for the frame");
     let inner = unframe_packet(&reliable[0].bytes).expect("a frame");
-    assert!(inner.len() >= 2, "both messages (and any control traffic) rode in it");
+    assert!(
+        inner.len() >= 2,
+        "both messages (and any control traffic) rode in it"
+    );
     assert_eq!(received(&net, host), vec![1, 1002]);
 }
 
@@ -209,11 +225,18 @@ fn reliable_and_unreliable_never_share_a_frame() {
     send(&mut net, client, Alpha(1), SendMode::Reliable);
     send(&mut net, client, Beta(2), SendMode::Unreliable);
     net.run(3);
-    for packet in net.trace().iter().filter(|p| p.from == client && p.to == host) {
+    for packet in net
+        .trace()
+        .iter()
+        .filter(|p| p.from == client && p.to == host)
+    {
         if let Some(inner) = unframe_packet(&packet.bytes) {
             // Every message in a frame was sent on the frame's channel: an `Alpha` never
             // appears in an unreliable frame and a `Beta` never in a reliable one.
-            let registry = net.app(client).world().resource::<EnsembleMessageRegistry>();
+            let registry = net
+                .app(client)
+                .world()
+                .resource::<EnsembleMessageRegistry>();
             let alpha = registry.index_of::<Alpha>().unwrap().to_le_bytes();
             let beta = registry.index_of::<Beta>().unwrap().to_le_bytes();
             for message in inner {
@@ -241,7 +264,10 @@ fn a_no_delay_message_is_not_held_for_the_batch() {
     send(&mut net, client, Alpha(1), SendMode::ReliableNoDelay);
     send(&mut net, client, Alpha(2), SendMode::ReliableNoDelay);
     net.run(3);
-    let registry = net.app(client).world().resource::<EnsembleMessageRegistry>();
+    let registry = net
+        .app(client)
+        .world()
+        .resource::<EnsembleMessageRegistry>();
     let alpha = registry.index_of::<Alpha>().unwrap().to_le_bytes();
     let alone: Vec<_> = net
         .trace()

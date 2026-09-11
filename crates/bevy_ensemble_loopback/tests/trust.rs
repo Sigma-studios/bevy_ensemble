@@ -11,12 +11,13 @@ use std::time::Duration;
 use bevy::prelude::*;
 use bevy::time::TimeUpdateStrategy;
 use bevy_ensemble::{
-    BroadcastLobbyMessage, EnsembleMessageRegistry, EnsemblePlugin, EnsemblePong, Host, HostUuid,
-    Lobby, LobbyBroadcastAppExt, LobbyBroadcastEnvelope, LobbyBroadcastPlugin, LobbyClient,
-    LobbyLeft, LobbyLeftReason, LobbyParticipant, LocalMultiplayerPlayerId, PeerLastPong, PeerRtt,
-    PeerTimeout, PlayerData, PlayerDataPlugin, ReceivedEnsembleMessage, RefusedPackets,
-    RemoveLobbyParticipant, SendMode, SetPlayerData, StartHosting, SyncLobbyParticipant,
-    SyncPlayerData, encode_ensemble_message,
+    BroadcastLobbyMessage, EnsembleAppExt, EnsembleMessageRegistry, EnsemblePlugin, EnsemblePong,
+    HandshakeVerified, Host, HostUuid, Lobby, LobbyBroadcastAppExt, LobbyBroadcastEnvelope,
+    LobbyBroadcastPlugin, LobbyClient, LobbyClientPlayerUuid, LobbyLeft, LobbyLeftReason,
+    LobbyParticipant, LocalMultiplayerPlayerId, MessageAuthority, PROTOCOL_VERSION, PeerLastPong,
+    PeerRtt, PeerTimeout, PlayerData, PlayerDataPlugin, ProtocolHandshake, ReceivedEnsembleMessage,
+    RefusedPackets, RemoveLobbyParticipant, SendMode, SetPlayerData, StartHosting,
+    SyncLobbyParticipant, SyncPlayerData, encode_ensemble_message,
 };
 use bevy_ensemble_loopback::{Link, LoopbackNetwork, LoopbackTransportPlugin, PeerId};
 use serde::{Deserialize, Serialize};
@@ -29,11 +30,34 @@ struct Chat(String);
 #[derive(Message, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Name(String);
 
+/// Stands in for a backend's ready handshake: the message that promotes a pending lobby.
+#[derive(Message, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Ready;
+
+/// Stands in for any other control message.
+#[derive(Message, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Roster;
+
+#[derive(Resource, Default)]
+struct ReadySeen(Vec<Option<u128>>);
+
+fn collect_ready(
+    mut messages: MessageReader<ReceivedEnsembleMessage<Ready>>,
+    mut out: ResMut<ReadySeen>,
+) {
+    for message in messages.read() {
+        out.0.push(message.sender);
+    }
+}
+
 /// Chat as received, with the sender the transport reported.
 #[derive(Resource, Default)]
 struct Heard(Vec<(Option<u128>, String)>);
 
-fn collect_chat(mut messages: MessageReader<ReceivedEnsembleMessage<Chat>>, mut out: ResMut<Heard>) {
+fn collect_chat(
+    mut messages: MessageReader<ReceivedEnsembleMessage<Chat>>,
+    mut out: ResMut<Heard>,
+) {
     for message in messages.read() {
         out.0.push((message.sender, message.message.0.clone()));
     }
@@ -52,12 +76,20 @@ fn peer(uuid: u128) -> App {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins)
         .insert_resource(TimeUpdateStrategy::ManualDuration(FRAME))
-        .add_plugins((EnsemblePlugin, LoopbackTransportPlugin, LobbyBroadcastPlugin))
+        .add_plugins((
+            EnsemblePlugin,
+            LoopbackTransportPlugin,
+            LobbyBroadcastPlugin,
+        ))
         .add_plugins(PlayerDataPlugin::<Name>::default())
         .register_broadcast_message::<Chat>("Chat")
+        .register_backend_handshake_message_type::<Ready>("test/Ready", MessageAuthority::Any)
+        .register_control_message_type::<Roster>("test/Roster", MessageAuthority::Any)
         .insert_resource(LocalMultiplayerPlayerId(uuid))
         .init_resource::<Heard>()
         .init_resource::<Departures>()
+        .init_resource::<ReadySeen>()
+        .add_systems(Update, collect_ready)
         .add_systems(Update, (collect_chat, collect_left));
     app
 }
@@ -72,7 +104,11 @@ fn trio() -> (LoopbackNetwork, PeerId, PeerId, PeerId) {
     (net, host, a, b)
 }
 
-fn encode<T: bevy_ensemble::EnsembleMessage>(net: &LoopbackNetwork, at: PeerId, message: &T) -> Vec<u8> {
+fn encode<T: bevy_ensemble::EnsembleMessage>(
+    net: &LoopbackNetwork,
+    at: PeerId,
+    message: &T,
+) -> Vec<u8> {
     let registry = net.app(at).world().resource::<EnsembleMessageRegistry>();
     encode_ensemble_message(registry, message)
 }
@@ -110,12 +146,19 @@ fn participants(net: &mut LoopbackNetwork, peer: PeerId) -> Vec<(u128, bool)> {
 
 fn has_lobby(net: &mut LoopbackNetwork, peer: PeerId) -> bool {
     let world = net.app_mut(peer).world_mut();
-    world.query_filtered::<(), With<Lobby>>().iter(world).next().is_some()
+    world
+        .query_filtered::<(), With<Lobby>>()
+        .iter(world)
+        .next()
+        .is_some()
 }
 
 fn lobby_clients(net: &mut LoopbackNetwork, host: PeerId) -> usize {
     let world = net.app_mut(host).world_mut();
-    world.query_filtered::<(), With<LobbyClient>>().iter(world).count()
+    world
+        .query_filtered::<(), With<LobbyClient>>()
+        .iter(world)
+        .count()
 }
 
 fn name_of(net: &mut LoopbackNetwork, peer: PeerId, uuid: u128) -> Option<String> {
@@ -141,8 +184,16 @@ fn a_relayed_envelope_carries_the_transport_sender_not_the_claimed_one() {
     net.deliver_raw(host, 3, bytes);
     net.run(6);
 
-    assert_eq!(heard(&net, host), vec![(Some(3), "I am the host".into())], "the host knows better");
-    assert_eq!(heard(&net, a), vec![(Some(3), "I am the host".into())], "and so does A");
+    assert_eq!(
+        heard(&net, host),
+        vec![(Some(3), "I am the host".into())],
+        "the host knows better"
+    );
+    assert_eq!(
+        heard(&net, a),
+        vec![(Some(3), "I am the host".into())],
+        "and so does A"
+    );
     assert_eq!(heard(&net, b), vec![(Some(3), "I am the host".into())]);
 }
 
@@ -213,6 +264,69 @@ fn a_nested_envelope_does_not_amplify() {
     assert!(refused(&net, host) > 0);
 }
 
+/// The WebRTC backend promotes a pending lobby on its ready handshake, and the protocol
+/// handshake is announced on the promotion. Held behind the protocol comparison, the ready
+/// handshake could never arrive and no real join ever completed. A backend handshake is read
+/// from an unverified sender; any other control message still waits.
+#[test]
+fn a_backends_ready_handshake_is_read_before_the_protocol_is_verified() {
+    let (mut net, _host, a, b) = trio();
+    // B never verified a protocol with A: B is not A's host.
+    let ready = encode(&net, b, &Ready);
+    let roster = encode(&net, b, &Roster);
+    net.deliver_raw(a, 3, ready);
+    net.deliver_raw(a, 3, roster);
+    net.run(4);
+    assert_eq!(
+        net.app(a).world().resource::<ReadySeen>().0,
+        vec![Some(3)],
+        "the ready handshake was read from the unverified sender"
+    );
+    assert_eq!(
+        held_from(&net, a, 3),
+        1,
+        "and the other control message waits"
+    );
+}
+
+/// The two promotions happen in whichever order the two ready handshakes land. A client whose
+/// protocol handshake reaches the host a frame before the host has seated it used to be
+/// dropped there and never resent, and the join failed on timing alone.
+#[test]
+fn a_protocol_handshake_that_arrives_before_the_seat_still_verifies() {
+    let (mut net, host, _a, _b) = trio();
+    let joiner = net.add_pending_client(4, peer(4));
+    let handshake = {
+        let registry = net
+            .app(joiner)
+            .world()
+            .resource::<EnsembleMessageRegistry>();
+        ProtocolHandshake {
+            version: PROTOCOL_VERSION,
+            hash: registry.wire_hash(),
+            names: registry
+                .wire_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        }
+    };
+    let bytes = encode(&net, joiner, &handshake);
+    net.deliver_raw(host, 4, bytes);
+    net.run(4);
+    net.promote(joiner);
+    net.run(4);
+    let world = net.app_mut(host).world_mut();
+    let verified = world
+        .query_filtered::<&LobbyClientPlayerUuid, (With<LobbyClient>, With<HandshakeVerified>)>()
+        .iter(world)
+        .any(|uuid| uuid.0 == 4);
+    assert!(
+        verified,
+        "the host seated the joiner after its handshake had already matched"
+    );
+}
+
 #[test]
 fn a_roster_sync_from_a_non_host_is_ignored() {
     let (mut net, _host, a, b) = trio();
@@ -227,7 +341,11 @@ fn a_roster_sync_from_a_non_host_is_ignored() {
     );
     net.deliver_raw(a, 3, bytes);
     net.run(4);
-    assert_eq!(participants(&mut net, a), before, "no phantom host appeared");
+    assert_eq!(
+        participants(&mut net, a),
+        before,
+        "no phantom host appeared"
+    );
     // B never verified a protocol with A — B is not A's host — so A holds B's bytes unread.
     assert_eq!(held_from(&net, a, 3), 1);
 }
@@ -238,7 +356,10 @@ fn a_removal_from_a_non_host_does_not_remove_anyone() {
     let bytes = encode(&net, b, &RemoveLobbyParticipant { player_uuid: 2 });
     net.deliver_raw(a, 3, bytes);
     net.run(4);
-    assert!(has_lobby(&mut net, a), "A was told to leave by somebody who may not say so");
+    assert!(
+        has_lobby(&mut net, a),
+        "A was told to leave by somebody who may not say so"
+    );
     assert_eq!(held_from(&net, a, 3), 1, "and never read what B said");
 }
 
@@ -336,13 +457,25 @@ fn a_peer_that_stops_answering_pings_is_removed_after_the_timeout() {
     net.half_open(a);
     // 64 frames is one second; give the timeout a little more than that.
     net.run(90);
-    assert_eq!(lobby_clients(&mut net, host), 1, "the host dropped the silent client");
-    assert!(!has_lobby(&mut net, a), "and the client, hearing no pong, left");
+    assert_eq!(
+        lobby_clients(&mut net, host),
+        1,
+        "the host dropped the silent client"
+    );
+    assert!(
+        !has_lobby(&mut net, a),
+        "and the client, hearing no pong, left"
+    );
     assert_eq!(
         net.app(a).world().resource::<Departures>().0,
         vec![LobbyLeftReason::PeerTimeout]
     );
-    assert!(net.app(a).world().get_resource::<LocalMultiplayerPlayerId>().is_none());
+    assert!(
+        net.app(a)
+            .world()
+            .get_resource::<LocalMultiplayerPlayerId>()
+            .is_none()
+    );
 }
 
 #[test]
@@ -371,7 +504,11 @@ fn liveness_is_armed_from_the_moment_a_peer_is_known() {
     // A never answers: half-open from the start.
     net.half_open(a);
     net.run(90);
-    assert_eq!(lobby_clients(&mut net, host), 0, "a peer that never pongs still times out");
+    assert_eq!(
+        lobby_clients(&mut net, host),
+        0,
+        "a peer that never pongs still times out"
+    );
 }
 
 #[test]
@@ -384,11 +521,19 @@ fn no_identity_is_published_until_the_backend_has_one() {
     app.update();
     app.update();
     assert!(
-        app.world().get_resource::<LocalMultiplayerPlayerId>().is_none(),
+        app.world()
+            .get_resource::<LocalMultiplayerPlayerId>()
+            .is_none(),
         "no placeholder"
     );
     let world = app.world_mut();
-    assert!(world.query_filtered::<(), With<Host>>().iter(world).next().is_some());
+    assert!(
+        world
+            .query_filtered::<(), With<Host>>()
+            .iter(world)
+            .next()
+            .is_some()
+    );
 }
 
 #[test]

@@ -133,7 +133,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await
     .map_err(|_| "data channels did not open within 15s")?;
-    println!("channels open; measuring {SAMPLES} sequential round trips ({PAYLOAD_BYTES}B, unreliable)...");
+    println!(
+        "channels open; measuring {SAMPLES} sequential round trips ({PAYLOAD_BYTES}B, unreliable)..."
+    );
 
     let payload = Bytes::from(vec![0u8; PAYLOAD_BYTES]);
     let mut samples: Vec<Duration> = Vec::with_capacity(SAMPLES);
