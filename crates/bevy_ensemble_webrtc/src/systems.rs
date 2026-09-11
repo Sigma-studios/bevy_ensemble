@@ -1,9 +1,10 @@
+use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use bevy_ensemble::{
-    Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyJoinFailed, LobbyParticipant,
-    LobbyParticipantOf, LocalMultiplayerPlayerId, PeerRoute, PendingLobby, PublicLobbies,
-    PublicLobbyInfo, RemoveLobbyParticipant, RequestLobby, SerializedLobbyPacket,
-    decode_ensemble_packet, encode_ensemble_message,
+    Host, HostUuid, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyJoinFailed, LobbyLeft,
+    LobbyLeftReason, LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId, PeerRoute,
+    PendingLobby, PublicLobbies, PublicLobbyInfo, RemoveLobbyParticipant, RequestLobby,
+    SerializedLobbyPacket, decode_ensemble_packet, encode_ensemble_message,
 };
 use bevy_ensemble_sockets::{PeerSignal, PeerState};
 
@@ -11,9 +12,82 @@ use crate::connection::{LobbyConnection, LobbyEvent};
 use crate::protocol::ClientMessage;
 
 use crate::{
-    JoinWebrtcLobby, JoinWebrtcLobbyByCode, LobbyClientWebrtcUuid, LobbyWebrtcCode, LobbyWebrtcId,
-    PendingWebrtcLobbyClient, RefreshLobbyList, SignallingDisplayName,
+    JoinWebrtcLobby, JoinWebrtcLobbyByCode, LobbyClientWebrtcUuid, LobbyHostUuid, LobbyWebrtcCode,
+    LobbyWebrtcId, PendingWebrtcLobbyClient, RefreshLobbyList, SignallingDisplayName,
 };
+
+/// Which side of the session this peer is on, as far as trust decisions go.
+///
+/// Derived from the lobby entities each time it is needed rather than stored, so it cannot go
+/// stale: a peer is a host while it has a hosted lobby, a client while it has a joined or
+/// pending-join lobby, and nothing in between.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PeerRole {
+    Host,
+    Client,
+    /// No lobby at all. Nothing arriving over a data channel or a signal is expected.
+    None,
+}
+
+/// Whether an SDP offer from `from` should be answered.
+///
+/// A client answers its host and nobody else: in this protocol the host is always the offerer,
+/// so an offer from another lobby member is that member trying to become the peer this client
+/// talks to -- its "host" in every way that matters -- and answering it would hand the session
+/// over. A host never legitimately receives an offer for the same reason, and with no lobby there
+/// is nothing to be joining.
+pub(crate) fn accept_offer_from(role: PeerRole, host: Option<u128>, from: u128) -> bool {
+    match role {
+        PeerRole::Client => host == Some(from),
+        PeerRole::Host | PeerRole::None => false,
+    }
+}
+
+/// Whether a data-channel packet from `from` should be decoded at all.
+///
+/// A client reads its host only. A host reads the peers the signalling server told it joined --
+/// the ones it holds a `LobbyClient` or `PendingWebrtcLobbyClient` entity for -- which is what
+/// `known_clients` is. Anything else is a connection that should not exist, and the safe thing to
+/// do with its traffic is nothing.
+pub(crate) fn accept_packet_from(
+    role: PeerRole,
+    host: Option<u128>,
+    known_clients: &[u128],
+    from: u128,
+) -> bool {
+    match role {
+        PeerRole::Client => host == Some(from),
+        PeerRole::Host => known_clients.contains(&from),
+        PeerRole::None => false,
+    }
+}
+
+/// Whether a peer going away ends a client's session.
+///
+/// Only the host's does. Another peer's disconnect is not this client's business -- it never
+/// connected to them on purpose -- and used to take the whole lobby down with it.
+pub(crate) fn client_session_ends_with(host: Option<u128>, peer: u128) -> bool {
+    host == Some(peer)
+}
+
+/// How many refused packets per peer are logged at `warn!` before dropping to `debug!`.
+///
+/// Three is enough to notice and not enough to bury the log under a peer that keeps sending.
+const UNTRUSTED_DROPS_LOGGED_LOUDLY: u32 = 3;
+
+/// Packets dropped by [`read_peer_messages`] because their sender was not trusted, per sender.
+#[derive(Resource, Default, Debug)]
+pub(crate) struct UntrustedPacketDrops(HashMap<u128, u32>);
+
+/// How often the signalling server is told this peer is still here, in seconds.
+///
+/// Well under any idle timeout a server would reasonably have, and cheap: one tiny frame over an
+/// otherwise silent WebSocket. Without it a host sitting in a lobby waiting for players is
+/// indistinguishable, to the server, from one that went away.
+const KEEP_ALIVE_INTERVAL_SECS: f64 = 20.0;
+
+/// How long to wait between attempts to rebuild a lost signalling connection, in seconds.
+const RECONNECT_INTERVAL_SECS: f64 = 5.0;
 
 /// Send the display name to the signalling server whenever it changes.
 ///
@@ -60,10 +134,13 @@ pub(crate) fn apply_lobby_events(
     mut lobby_conn: ResMut<LobbyConnection>,
     mut socket: ResMut<crate::EnsembleSocketRes>,
     mut events: MessageReader<LobbyEvent>,
+    mut lobby_left: MessageWriter<LobbyLeft>,
+    mut join_failed: MessageWriter<LobbyJoinFailed>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
     pending_host_lobbies: Query<Entity, (With<PendingLobby>, With<RequestLobby>, With<Host>)>,
     pending_client_lobbies: Query<Entity, (With<PendingLobby>, Without<Host>)>,
     active_client_lobbies: Query<Entity, (With<Lobby>, Without<Host>)>,
+    all_lobbies: Query<(Entity, Has<PendingLobby>), Or<(With<Lobby>, With<PendingLobby>)>>,
     lobby_clients: Query<
         (Entity, &LobbyClientWebrtcUuid, &LobbyClientPlayerUuid),
         Or<(With<LobbyClient>, With<PendingWebrtcLobbyClient>)>,
@@ -75,6 +152,10 @@ pub(crate) fn apply_lobby_events(
             LobbyEvent::Welcome { player_uuid } => {
                 info!("Authenticated with signaling server, uuid: {player_uuid}");
                 lobby_conn.local_player_uuid = Some(*player_uuid);
+                // The identity is known from here on, before any lobby exists. Nothing else
+                // puts one in place: `StartHosting` no longer inserts a placeholder, so a host
+                // whose lobby is still being created would otherwise have no id at all.
+                commands.insert_resource(LocalMultiplayerPlayerId(*player_uuid));
             }
 
             LobbyEvent::LobbyCreated { lobby_id, code } => {
@@ -87,6 +168,8 @@ pub(crate) fn apply_lobby_events(
                     continue;
                 };
                 commands.insert_resource(LocalMultiplayerPlayerId(player_uuid));
+                // A host is its own authority.
+                commands.insert_resource(HostUuid(player_uuid));
 
                 if let Some(entity) = pending_host_lobbies.iter().next() {
                     commands
@@ -105,8 +188,15 @@ pub(crate) fn apply_lobby_events(
                 }
             }
 
-            LobbyEvent::LobbyJoined { lobby_id } => {
-                info!("Joined lobby: {lobby_id}");
+            LobbyEvent::LobbyJoined {
+                lobby_id,
+                host_uuid,
+                existing_members,
+            } => {
+                info!(
+                    "Joined lobby: {lobby_id}, hosted by {host_uuid:#x} with {} other member(s)",
+                    existing_members.len()
+                );
                 let Some(player_uuid) = lobby_conn.local_player_uuid else {
                     warn!(
                         "joined lobby {lobby_id} before the server said `Welcome`; no local uuid \
@@ -115,9 +205,14 @@ pub(crate) fn apply_lobby_events(
                     continue;
                 };
                 commands.insert_resource(LocalMultiplayerPlayerId(player_uuid));
+                // Set before the host's offer can be answered (`pump_socket_signals` runs after
+                // this system), so no data channel exists to a peer this side does not trust.
+                commands.insert_resource(HostUuid(*host_uuid));
 
                 if let Some(entity) = pending_client_lobbies.iter().next() {
-                    commands.entity(entity).insert(LobbyWebrtcId(*lobby_id));
+                    commands
+                        .entity(entity)
+                        .insert((LobbyWebrtcId(*lobby_id), LobbyHostUuid(*host_uuid)));
                 } else {
                     warn!(
                         "joined lobby {lobby_id} with no pending client lobby to attach it to. \
@@ -129,6 +224,7 @@ pub(crate) fn apply_lobby_events(
             LobbyEvent::LobbyError { reason } => {
                 error!("Lobby error: {reason}");
                 commands.remove_resource::<LocalMultiplayerPlayerId>();
+                commands.remove_resource::<HostUuid>();
                 for entity in pending_host_lobbies.iter() {
                     commands.entity(entity).try_despawn();
                 }
@@ -186,12 +282,17 @@ pub(crate) fn apply_lobby_events(
                 }
             }
 
+            // The server removing this peer from its lobby. The one reason it has for doing so
+            // is the host leaving, which destroys the lobby under everybody in it.
             LobbyEvent::Disconnected { reason } => {
                 info!("Disconnected from lobby: {reason}");
+                let mut had_lobby = false;
                 for entity in pending_client_lobbies.iter() {
+                    had_lobby = true;
                     commands.entity(entity).try_despawn();
                 }
                 for entity in active_client_lobbies.iter() {
+                    had_lobby = true;
                     for (participant_entity, _, pof) in participants.iter() {
                         if pof.0 == entity {
                             commands.entity(participant_entity).try_despawn();
@@ -200,6 +301,49 @@ pub(crate) fn apply_lobby_events(
                     commands.entity(entity).try_despawn();
                 }
                 commands.remove_resource::<LocalMultiplayerPlayerId>();
+                commands.remove_resource::<HostUuid>();
+                if had_lobby {
+                    lobby_left.write(LobbyLeft {
+                        reason: LobbyLeftReason::HostGone,
+                    });
+                }
+            }
+
+            // The WebSocket is gone. A lobby on either side is over: the server drops a lobby
+            // whose host it cannot reach and tells the members so, and a client with no
+            // signalling cannot be told anything. Despawning a lobby with a server id rebuilds
+            // the connection through `detect_lobby_leave`; when there is no such lobby,
+            // `reconnect_signalling` does it instead, with a backoff.
+            LobbyEvent::SignallingClosed => {
+                warn!("lost the signalling server");
+                lobby_conn.signalling_lost = true;
+                let mut had_lobby = false;
+                let mut was_joining = false;
+                for (lobby, pending) in all_lobbies.iter() {
+                    had_lobby = true;
+                    was_joining |= pending;
+                    for (participant_entity, _, pof) in participants.iter() {
+                        if pof.0 == lobby {
+                            commands.entity(participant_entity).try_despawn();
+                        }
+                    }
+                    for (client_entity, _, _) in lobby_clients.iter() {
+                        commands.entity(client_entity).try_despawn();
+                    }
+                    commands.entity(lobby).try_despawn();
+                }
+                commands.remove_resource::<LocalMultiplayerPlayerId>();
+                commands.remove_resource::<HostUuid>();
+                if was_joining {
+                    join_failed.write(LobbyJoinFailed {
+                        reason: "Lost the signalling server before the lobby was ready.".into(),
+                    });
+                }
+                if had_lobby {
+                    lobby_left.write(LobbyLeft {
+                        reason: LobbyLeftReason::SignallingLost,
+                    });
+                }
             }
 
             LobbyEvent::LobbyList { lobbies } => {
@@ -291,15 +435,17 @@ pub(crate) fn refresh_lobby_list(
 /// Poll the EnsembleSocket for peer connect/disconnect events.
 ///
 /// - On the **host**: despawns lobby client entities when a peer disconnects.
-/// - On a **client**: despawns the lobby entity when the host peer disconnects
-///   (e.g. kicked or host left), which triggers the full leave/cleanup flow.
+/// - On a **client**: despawns the lobby entity when the *host* peer disconnects
+///   (e.g. kicked or host left), which triggers the full leave/cleanup flow. Any other peer
+///   going away is logged and ignored; it was never this client's session.
 pub(crate) fn poll_socket_peers(
     mut commands: Commands,
     mut socket: ResMut<crate::EnsembleSocketRes>,
     mut join_failed: MessageWriter<LobbyJoinFailed>,
+    mut lobby_left: MessageWriter<LobbyLeft>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
     client_lobbies: Query<
-        (Entity, Has<PendingLobby>),
+        (Entity, Has<PendingLobby>, Option<&LobbyHostUuid>),
         (Or<(With<Lobby>, With<PendingLobby>)>, Without<Host>),
     >,
     lobby_clients: Query<
@@ -342,13 +488,31 @@ pub(crate) fn poll_socket_peers(
                     continue;
                 }
 
-                // Client side: that peer was the whole session.
+                // Client side: the host was the whole session. Anybody else was a connection
+                // this side never asked for, and its ending changes nothing.
                 let mut was_joining = false;
-                for (entity, pending) in client_lobbies.iter() {
+                let mut host_gone = false;
+                for (entity, pending, host) in client_lobbies.iter() {
+                    if !client_session_ends_with(host.map(|host| host.0), peer_id) {
+                        debug!(
+                            "peer {peer_id:#x} went away and it is not the host \
+                             ({:#x?}); the lobby stands",
+                            host.map(|host| host.0)
+                        );
+                        continue;
+                    }
+                    host_gone = true;
                     was_joining |= pending;
                     commands.entity(entity).try_despawn();
                 }
+                if !host_gone {
+                    continue;
+                }
                 commands.remove_resource::<LocalMultiplayerPlayerId>();
+                commands.remove_resource::<HostUuid>();
+                lobby_left.write(LobbyLeft {
+                    reason: LobbyLeftReason::HostGone,
+                });
                 if failed {
                     join_failed.write(LobbyJoinFailed {
                         reason: if was_joining {
@@ -480,7 +644,20 @@ fn signal_kind(signal: &PeerSignal) -> &'static str {
 pub(crate) fn pump_socket_signals(
     mut socket: ResMut<crate::EnsembleSocketRes>,
     lobby_conn: Res<LobbyConnection>,
+    host_lobbies: Query<(), (Or<(With<Lobby>, With<PendingLobby>)>, With<Host>)>,
+    client_lobbies: Query<
+        Option<&LobbyHostUuid>,
+        (Or<(With<Lobby>, With<PendingLobby>)>, Without<Host>),
+    >,
 ) {
+    let (role, host) = if let Some(host) = client_lobbies.iter().next() {
+        (PeerRole::Client, host.map(|host| host.0))
+    } else if !host_lobbies.is_empty() {
+        (PeerRole::Host, None)
+    } else {
+        (PeerRole::None, None)
+    };
+
     if let Ok(mut signal_rx) = lobby_conn.signal_rx.lock() {
         while let Ok((sender, signal)) = signal_rx.try_recv() {
             // Both directions are logged, at the one seam every signal crosses, because the
@@ -488,6 +665,16 @@ pub(crate) fn pump_socket_signals(
             // while its candidates do not is a different bug from one that never sends them, and
             // the two are indistinguishable from either end alone.
             info!("<- {} from peer {sender:#x}", signal_kind(&signal));
+            // An offer is the one signal that *creates* a connection; the others only apply to
+            // one that exists, and the socket already discards those for unknown peers. So the
+            // trust decision is made here, once, on the offer.
+            if matches!(signal, PeerSignal::Offer(_)) && !accept_offer_from(role, host, sender) {
+                warn!(
+                    "ignoring an offer from peer {sender:#x}: this peer is {role:?} and its \
+                     host is {host:#x?}, so that peer has no business opening a connection"
+                );
+                continue;
+            }
             socket.receive_signal(sender, signal);
         }
     }
@@ -525,6 +712,11 @@ pub(crate) fn detect_lobby_leave(
         // Disconnect all WebRTC peers
         socket.disconnect_all();
 
+        // The session's identity goes with it. `Welcome` on the rebuilt connection restores
+        // the local id; the host is whoever the next lobby says.
+        commands.remove_resource::<LocalMultiplayerPlayerId>();
+        commands.remove_resource::<HostUuid>();
+
         // Rebuild the WS connection from scratch.
         // The old WS task will naturally exit when its channels are dropped.
         let (new_socket, lobby_connection) = webrtc_runtime.build_socket();
@@ -536,9 +728,10 @@ pub(crate) fn detect_lobby_leave(
 pub(crate) fn send_serialized_lobby_packet(
     packet: On<SerializedLobbyPacket>,
     socket: ResMut<crate::EnsembleSocketRes>,
-    lobby_query: Query<(Option<&Host>, Option<&LobbyWebrtcId>), With<Lobby>>,
+    host_uuid: Option<Res<HostUuid>>,
+    lobby_query: Query<(Option<&Host>, Option<&LobbyHostUuid>), With<Lobby>>,
     pending_lobby_query: Query<
-        (Option<&Host>, Option<&LobbyWebrtcId>),
+        (Option<&Host>, Option<&LobbyHostUuid>),
         (With<PendingLobby>, Without<Lobby>),
     >,
     lobby_client_query: Query<&LobbyClientWebrtcUuid>,
@@ -546,21 +739,33 @@ pub(crate) fn send_serialized_lobby_packet(
     let reliable = packet.send_mode.is_reliable();
 
     // Resolve the target: active lobby, pending lobby, or a specific client entity.
-    let host = lobby_query
+    let lobby = lobby_query
         .get(packet.entity)
         .or_else(|_| pending_lobby_query.get(packet.entity))
-        .ok()
-        .map(|(host, _)| host);
+        .ok();
 
-    if let Some(host) = host {
+    if let Some((host, lobby_host)) = lobby {
         let data: Box<[u8]> = packet.packet.clone().into_boxed_slice();
-        let peers: Vec<u128> = socket.connected_peers().collect();
         if host.is_some() {
+            let peers: Vec<u128> = socket.connected_peers().collect();
             for peer in peers {
                 socket.send_with_mode(data.clone(), peer, reliable);
             }
-        } else if let Some(&peer) = peers.first() {
-            socket.send_with_mode(data, peer, reliable);
+            return;
+        }
+        // A client talks to its host, by name -- not to whichever connected peer a hash map
+        // happens to list first, which with a second connection open is a coin toss.
+        let host = lobby_host
+            .map(|host| host.0)
+            .or(host_uuid.map(|host| host.0));
+        let Some(host) = host else {
+            debug!("dropping a lobby packet: this client does not know its host yet");
+            return;
+        };
+        if socket.connected_peers().any(|peer| peer == host) {
+            socket.send_with_mode(data, host, reliable);
+        } else {
+            debug!("dropping a lobby packet: the host {host:#x} is not connected yet");
         }
         return;
     }
@@ -586,16 +791,156 @@ pub(crate) fn send_serialized_lobby_packet(
     );
 }
 
+/// Drain the socket and decode what the trusted peers sent.
+///
+/// The trust decision is [`accept_packet_from`]: a client reads its host, a host reads the
+/// peers the signalling server told it joined. It is made here, before decoding, so that no
+/// packet from anybody else reaches a message reader at all -- the per-type `HostOnly` check in
+/// `bevy_ensemble` is the second line, not the first.
 pub(crate) fn read_peer_messages(world: &mut World) {
     let packets = {
         let mut socket = world.resource_mut::<crate::EnsembleSocketRes>();
         socket.receive()
     };
+    if packets.is_empty() {
+        return;
+    }
+
+    let (role, host) = {
+        let mut client_lobbies = world.query_filtered::<Option<&LobbyHostUuid>, (
+            Or<(With<Lobby>, With<PendingLobby>)>,
+            Without<Host>,
+        )>();
+        if let Some(host) = client_lobbies.iter(world).next() {
+            (PeerRole::Client, host.map(|host| host.0))
+        } else {
+            let mut host_lobbies =
+                world.query_filtered::<(), (With<Lobby>, With<Host>)>();
+            if host_lobbies.iter(world).next().is_some() {
+                (PeerRole::Host, None)
+            } else {
+                (PeerRole::None, None)
+            }
+        }
+    };
+    let known_clients: Vec<u128> = if role == PeerRole::Host {
+        let mut clients = world.query_filtered::<&LobbyClientWebrtcUuid, Or<(
+            With<LobbyClient>,
+            With<PendingWebrtcLobbyClient>,
+        )>>();
+        clients.iter(world).map(|uuid| uuid.0).collect()
+    } else {
+        Vec::new()
+    };
 
     for (sender_uuid, payload) in packets {
+        if !accept_packet_from(role, host, &known_clients, sender_uuid) {
+            let count = {
+                let mut drops = world.get_resource_or_insert_with(UntrustedPacketDrops::default);
+                let count = drops.0.entry(sender_uuid).or_insert(0);
+                *count += 1;
+                *count
+            };
+            if count <= UNTRUSTED_DROPS_LOGGED_LOUDLY {
+                warn!(
+                    "dropping a packet from peer {sender_uuid:#x}: this peer is {role:?} and \
+                     that one is not its host ({host:#x?}) nor a client it was told joined; \
+                     {count} so far, later ones at debug level"
+                );
+            } else {
+                debug!("dropping a packet from untrusted peer {sender_uuid:#x} ({count} so far)");
+            }
+            continue;
+        }
         if !decode_ensemble_packet(world, Some(sender_uuid), &payload) {
             warn!("Failed to decode ensemble packet from peer {sender_uuid}");
         }
+    }
+}
+
+/// Tell the signalling server this peer is still here, every [`KEEP_ALIVE_INTERVAL_SECS`].
+///
+/// Only once `Welcome` has arrived -- before that there is no session to keep alive -- and never
+/// on a connection already known to be gone.
+pub(crate) fn send_keep_alives(
+    lobby_conn: Res<LobbyConnection>,
+    time: Res<Time>,
+    mut next_at: Local<f64>,
+) {
+    if lobby_conn.local_player_uuid.is_none() || lobby_conn.signalling_lost {
+        return;
+    }
+    let now = time.elapsed_secs_f64();
+    if now < *next_at {
+        return;
+    }
+    *next_at = now + KEEP_ALIVE_INTERVAL_SECS;
+    let _ = lobby_conn.command_tx.send(ClientMessage::KeepAlive);
+}
+
+/// Rebuild a signalling connection that was lost while no lobby was there to rebuild it.
+///
+/// Losing the server while in a lobby ends the lobby, and ending a lobby with a server id
+/// rebuilds the connection (`detect_lobby_leave`). Losing it while idle -- in a menu, or after a
+/// join was refused -- used to leave a dead WebSocket behind for the rest of the run, so the next
+/// host or join silently went nowhere. Retried on a backoff rather than every frame so a server
+/// that is down is not hammered.
+pub(crate) fn reconnect_signalling(
+    mut commands: Commands,
+    lobby_conn: Res<LobbyConnection>,
+    webrtc_runtime: Res<crate::WebrtcRuntime>,
+    time: Res<Time>,
+    mut next_attempt: Local<f64>,
+    lobbies_with_id: Query<(), With<LobbyWebrtcId>>,
+) {
+    if !lobby_conn.signalling_lost || !lobbies_with_id.is_empty() {
+        return;
+    }
+    let now = time.elapsed_secs_f64();
+    if now < *next_attempt {
+        return;
+    }
+    *next_attempt = now + RECONNECT_INTERVAL_SECS;
+
+    info!("reconnecting to the signalling server");
+    let (new_socket, lobby_connection) = webrtc_runtime.build_socket();
+    commands.insert_resource(new_socket);
+    commands.insert_resource(lobby_connection);
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::{PeerRole, accept_offer_from, accept_packet_from, client_session_ends_with};
+
+    const HOST: u128 = 0xA;
+    const OTHER: u128 = 0xB;
+
+    #[test]
+    fn a_client_accepts_an_offer_only_from_its_host() {
+        assert!(accept_offer_from(PeerRole::Client, Some(HOST), HOST));
+        assert!(!accept_offer_from(PeerRole::Client, Some(HOST), OTHER));
+        // Not yet told who the host is: nobody is trusted, rather than the first to ask.
+        assert!(!accept_offer_from(PeerRole::Client, None, HOST));
+        // A host is the offerer; an offer to it is never legitimate. Nor with no lobby.
+        assert!(!accept_offer_from(PeerRole::Host, None, OTHER));
+        assert!(!accept_offer_from(PeerRole::None, None, HOST));
+    }
+
+    #[test]
+    fn a_client_reads_only_its_host_and_a_host_only_its_known_clients() {
+        assert!(accept_packet_from(PeerRole::Client, Some(HOST), &[], HOST));
+        assert!(!accept_packet_from(PeerRole::Client, Some(HOST), &[], OTHER));
+        assert!(!accept_packet_from(PeerRole::Client, None, &[], HOST));
+        assert!(accept_packet_from(PeerRole::Host, None, &[OTHER], OTHER));
+        assert!(!accept_packet_from(PeerRole::Host, None, &[OTHER], HOST));
+        assert!(!accept_packet_from(PeerRole::None, None, &[OTHER], OTHER));
+    }
+
+    #[test]
+    fn only_the_host_leaving_ends_a_client_session() {
+        assert!(client_session_ends_with(Some(HOST), HOST));
+        assert!(!client_session_ends_with(Some(HOST), OTHER));
+        assert!(!client_session_ends_with(None, OTHER));
     }
 }
 

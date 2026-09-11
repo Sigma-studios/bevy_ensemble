@@ -71,6 +71,13 @@ cli = [
 # The example runs a whole app; the plugin itself only needs the ECS and the log.
 bevy = "0.19"
 bevy_immediate = "0.7"
+# `tests/signalling.rs` talks to the in-process server as a plain websocket client; `ws://` on
+# loopback, so no TLS.
+tokio-tungstenite = "0.26"
+
+[[test]]
+name = "signalling"
+required-features = ["server"]
 
 [[example]]
 name = "relay_probe"

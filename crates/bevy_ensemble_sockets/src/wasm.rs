@@ -141,10 +141,16 @@ pub(crate) fn create_peer_connection(
                 "peer {peer_id:#x}: gathered local candidate {}",
                 candidate.candidate()
             );
-            let json = js_sys::JSON::stringify(&candidate.to_json())
-                .unwrap()
-                .as_string()
-                .unwrap();
+            let json = match js_sys::JSON::stringify(&candidate.to_json()) {
+                Ok(json) => String::from(json),
+                Err(error) => {
+                    log::warn!(
+                        "peer {peer_id:#x}: dropping a local candidate that would not \
+                         serialise: {error:?}"
+                    );
+                    return;
+                }
+            };
             let _ = sig_tx.send(OutgoingSignal {
                 peer: peer_id,
                 signal: PeerSignal::IceCandidate(json),
@@ -293,6 +299,24 @@ pub(crate) fn create_peer_connection(
     }
 }
 
+/// The `sdp` string of a description the browser produced, or `None` — with a line saying so —
+/// if it did not produce one.
+///
+/// Every step of negotiation used to `unwrap()` its result, and a promise the browser rejects is
+/// a panic on wasm: `unreachable` executed, the tab's whole game gone. Any lobby member can cause
+/// that by sending an offer that is not SDP, and the native backend has always answered the same
+/// input with a warning (see `run_signal_queue` there). This and the `match`es below make the
+/// browser do the same.
+fn sdp_of(peer_id: u128, what: &str, description: &JsValue) -> Option<String> {
+    let sdp = js_sys::Reflect::get(description, &JsValue::from_str("sdp"))
+        .ok()
+        .and_then(|value| value.as_string());
+    if sdp.is_none() {
+        log::warn!("peer {peer_id:#x}: the browser's {what} carries no SDP");
+    }
+    sdp
+}
+
 pub(crate) fn create_offer(
     pc: &WasmPeerConnection,
     peer_id: u128,
@@ -300,18 +324,24 @@ pub(crate) fn create_offer(
 ) {
     let conn = pc.connection.clone();
     wasm_bindgen_futures::spawn_local(async move {
-        let offer = JsFuture::from(conn.create_offer()).await.unwrap();
-        let sdp = js_sys::Reflect::get(&offer, &JsValue::from_str("sdp"))
-            .unwrap()
-            .as_string()
-            .unwrap();
+        let offer = match JsFuture::from(conn.create_offer()).await {
+            Ok(offer) => offer,
+            Err(error) => {
+                log::warn!("peer {peer_id:#x}: could not create an offer: {error:?}");
+                return;
+            }
+        };
+        let Some(sdp) = sdp_of(peer_id, "offer", &offer) else {
+            return;
+        };
 
         // Per spec: setLocalDescription must be called before sending the offer.
         let desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
         desc.set_sdp(&sdp);
-        JsFuture::from(conn.set_local_description(&desc))
-            .await
-            .unwrap();
+        if let Err(error) = JsFuture::from(conn.set_local_description(&desc)).await {
+            log::warn!("peer {peer_id:#x}: could not apply our offer: {error:?}");
+            return;
+        }
 
         let _ = signal_tx.send(OutgoingSignal {
             peer: peer_id,
@@ -333,9 +363,12 @@ pub(crate) fn accept_offer(
     wasm_bindgen_futures::spawn_local(async move {
         let remote_desc = RtcSessionDescriptionInit::new(RtcSdpType::Offer);
         remote_desc.set_sdp(&offer_sdp);
-        JsFuture::from(conn.set_remote_description(&remote_desc))
-            .await
-            .unwrap();
+        // The one line here that another peer controls. Garbage in its offer is its bug, and
+        // it ends here as a warning rather than as the tab.
+        if let Err(error) = JsFuture::from(conn.set_remote_description(&remote_desc)).await {
+            log::warn!("peer {peer_id:#x}: could not apply its offer: {error:?}");
+            return;
+        }
 
         // Flush buffered candidates now that remote description is set.
         *rds.lock().unwrap() = true;
@@ -344,18 +377,24 @@ pub(crate) fn accept_offer(
             apply_ice_candidate(&conn, &c).await;
         }
 
-        let answer = JsFuture::from(conn.create_answer()).await.unwrap();
-        let sdp = js_sys::Reflect::get(&answer, &JsValue::from_str("sdp"))
-            .unwrap()
-            .as_string()
-            .unwrap();
+        let answer = match JsFuture::from(conn.create_answer()).await {
+            Ok(answer) => answer,
+            Err(error) => {
+                log::warn!("peer {peer_id:#x}: could not answer: {error:?}");
+                return;
+            }
+        };
+        let Some(sdp) = sdp_of(peer_id, "answer", &answer) else {
+            return;
+        };
 
         // Per spec: setLocalDescription must be called before sending the answer.
         let desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
         desc.set_sdp(&sdp);
-        JsFuture::from(conn.set_local_description(&desc))
-            .await
-            .unwrap();
+        if let Err(error) = JsFuture::from(conn.set_local_description(&desc)).await {
+            log::warn!("peer {peer_id:#x}: could not apply our answer: {error:?}");
+            return;
+        }
 
         let _ = signal_tx.send(OutgoingSignal {
             peer: peer_id,
@@ -364,7 +403,7 @@ pub(crate) fn accept_offer(
     });
 }
 
-pub(crate) fn set_remote_answer(pc: &WasmPeerConnection, sdp: &str) {
+pub(crate) fn set_remote_answer(pc: &WasmPeerConnection, peer_id: u128, sdp: &str) {
     let conn = pc.connection.clone();
     let sdp = sdp.to_string();
     let rds = pc.remote_desc_set.clone();
@@ -372,9 +411,10 @@ pub(crate) fn set_remote_answer(pc: &WasmPeerConnection, sdp: &str) {
     wasm_bindgen_futures::spawn_local(async move {
         let desc = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
         desc.set_sdp(&sdp);
-        JsFuture::from(conn.set_remote_description(&desc))
-            .await
-            .unwrap();
+        if let Err(error) = JsFuture::from(conn.set_remote_description(&desc)).await {
+            log::warn!("peer {peer_id:#x}: could not apply its answer: {error:?}");
+            return;
+        }
 
         // Flush buffered candidates now that remote description is set.
         *rds.lock().unwrap() = true;

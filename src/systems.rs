@@ -1,20 +1,21 @@
 use bevy::prelude::*;
 
 use crate::{
-    Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipant, LobbyParticipantOf,
+    Host, HostUuid, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipant, LobbyParticipantOf,
     LocalMultiplayerPlayerId, PendingLobby, RequestLobby, SendMode,
+    session::{LobbyLeft, LobbyLeftReason},
     messages::{
         LobbyClientMessage, LobbyMessage, ReceivedEnsembleMessage, RemoveLobbyParticipant,
         StartHosting, SyncLobbyParticipant,
     },
-    LOCAL_PLAYER_UUID,
 };
 
 /// Spawns a host lobby entity when [`StartHosting`] is received.
 ///
-/// Creates an entity with [`PendingLobby`], [`RequestLobby`], and [`Host`] components.
-/// Also inserts the [`LocalMultiplayerPlayerId`] resource with [`LOCAL_PLAYER_UUID`]
-/// as a placeholder until the platform backend assigns the real identity.
+/// Creates an entity with [`PendingLobby`], [`RequestLobby`], and [`Host`] components. The
+/// [`LocalMultiplayerPlayerId`] is the backend's to insert, once it knows it; this used to insert
+/// a placeholder of zero, and everything that read the resource between then and the backend's
+/// answer believed it.
 ///
 /// Ignored if a host lobby already exists.
 pub(crate) fn spawn_host_lobby(
@@ -32,17 +33,44 @@ pub(crate) fn spawn_host_lobby(
     }
 
     commands.spawn((PendingLobby, RequestLobby, Host));
-    commands.insert_resource(LocalMultiplayerPlayerId(LOCAL_PLAYER_UUID));
 }
 
-/// Adds the host player as a [`LobbyParticipant`] when the lobby becomes active.
+/// Keep [`HostUuid`] true on a host, and gone once there is no lobby of any kind.
 ///
-/// Runs when [`Lobby`] is added to a host entity. Creates a participant entity
-/// with `is_host: true` linked via [`LobbyParticipantOf`].
+/// A host is its own host: the moment it knows its identity, that is who its authoritative
+/// messages come from. A client's `HostUuid` is the backend's to set as part of joining; this
+/// only removes it when the client has left, so a stale host cannot be trusted into the next
+/// session.
+pub(crate) fn publish_host_uuid(
+    mut commands: Commands,
+    local_player_id: Option<Res<LocalMultiplayerPlayerId>>,
+    host_uuid: Option<Res<HostUuid>>,
+    host_lobbies: Query<(), (With<Host>, Or<(With<Lobby>, With<PendingLobby>)>)>,
+    any_lobbies: Query<(), Or<(With<Lobby>, With<PendingLobby>)>>,
+) {
+    if !host_lobbies.is_empty() {
+        if let Some(local) = local_player_id
+            && host_uuid.map(|host| host.0) != Some(local.0)
+        {
+            commands.insert_resource(HostUuid(local.0));
+        }
+        return;
+    }
+    if any_lobbies.is_empty() && host_uuid.is_some() {
+        commands.remove_resource::<HostUuid>();
+    }
+}
+
+/// Adds the host player as a [`LobbyParticipant`] once the lobby is active and the host knows
+/// who it is.
+///
+/// Not keyed on `Added<Lobby>`: the backend may learn the local identity after the lobby is
+/// promoted, and a participant that is only ever created on the frame the lobby appeared would
+/// then never be created. The existing-participant check is what makes this idempotent.
 pub(crate) fn add_host_lobby_participant(
     mut commands: Commands,
     local_player_id: Option<Res<LocalMultiplayerPlayerId>>,
-    ready_host_lobbies: Query<Entity, (With<Lobby>, With<Host>, Added<Lobby>)>,
+    ready_host_lobbies: Query<Entity, (With<Lobby>, With<Host>)>,
     existing_participants: Query<(&LobbyParticipant, &LobbyParticipantOf)>,
 ) {
     let Some(local_player_id) = local_player_id else {
@@ -285,6 +313,7 @@ pub(crate) fn apply_removed_lobby_participants(
     client_lobby: Option<Single<Entity, (With<Lobby>, Without<Host>)>>,
     pending_client_lobby: Option<Single<Entity, (With<PendingLobby>, Without<Host>)>>,
     existing_participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
+    mut left: MessageWriter<LobbyLeft>,
 ) {
     let Some(client_lobby) = client_lobby
         .map(|s| *s)
@@ -299,6 +328,9 @@ pub(crate) fn apply_removed_lobby_participants(
             if message.message.player_uuid == local_player.0 {
                 commands.entity(client_lobby).try_despawn();
                 commands.remove_resource::<LocalMultiplayerPlayerId>();
+                left.write(LobbyLeft {
+                    reason: LobbyLeftReason::Kicked,
+                });
                 return;
             }
         }

@@ -28,6 +28,13 @@ pub(crate) enum LobbyEvent {
     },
     LobbyJoined {
         lobby_id: u64,
+        /// Who runs the lobby that was joined. The one fact a client's trust rests on: it is the
+        /// only peer whose offer is answered, whose packets are read, and whose loss ends the
+        /// session.
+        host_uuid: u128,
+        /// The other members at the time of joining. Informational: a client connects to its
+        /// host only, never to them.
+        existing_members: Vec<u128>,
     },
     LobbyError {
         reason: String,
@@ -44,6 +51,11 @@ pub(crate) enum LobbyEvent {
     Disconnected {
         reason: String,
     },
+    /// The WebSocket to the signalling server is gone: it closed, errored, or never opened.
+    ///
+    /// Not sent when this side dropped the connection itself (a rebuild after leaving a lobby)
+    /// — that is a teardown already under way, not a loss.
+    SignallingClosed,
 }
 
 /// Resource for lobby-level communication with the signaling server.
@@ -56,6 +68,9 @@ pub struct LobbyConnection {
     pub event_rx: Mutex<mpsc::UnboundedReceiver<LobbyEvent>>,
     pub signal_rx: Mutex<mpsc::UnboundedReceiver<(u128, PeerSignal)>>,
     pub local_player_uuid: Option<u128>,
+    /// Set once [`LobbyEvent::SignallingClosed`] has been seen: this connection can carry nothing
+    /// more, and a fresh one has to be built before hosting or joining again.
+    pub signalling_lost: bool,
 }
 
 /// Dispatch a decoded server message to the lobby event and/or signal channels.
@@ -89,8 +104,16 @@ pub(crate) fn dispatch_server_message(
         ServerMessage::LobbyCreated { lobby_id, code } => {
             let _ = lobby_event_tx.send(LobbyEvent::LobbyCreated { lobby_id, code });
         }
-        ServerMessage::LobbyJoined { lobby_id, .. } => {
-            let _ = lobby_event_tx.send(LobbyEvent::LobbyJoined { lobby_id });
+        ServerMessage::LobbyJoined {
+            lobby_id,
+            host_uuid,
+            existing_members,
+        } => {
+            let _ = lobby_event_tx.send(LobbyEvent::LobbyJoined {
+                lobby_id,
+                host_uuid,
+                existing_members,
+            });
         }
         ServerMessage::LobbyError { reason } => {
             let _ = lobby_event_tx.send(LobbyEvent::LobbyError { reason });

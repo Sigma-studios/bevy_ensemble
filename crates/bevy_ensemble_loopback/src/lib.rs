@@ -118,9 +118,10 @@
 
 use bevy::prelude::*;
 use bevy_ensemble::{
-    EnsembleSet, EnsembleTransportAppExt, Host, Lobby, LobbyClient, LobbyClientPlayerUuid,
-    LobbyParticipantOf, LocalMultiplayerPlayerId, NetPreset, PeerRtt, PeerRttJitter, PendingLobby,
-    PlayerUUID, SendMode, SerializedLobbyPacket, decode_ensemble_packet,
+    EnsembleSet, EnsembleTransportAppExt, Host, HostUuid, Lobby, LobbyClient,
+    LobbyClientPlayerUuid, LobbyParticipantOf, LocalMultiplayerPlayerId, NetPreset, PeerRtt,
+    PeerRttJitter, PendingLobby, PlayerUUID, SendMode, SerializedLobbyPacket,
+    decode_ensemble_packet,
 };
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
@@ -453,6 +454,11 @@ pub struct LoopbackNetwork {
     sent: HashMap<(usize, usize), (u64, u64)>,
     pending_drops: HashMap<(usize, usize), usize>,
     pending_corruptions: HashMap<(usize, usize), VecDeque<Corruption>>,
+    /// Every `LobbyClient` entity the host has had, and who it stood for. A packet addressed
+    /// to a client that was despawned this frame — the kick notification is exactly that — still
+    /// has somewhere to go, as it does on a transport that keeps the connection open a moment
+    /// longer than the entity.
+    known_clients: HashMap<Entity, PlayerUUID>,
 }
 
 impl LoopbackNetwork {
@@ -478,6 +484,7 @@ impl LoopbackNetwork {
             sent: HashMap::new(),
             pending_drops: HashMap::new(),
             pending_corruptions: HashMap::new(),
+            known_clients: HashMap::new(),
         };
         network.seed(0x2545_f491_4f6c_dd1d);
         network
@@ -508,6 +515,7 @@ impl LoopbackNetwork {
     /// plugins, its starting world — belongs to the game.
     pub fn add_host(&mut self, uuid: PlayerUUID, mut app: App) -> PeerId {
         let lobby = app.world_mut().spawn((Lobby, Host)).id();
+        app.world_mut().insert_resource(HostUuid(uuid));
         self.push_peer(app, uuid, true, Some(lobby), Attachment::Connected)
     }
 
@@ -521,9 +529,17 @@ impl LoopbackNetwork {
     /// all, is exactly what a test may want to assert about.
     pub fn add_client(&mut self, uuid: PlayerUUID, mut app: App) -> PeerId {
         let lobby = app.world_mut().spawn(Lobby).id();
+        self.tell_who_the_host_is(&mut app);
         let peer = self.push_peer(app, uuid, false, Some(lobby), Attachment::Connected);
         self.spawn_lobby_client(uuid);
         peer
+    }
+
+    /// What a backend does as part of joining: the client learns its host's identity before
+    /// any packet is decoded, which is what host-only messages are checked against.
+    fn tell_who_the_host_is(&self, app: &mut App) {
+        let host = self.peers[self.host().0].uuid;
+        app.world_mut().insert_resource(HostUuid(host));
     }
 
     /// Attach `app` as a client whose join is not finished: the data channel is up, packets
@@ -535,6 +551,7 @@ impl LoopbackNetwork {
     /// closes it.
     pub fn add_pending_client(&mut self, uuid: PlayerUUID, mut app: App) -> PeerId {
         let lobby = app.world_mut().spawn(PendingLobby).id();
+        self.tell_who_the_host_is(&mut app);
         self.push_peer(app, uuid, false, Some(lobby), Attachment::Pending)
     }
 
@@ -677,6 +694,7 @@ impl LoopbackNetwork {
         if let Some(lobby) = self.peers[peer.0].lobby.take() {
             self.peers[peer.0].app.world_mut().despawn(lobby);
         }
+        self.peers[peer.0].app.world_mut().remove_resource::<HostUuid>();
         self.despawn_lobby_client(uuid);
     }
 
@@ -690,7 +708,10 @@ impl LoopbackNetwork {
             "only a peer that left can rejoin"
         );
         let uuid = self.peers[peer.0].uuid;
-        let lobby = self.peers[peer.0].app.world_mut().spawn(Lobby).id();
+        let host = self.peers[self.host().0].uuid;
+        let world = self.peers[peer.0].app.world_mut();
+        let lobby = world.spawn(Lobby).id();
+        world.insert_resource(HostUuid(host));
         self.peers[peer.0].lobby = Some(lobby);
         self.peers[peer.0].attachment = Attachment::Connected;
         self.spawn_lobby_client(uuid);
@@ -715,16 +736,17 @@ impl LoopbackNetwork {
             }
             peer.is_host = false;
             peer.attachment = Attachment::Left;
+            peer.app.world_mut().remove_resource::<HostUuid>();
         }
         self.in_flight.clear();
         self.last_reliable_delivery.clear();
         self.next_seq.clear();
+        self.known_clients.clear();
 
-        let lobby = self.peers[new_host.0]
-            .app
-            .world_mut()
-            .spawn((Lobby, Host))
-            .id();
+        let new_uuid = self.peers[new_host.0].uuid;
+        let world = self.peers[new_host.0].app.world_mut();
+        let lobby = world.spawn((Lobby, Host)).id();
+        world.insert_resource(HostUuid(new_uuid));
         self.peers[new_host.0].lobby = Some(lobby);
         self.peers[new_host.0].is_host = true;
         self.peers[new_host.0].attachment = Attachment::Connected;
@@ -1129,18 +1151,25 @@ impl LoopbackNetwork {
         let mut resolved: Vec<(usize, usize, Vec<u8>, SendMode)> = Vec::new();
         let host = self.host().0;
 
+        {
+            let world = self.peers[host].app.world_mut();
+            let current: Vec<(Entity, PlayerUUID)> = world
+                .query_filtered::<(Entity, &LobbyClientPlayerUuid), With<LobbyClient>>()
+                .iter(world)
+                .map(|(entity, uuid)| (entity, uuid.0))
+                .collect();
+            self.known_clients.extend(current);
+        }
+
         for index in 0..self.peers.len() {
             let packets =
                 std::mem::take(&mut self.peers[index].app.world_mut().resource_mut::<Outbox>().0);
             for (entity, bytes, send_mode) in packets {
                 let destination = if self.peers[index].is_host {
-                    // On a host the packet is addressed to one `LobbyClient` entity.
-                    let world = self.peers[index].app.world();
-                    let Some(target_uuid) =
-                        world.get::<LobbyClientPlayerUuid>(entity).map(|uuid| uuid.0)
-                    else {
-                        // The client entity is gone: the peer disconnected between encoding and
-                        // now. Dropping is correct — there is nowhere to send it.
+                    // On a host the packet is addressed to one `LobbyClient` entity — possibly
+                    // one that was despawned since the packet was encoded, which is what a kick
+                    // notification always is.
+                    let Some(target_uuid) = self.known_clients.get(&entity).copied() else {
                         continue;
                     };
                     self.peers.iter().position(|peer| peer.uuid == target_uuid)
