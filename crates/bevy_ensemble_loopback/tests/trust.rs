@@ -437,3 +437,45 @@ fn a_kicked_client_learns_why() {
         vec![LobbyLeftReason::Kicked]
     );
 }
+
+// ── Liveness grace ───────────────────────────────────────────────────────────
+
+/// A transport that knows why a peer is silent (an ICE restart in flight) can hold the
+/// liveness check off for that long, and no longer: the grace adds to the timeout.
+#[test]
+fn a_peer_under_liveness_grace_outlives_the_timeout_but_not_the_grace() {
+    use bevy_ensemble::LivenessGrace;
+
+    let (mut net, host, _a, _b) = trio();
+    net.app_mut(host)
+        .insert_resource(PeerTimeout(Some(Duration::from_millis(100))));
+    let seat = net
+        .app_mut(host)
+        .world_mut()
+        .query_filtered::<Entity, With<LobbyClient>>()
+        .iter(net.app(host).world())
+        .next()
+        .unwrap();
+    net.app_mut(host).world_mut().entity_mut(seat).insert((
+        LivenessGrace {
+            extra: Duration::from_millis(300),
+        },
+        // Silence: as if the client's pongs stopped a quarter second ago.
+        PeerLastPong(0.25),
+    ));
+    net.step_only(&[host]);
+    assert!(
+        net.app(host).world().get_entity(seat).is_ok(),
+        "past the timeout but inside the grace, the seat stands"
+    );
+
+    net.app_mut(host)
+        .world_mut()
+        .entity_mut(seat)
+        .insert(PeerLastPong(0.45));
+    net.step_only(&[host]);
+    assert!(
+        net.app(host).world().get_entity(seat).is_err(),
+        "past timeout plus grace, the peer is gone like any other"
+    );
+}

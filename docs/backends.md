@@ -140,6 +140,32 @@ When the host disconnects (detected on the client side):
 1. Close the platform-level connection.
 2. Despawn the client's lobby entity.
 
+## Connection State and ICE Restart
+
+`bevy_ensemble_sockets` reports each peer through `EnsembleSocket::update_peers` as a
+`PeerState`, in this order over a connection's life:
+
+| State | Meaning | What the WebRTC backend does |
+|-------|---------|------------------------------|
+| `Connecting` | A connection exists; offer/answer and gathering are under way. Reported once, first. | Logs it. |
+| `Connected` | The reliable data channel is open. | Logs it; the handshake takes it from here. |
+| `Reconnecting` | ICE lost the path (Wi-Fi to cellular, a NAT rebinding) and is restarting. The data channels are still open; sends are queued by SCTP and delivered once a new pair is nominated. | Logs it, keeps everything: the host keeps the `LobbyClient`, the client keeps its lobby. |
+| `Disconnected` | A connection that was open has ended. | Host: despawns the `LobbyClient`. Client: if it was the host, despawns the lobby (`LobbyLeft { HostGone }`). |
+| `Failed` | Over for good: no pair ever worked, or a restart found none within `ICE_RESTART_TIMEOUT` (15 s) or `MAX_ICE_RESTARTS` (3). Nothing is reported after it. | Same teardown as `Disconnected`, plus `LobbyJoinFailed` with a reason. |
+
+Only the side that made the original offer restarts ICE — in this protocol, the host — because a
+restart *is* a new offer and a client's offers are refused. The host's ICE agent notices the loss
+and sends an offer with `ice_restart` through the signalling server; the client answers it as it
+would the first one, and reports `Reconnecting` while its own ICE is disconnected. Nothing new
+crosses the signalling server for this: a second `PeerSignal::Offer` on an existing connection
+is a renegotiation. `EnsembleSocket::restart_ice(peer)` asks for one explicitly — a "reconnect"
+button — and `connected_peers()` includes reconnecting peers, so that pings and inputs keep
+flowing through the window that decides whether the session survives.
+
+A backend built on another transport has no obligation to restart anything, but should report
+the same states with the same meanings, and in particular should not report `Disconnected` for a
+loss it is about to recover from.
+
 ## Message Registration
 
 If your backend uses internal messages for handshaking or protocol purposes, register them as ensemble message types:

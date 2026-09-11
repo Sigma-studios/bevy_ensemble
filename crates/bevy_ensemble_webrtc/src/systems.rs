@@ -2,7 +2,8 @@ use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use bevy_ensemble::{
     Host, HostUuid, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyJoinFailed, LobbyLeft,
-    LobbyLeftReason, LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId, PeerRoute,
+    LivenessGrace, LobbyLeftReason, LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId,
+    PeerRoute,
     PendingLobby, PublicLobbies, PublicLobbyInfo, RemoveLobbyParticipant, RequestLobby,
     SerializedLobbyPacket, decode_ensemble_packet, encode_ensemble_message,
 };
@@ -438,6 +439,8 @@ pub(crate) fn refresh_lobby_list(
 /// - On a **client**: despawns the lobby entity when the *host* peer disconnects
 ///   (e.g. kicked or host left), which triggers the full leave/cleanup flow. Any other peer
 ///   going away is logged and ignored; it was never this client's session.
+/// - `Reconnecting` on either side is logged and nothing else: the socket is restarting ICE
+///   with the data channels kept, and it reports `Connected` or `Failed` when that is settled.
 pub(crate) fn poll_socket_peers(
     mut commands: Commands,
     mut socket: ResMut<crate::EnsembleSocketRes>,
@@ -455,13 +458,38 @@ pub(crate) fn poll_socket_peers(
 ) {
     for (peer_id, state) in socket.update_peers() {
         match state {
+            PeerState::Connecting => {
+                debug!("peer {peer_id:#x}: connecting");
+            }
             PeerState::Connected => {
                 info!("Peer connected: {peer_id}");
+                // Back from a restart, or never away: liveness runs on its normal clock.
+                for entity in liveness_entity(peer_id, host_lobby.as_deref(), &lobby_clients, &client_lobbies) {
+                    commands.entity(entity).try_remove::<LivenessGrace>();
+                }
+            }
+            // The path is gone and ICE is restarting to find another; the data channels are
+            // still open and everything queued on them will arrive once it has. Nothing to tear
+            // down: `Connected` follows if it works, `Failed` if it does not, and the arm below
+            // handles that one. A host keeps the client's seat, a client keeps its lobby.
+            PeerState::Reconnecting => {
+                info!(
+                    "peer {peer_id:#x}: the path to it was lost; ICE is restarting, the \
+                     session stands"
+                );
+                // The liveness check must outlast the restart, or it ends the session the
+                // restart was about to save. The socket gives up after `ICE_RESTART_TIMEOUT`
+                // and reports `Failed`, which tears down on its own.
+                for entity in liveness_entity(peer_id, host_lobby.as_deref(), &lobby_clients, &client_lobbies) {
+                    commands.entity(entity).try_insert(LivenessGrace {
+                        extra: bevy_ensemble_sockets::ICE_RESTART_TIMEOUT,
+                    });
+                }
             }
             // The same teardown either way -- what differs is what it means and who is told.
-            // `Failed` is a connection that never opened, so if the lobby is still pending this
-            // is a join that will not be completing, and somebody is watching a screen that
-            // would otherwise never change.
+            // `Failed` is a connection that never opened, or one whose ICE restart found no
+            // path in time; if the lobby is still pending this is a join that will not be
+            // completing, and somebody is watching a screen that would otherwise never change.
             PeerState::Disconnected | PeerState::Failed => {
                 let failed = state == PeerState::Failed;
                 if failed {
@@ -527,6 +555,34 @@ pub(crate) fn poll_socket_peers(
             }
         }
     }
+}
+
+/// The entity whose liveness clock `peer_id` runs on: the host's `LobbyClient` for that peer,
+/// or a client's lobby if the peer is its host. Empty for a peer this side does not track.
+fn liveness_entity(
+    peer_id: u128,
+    host_lobby: Option<&Entity>,
+    lobby_clients: &Query<
+        (Entity, &LobbyClientWebrtcUuid),
+        Or<(With<LobbyClient>, With<PendingWebrtcLobbyClient>)>,
+    >,
+    client_lobbies: &Query<
+        (Entity, Has<PendingLobby>, Option<&LobbyHostUuid>),
+        (Or<(With<Lobby>, With<PendingLobby>)>, Without<Host>),
+    >,
+) -> Vec<Entity> {
+    if host_lobby.is_some() {
+        return lobby_clients
+            .iter()
+            .filter(|(_, uuid)| uuid.0 == peer_id)
+            .map(|(entity, _)| entity)
+            .collect();
+    }
+    client_lobbies
+        .iter()
+        .filter(|(_, _, host)| host.is_some_and(|host| host.0 == peer_id))
+        .map(|(entity, _, _)| entity)
+        .collect()
 }
 
 /// Record which kind of ICE pair each peer ended up on.
