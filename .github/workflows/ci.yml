@@ -27,6 +27,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
       # Steam needs the Steamworks SDK on the linker path; it is checked, not tested, here.
       - run: cargo test --workspace --exclude bevy_ensemble_steam
+      # The signalling server and its tests are behind the `server` feature, which the workspace
+      # run above does not enable: without this they were never run.
+      - run: cargo test -p bevy_ensemble_webrtc --features server
       - run: cargo check -p bevy_ensemble_steam
 
   guards:
