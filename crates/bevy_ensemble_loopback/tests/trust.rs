@@ -646,3 +646,58 @@ fn a_peer_under_liveness_grace_outlives_the_timeout_but_not_the_grace() {
         "past timeout plus grace, the peer is gone like any other"
     );
 }
+
+#[test]
+fn a_removal_notice_that_arrives_after_leaving_is_not_read_in_the_next_session() {
+    let (mut net, host, a, _b) = trio();
+
+    // A leaves on its own, and the host removes its seat, which tells A it was removed. A has no
+    // lobby by then, so nothing it could do with the notice is legitimate.
+    net.app_mut(a)
+        .world_mut()
+        .write_message(bevy_ensemble::LeaveLobby);
+    net.run(1);
+    {
+        let world = net.app_mut(host).world_mut();
+        let seat = world
+            .query_filtered::<(Entity, &LobbyClientPlayerUuid), With<LobbyClient>>()
+            .iter(world)
+            .find(|(_, uuid)| uuid.0 == 2)
+            .map(|(entity, _)| entity)
+            .expect("the host seats A");
+        world.despawn(seat);
+    }
+    net.run(30);
+    assert!(!has_lobby(&mut net, a));
+
+    // The same app joins again, as a player who pressed Leave and then Join does.
+    {
+        let world = net.app_mut(host).world_mut();
+        let lobby = world
+            .query_filtered::<Entity, (With<Lobby>, With<Host>)>()
+            .single(world)
+            .expect("the host still hosts");
+        world.spawn((
+            LobbyClient,
+            LobbyClientPlayerUuid(2),
+            bevy_ensemble::LobbyParticipantOf(lobby),
+        ));
+    }
+    {
+        let world = net.app_mut(a).world_mut();
+        world.insert_resource(HostUuid(1));
+        world.spawn(Lobby);
+    }
+    net.run(60);
+
+    assert!(
+        has_lobby(&mut net, a),
+        "the notice from the last session ended this one: {:?}",
+        net.app(a).world().resource::<Departures>().0
+    );
+    assert!(
+        participants(&mut net, a).iter().any(|(uuid, _)| *uuid == 2),
+        "A is not in its own roster: {:?}",
+        participants(&mut net, a)
+    );
+}

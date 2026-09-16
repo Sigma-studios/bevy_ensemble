@@ -141,6 +141,11 @@ impl HeldUntilVerified {
         self.by_sender.remove(&sender);
     }
 
+    /// Forget everything held, from everyone.
+    pub fn clear(&mut self) {
+        self.by_sender.clear();
+    }
+
     /// Packets currently held for `sender`.
     pub fn held_for(&self, sender: PlayerUUID) -> usize {
         self.by_sender.get(&sender).map_or(0, Vec::len)
@@ -527,6 +532,14 @@ pub(crate) fn decode_ensemble_packet_now(
         return decode_verified_packet(world, None, packet, received_at);
     };
     let verified = peer_is_verified(world, sender);
+    // Nothing to hold for. Held packets are replayed once the sender is verified, and a peer with
+    // no lobby has no session that could verify anyone: whatever arrives now is the tail of one
+    // that is over -- the host's notice that a player who had already left was removed, most
+    // often -- and holding it read it into the *next* session, which it then ended.
+    let in_a_lobby = verified || {
+        let mut lobbies = world.query_filtered::<(), Or<(With<Lobby>, With<PendingLobby>)>>();
+        lobbies.iter(world).next().is_some()
+    };
     let mut all = true;
     let messages = unframe_packet(packet).unwrap_or_else(|| vec![packet]);
     for message in messages {
@@ -551,6 +564,8 @@ pub(crate) fn decode_ensemble_packet_now(
         );
         if handshake || verified {
             all &= decode_one(world, Some(sender), message, received_at);
+        } else if !in_a_lobby {
+            debug!("dropping a packet from {sender:#x}: this peer is in no lobby to hold it for");
         } else {
             world
                 .get_resource_or_insert_with(HeldUntilVerified::default)
@@ -736,6 +751,16 @@ fn dispatch_message<T: EnsembleMessage>(
     }
 
     true
+}
+
+/// A lobby that goes takes what was held for it: those packets were waiting on a session that is
+/// over, and replaying them into the next one with the same host is how a notice meant for the
+/// last session ends the new one.
+pub(crate) fn forget_held_packets_with_the_lobby(
+    _removed: On<Remove, Lobby>,
+    mut held: ResMut<HeldUntilVerified>,
+) {
+    held.clear();
 }
 
 #[cfg(test)]
