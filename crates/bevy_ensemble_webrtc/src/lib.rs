@@ -453,6 +453,7 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
                     session::refresh_lobbies,
                     session::join_lobby,
                     session::leave_lobby,
+                    session::close_lobby,
                 ),
             )
             .add_observer(systems::send_serialized_lobby_packet)

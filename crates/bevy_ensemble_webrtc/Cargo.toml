@@ -79,6 +79,10 @@ tokio-tungstenite = "0.26"
 name = "signalling"
 required-features = ["server"]
 
+[[test]]
+name = "host_migration"
+required-features = ["server"]
+
 [[example]]
 name = "relay_probe"
 path = "examples/relay_probe.rs"

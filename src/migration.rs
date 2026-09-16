@@ -199,9 +199,12 @@ fn waits(world: &World, lobby: Entity) -> Option<HostMigratable> {
 /// End a client's session: the lobby goes, the identity goes with it, and [`LobbyLeft`] says why.
 /// What every host-loss path did before there was anything to wait for.
 pub(crate) fn end_client_session(world: &mut World, lobby: Entity, reason: LobbyLeftReason) {
-    if let Ok(entity) = world.get_entity_mut(lobby) {
-        entity.despawn();
-    }
+    // Two words that the session is over can land in one frame -- the host's `LobbyClosed` and the
+    // platform's own notice, say -- and only the first one ends anything.
+    let Ok(entity) = world.get_entity_mut(lobby) else {
+        return;
+    };
+    entity.despawn();
     world.remove_resource::<LocalMultiplayerPlayerId>();
     world.write_message(LobbyLeft { reason });
 }

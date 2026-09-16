@@ -4,6 +4,44 @@ One section per phase of the netcode overhaul, in the order they landed. Each na
 what to change in a consumer, and why. Both peers of a session must be built from the same
 commit; the join handshake enforces it from phase E2 onward.
 
+## E5d — a WebRTC lobby outlives its host
+
+The WebRTC backend turns E5c on. Against a server with E5b, every lobby it creates or joins is
+migratable; against an older server nothing changes. Nothing on the data channels changed, so the
+wire hash is E5c's.
+
+### What the backend does
+
+- Declares `CAPABILITY_HOST_MIGRATION` right after `Authenticate`, on native and in the browser.
+- On `LobbyMigratable`, inserts `HostMigratable` on the lobby: `successor_within` is the server's
+  idle timeout plus the 20 s keep-alive interval plus 10 s (90 s against a default server, which is
+  how long a host that froze without closing its socket takes to be replaced), and `reach_within` is
+  the plugin's `join_timeout` plus 5 s (20 s by default).
+- When the data channel to the host closes or fails on a joined, migratable lobby, triggers
+  `HostLost` instead of despawning the lobby. A join still pending fails as before.
+- On `HostChanged`, drops the old host's connection. The new host opens a connection to every
+  remaining member and gives each a pending seat, as for a join. A follower drops any stale
+  connection to the new host, points `LobbyHostUuid` at it and answers its offer. Both then trigger
+  `NewHostNamed` with the server's member list.
+- On `PlayerLeft` with no seat to despawn, triggers `ParticipantDeparted`, so a member who leaves
+  mid-change is dropped from the roster.
+- `CloseLobby` on a host also sends `ClientMessage::CloseLobby`, so the server ends the lobby for
+  everyone even if the data-channel message is lost.
+
+### Fixed: `LobbyLeft` twice when a lobby ends two ways at once
+
+When the host's `LobbyClosed` and the server's `Disconnected` land on the same frame, the client now
+hears `LobbyLeft` once. The WebRTC backend checks that the lobby still exists when its teardown is
+applied, not when it reads the event, and the core no longer writes `LobbyLeft` for a lobby that is
+already gone.
+
+**What to change** Deploy the E5b server first. Then every item in E5c's list applies to a game on
+this backend: read `HostChanged`, stop treating an empty `(Lobby, Without<Host>)` query as the end
+of the session, show `AwaitingHost`, and use `CloseLobby` to end a game for everyone.
+`examples/minimal_lobby.rs` shows all of these; Escape hands the lobby over and C closes it.
+`tests/host_migration.rs` runs three apps against the in-process server over loopback WebRTC. It
+needs the `server` feature.
+
 ## E5c — the lobby outlives its host, in the core
 
 Nothing changes for a game until its backend marks a lobby `HostMigratable`; no shipped backend

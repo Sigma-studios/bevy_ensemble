@@ -1,9 +1,10 @@
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use bevy_ensemble::{
-    Host, HostUuid, LivenessGrace, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyJoinFailed,
-    LobbyLeft, LobbyLeftReason, LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId,
-    PeerRoute, PendingLobby, PublicLobbies, PublicLobbyInfo, RemoveLobbyParticipant, RequestLobby,
+    Host, HostLost, HostMigratable, HostUuid, LivenessGrace, Lobby, LobbyClient,
+    LobbyClientPlayerUuid, LobbyJoinFailed, LobbyLeft, LobbyLeftReason, LobbyParticipant,
+    LobbyParticipantOf, LocalMultiplayerPlayerId, NewHostNamed, ParticipantDeparted, PeerRoute,
+    PendingLobby, PublicLobbies, PublicLobbyInfo, RemoveLobbyParticipant, RequestLobby,
     SerializedLobbyPacket, decode_ensemble_packet, encode_ensemble_message,
 };
 use bevy_ensemble_sockets::{PeerSignal, PeerState};
@@ -146,7 +147,13 @@ pub(crate) fn apply_lobby_events(
         Or<(With<LobbyClient>, With<PendingWebrtcLobbyClient>)>,
     >,
     participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
+    runtime: Res<crate::WebrtcRuntime>,
 ) {
+    // Queries see the world as it was before this frame's events, and a promotion is only
+    // applied once they have all been read: a join or a leave the server sends right after
+    // naming this peer host has to find the lobby it now hosts and the seats opened for it here.
+    let mut hosted = host_lobby.as_deref().copied();
+    let mut seated: Vec<(Entity, u128)> = Vec::new();
     for event in events.read() {
         match event {
             LobbyEvent::Welcome { player_uuid } => {
@@ -241,7 +248,7 @@ pub(crate) fn apply_lobby_events(
                 // waiting on a data channel this side never opens -- with, until this line
                 // existed, the `info!` above as the only trace, which reads exactly like a join
                 // that worked.
-                let Some(lobby) = host_lobby.as_ref() else {
+                let Some(lobby) = hosted else {
                     warn!(
                         "dropping the join of {player_uuid}: this peer has no single hosted \
                          lobby to attach them to, so no connection to them will be opened"
@@ -251,7 +258,8 @@ pub(crate) fn apply_lobby_events(
 
                 let already_known = lobby_clients
                     .iter()
-                    .any(|(_, _, puuid)| puuid.0 == player_uuid);
+                    .any(|(_, _, puuid)| puuid.0 == player_uuid)
+                    || seated.iter().any(|(_, uuid)| *uuid == player_uuid);
                 if already_known {
                     debug!("{player_uuid} is already a known client; not connecting twice");
                     continue;
@@ -260,53 +268,154 @@ pub(crate) fn apply_lobby_events(
                 // Initiate WebRTC connection to the new peer
                 socket.connect_peer(player_uuid);
 
-                commands.spawn((
-                    PendingWebrtcLobbyClient,
-                    LobbyParticipantOf(**lobby),
-                    LobbyClientWebrtcUuid(player_uuid),
-                    LobbyClientPlayerUuid(player_uuid),
-                ));
+                let seat = commands
+                    .spawn((
+                        PendingWebrtcLobbyClient,
+                        LobbyParticipantOf(lobby),
+                        LobbyClientWebrtcUuid(player_uuid),
+                        LobbyClientPlayerUuid(player_uuid),
+                    ))
+                    .id();
+                seated.push((seat, player_uuid));
             }
 
             LobbyEvent::PlayerLeft { player_uuid } => {
                 let player_uuid = *player_uuid;
                 info!("Player left lobby: {player_uuid}");
 
-                if host_lobby.is_some() {
-                    if let Some((client_entity, _, _)) = lobby_clients
-                        .iter()
-                        .find(|(_, _, puuid)| puuid.0 == player_uuid)
-                    {
-                        commands.entity(client_entity).try_despawn();
-                    }
+                let seat = lobby_clients
+                    .iter()
+                    .find(|(_, _, puuid)| puuid.0 == player_uuid)
+                    .map(|(seat, _, _)| seat)
+                    .or_else(|| {
+                        seated
+                            .iter()
+                            .find(|(_, uuid)| *uuid == player_uuid)
+                            .map(|(seat, _)| *seat)
+                    });
+                if hosted.is_some()
+                    && let Some(seat) = seat
+                {
+                    seated.retain(|(entity, _)| *entity != seat);
+                    commands.entity(seat).try_despawn();
+                    continue;
+                }
+                // Somebody the server says is gone at a moment no host could say so: a member a
+                // new host inherited and has no seat for yet, or one that left while this peer
+                // waited for its host. The core decides which, if either, this is.
+                if let Some((lobby, _)) = all_lobbies.iter().next() {
+                    commands
+                        .entity(lobby)
+                        .trigger(move |entity| ParticipantDeparted {
+                            entity,
+                            player_uuid,
+                        });
                 }
             }
 
-            // The server removing this peer from its lobby. The one reason it has for doing so
-            // is the host leaving, which destroys the lobby under everybody in it.
+            // The lobby survives its host: waiting for the server to name a successor is worth
+            // as long as the server takes to notice a silent host, plus the keep-alive it would
+            // have to miss, plus margin; reaching the successor, as long as a join may take.
+            LobbyEvent::LobbyMigratable { idle_timeout_secs } => {
+                let Some((lobby, _)) = all_lobbies.iter().next() else {
+                    continue;
+                };
+                let successor_within =
+                    std::time::Duration::from_secs(u64::from(*idle_timeout_secs))
+                        + std::time::Duration::from_secs_f64(KEEP_ALIVE_INTERVAL_SECS)
+                        + std::time::Duration::from_secs(10);
+                let reach_within = runtime
+                    .join_timeout
+                    .unwrap_or(std::time::Duration::from_secs(15))
+                    + std::time::Duration::from_secs(5);
+                commands.entity(lobby).try_insert(HostMigratable {
+                    successor_within,
+                    reach_within,
+                });
+            }
+
+            // The server named a new host. This peer either becomes it — opening a connection to
+            // every member, as a host does to a joiner — or points its transport at it, and the
+            // core does the rest once `NewHostNamed` lands. Both before any of the new host's
+            // traffic can be read: its offer is only answered once `LobbyHostUuid` names it.
+            LobbyEvent::HostChanged {
+                lobby_id,
+                previous_host,
+                new_host,
+                code,
+                members,
+            } => {
+                let Some(me) = lobby_conn.local_player_uuid else {
+                    continue;
+                };
+                let Some((lobby, _)) = all_lobbies.iter().next() else {
+                    continue;
+                };
+                let (previous, new_host) = (*previous_host, *new_host);
+                info!(
+                    "lobby {lobby_id}: the server named {new_host:#x} host in place of \
+                     {previous:#x}"
+                );
+                socket.disconnect_peer(previous);
+                if new_host == me {
+                    commands
+                        .entity(lobby)
+                        .try_remove::<LobbyHostUuid>()
+                        .try_insert(LobbyWebrtcCode(code.clone()));
+                    hosted = Some(lobby);
+                    for member in members.iter().copied().filter(|member| *member != me) {
+                        if lobby_clients.iter().any(|(_, _, uuid)| uuid.0 == member)
+                            || seated.iter().any(|(_, uuid)| *uuid == member)
+                        {
+                            continue;
+                        }
+                        // A stale entry would make the offer a no-op.
+                        socket.disconnect_peer(member);
+                        socket.connect_peer(member);
+                        let seat = commands
+                            .spawn((
+                                PendingWebrtcLobbyClient,
+                                LobbyParticipantOf(lobby),
+                                LobbyClientWebrtcUuid(member),
+                                LobbyClientPlayerUuid(member),
+                            ))
+                            .id();
+                        seated.push((seat, member));
+                    }
+                } else {
+                    hosted = None;
+                    // So its offer makes a fresh connection, not a restart of a dead one.
+                    socket.disconnect_peer(new_host);
+                    commands
+                        .entity(lobby)
+                        .try_insert((LobbyHostUuid(new_host), LobbyWebrtcCode(code.clone())));
+                }
+                let members = members.clone();
+                commands.entity(lobby).trigger(move |entity| NewHostNamed {
+                    entity,
+                    previous,
+                    new_host,
+                    members: Some(members),
+                });
+            }
+
+            // The server removing this peer from its lobby: the host closed it, or left one that
+            // could not be handed over -- to anybody, or to a peer that never declared it could
+            // take it.
             LobbyEvent::Disconnected { reason } => {
                 info!("Disconnected from lobby: {reason}");
-                let mut had_lobby = false;
-                for entity in pending_client_lobbies.iter() {
-                    had_lobby = true;
-                    commands.entity(entity).try_despawn();
+                let lobbies: Vec<Entity> = pending_client_lobbies
+                    .iter()
+                    .chain(active_client_lobbies.iter())
+                    .collect();
+                if lobbies.is_empty() {
+                    commands.remove_resource::<LocalMultiplayerPlayerId>();
+                    commands.remove_resource::<HostUuid>();
+                    continue;
                 }
-                for entity in active_client_lobbies.iter() {
-                    had_lobby = true;
-                    for (participant_entity, _, pof) in participants.iter() {
-                        if pof.0 == entity {
-                            commands.entity(participant_entity).try_despawn();
-                        }
-                    }
-                    commands.entity(entity).try_despawn();
-                }
-                commands.remove_resource::<LocalMultiplayerPlayerId>();
-                commands.remove_resource::<HostUuid>();
-                if had_lobby {
-                    lobby_left.write(LobbyLeft {
-                        reason: LobbyLeftReason::HostGone,
-                    });
-                }
+                commands.queue(move |world: &mut World| {
+                    end_client_lobbies(world, &lobbies, LobbyLeftReason::HostGone);
+                });
             }
 
             // The WebSocket is gone. A lobby on either side is over: the server drops a lobby
@@ -366,6 +475,29 @@ pub(crate) fn apply_lobby_events(
             }
         }
     }
+}
+
+/// End this client's session in `lobbies`, judged when the command is applied rather than when
+/// the event was read.
+///
+/// The server's word that a lobby is over can land on the same frame as the core ending it on its
+/// own -- the host's `LobbyClosed` over the data channel, most often, which the server's
+/// `Disconnected` races -- and whichever is applied second must find nothing left to end, or the
+/// game hears `LobbyLeft` twice for one session.
+fn end_client_lobbies(world: &mut World, lobbies: &[Entity], reason: LobbyLeftReason) {
+    let mut ended = false;
+    for &lobby in lobbies {
+        if let Ok(entity) = world.get_entity_mut(lobby) {
+            entity.despawn();
+            ended = true;
+        }
+    }
+    if !ended {
+        return;
+    }
+    world.remove_resource::<LocalMultiplayerPlayerId>();
+    world.remove_resource::<HostUuid>();
+    world.write_message(LobbyLeft { reason });
 }
 
 pub(crate) fn create_lobby(
@@ -458,6 +590,7 @@ pub(crate) fn poll_socket_peers(
         (Entity, &LobbyClientWebrtcUuid),
         Or<(With<LobbyClient>, With<PendingWebrtcLobbyClient>)>,
     >,
+    migratable: Query<(), With<HostMigratable>>,
 ) {
     for (peer_id, state) in socket.update_peers() {
         match state {
@@ -540,6 +673,17 @@ pub(crate) fn poll_socket_peers(
                              ({:#x?}); the lobby stands",
                             host.map(|host| host.0)
                         );
+                        continue;
+                    }
+                    // A lobby that outlives its host waits to be told who hosts it now.
+                    if !pending && migratable.contains(entity) {
+                        info!(
+                            "lost the connection to the host {peer_id:#x}; waiting for the \
+                             server to name the lobby's next host"
+                        );
+                        commands
+                            .entity(entity)
+                            .trigger(|entity| HostLost { entity });
                         continue;
                     }
                     host_gone = true;

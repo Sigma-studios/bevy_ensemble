@@ -51,6 +51,19 @@ pub(crate) enum LobbyEvent {
     Disconnected {
         reason: String,
     },
+    /// The lobby this peer created or joined outlives its host. See
+    /// [`ServerMessage::LobbyMigratable`].
+    LobbyMigratable {
+        idle_timeout_secs: u32,
+    },
+    /// The host left and `new_host` hosts the lobby now. See [`ServerMessage::HostChanged`].
+    HostChanged {
+        lobby_id: u64,
+        previous_host: u128,
+        new_host: u128,
+        code: String,
+        members: Vec<u128>,
+    },
     /// The WebSocket to the signalling server is gone: it closed, errored, or never opened.
     ///
     /// Not sent when this side dropped the connection itself (a rebuild after leaving a lobby)
@@ -124,11 +137,25 @@ pub(crate) fn dispatch_server_message(
         ServerMessage::Disconnected { reason } => {
             let _ = lobby_event_tx.send(LobbyEvent::Disconnected { reason });
         }
-        // Sent only to a client that declared `CAPABILITY_HOST_MIGRATION`, which this one does
-        // not yet: a server that sends one anyway is misbehaving, and the host leaving still ends
-        // the session through the data channel closing.
-        ServerMessage::LobbyMigratable { .. } | ServerMessage::HostChanged { .. } => {
-            warn!("ignoring a host-migration message this client never declared it understands");
+        ServerMessage::LobbyMigratable {
+            idle_timeout_secs, ..
+        } => {
+            let _ = lobby_event_tx.send(LobbyEvent::LobbyMigratable { idle_timeout_secs });
+        }
+        ServerMessage::HostChanged {
+            lobby_id,
+            previous_host,
+            new_host,
+            code,
+            members,
+        } => {
+            let _ = lobby_event_tx.send(LobbyEvent::HostChanged {
+                lobby_id,
+                previous_host,
+                new_host,
+                code,
+                members,
+            });
         }
     }
 }
