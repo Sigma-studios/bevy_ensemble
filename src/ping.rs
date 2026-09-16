@@ -4,10 +4,10 @@ use std::time::Duration;
 use bevy::prelude::*;
 
 use crate::{
-    Host, Instant, Lobby, LobbyClient, LobbyClientPlayerUuid, LocalMultiplayerPlayerId,
-    PendingLobby, ReceivedEnsembleMessage, SendMode,
+    Host, Instant, Lobby, LobbyClient, LobbyClientPlayerUuid, PendingLobby,
+    ReceivedEnsembleMessage, SendMode,
     messages::{LobbyClientMessage, LobbyMessage},
-    session::{LobbyLeft, LobbyLeftReason},
+    migration::{AwaitingHost, HostLossCause, host_lost},
 };
 
 /// How often each peer pings every other.
@@ -157,7 +157,9 @@ pub(crate) struct PeerLastPongSeq(pub u32);
 ///
 /// On the host, a client past this is despawned as if it had disconnected, which tells everyone
 /// else. On a client, a host past this ends the session with
-/// [`LobbyLeft { reason: PeerTimeout }`](crate::LobbyLeft). `None` disables the check.
+/// [`LobbyLeft { reason: PeerTimeout }`](crate::LobbyLeft) — or, in a lobby that can migrate,
+/// starts the wait for a new host, during which an answer from the old one still counts. `None`
+/// disables the check.
 ///
 /// The transport's own disconnect detection is not enough on its own: a NAT binding that
 /// expired, a process that froze while its OS keeps acknowledging, or a tab in the background
@@ -194,7 +196,7 @@ impl Default for PeerTimeout {
 /// whichever transport backend is active.
 pub(crate) fn send_pings(
     mut commands: Commands,
-    lobbies: Query<Entity, With<Lobby>>,
+    lobbies: Query<(Entity, Option<&AwaitingHost>), With<Lobby>>,
     time: Res<Time>,
     mut outstanding: ResMut<OutstandingPings>,
     mut cooldown: Local<f32>,
@@ -209,7 +211,13 @@ pub(crate) fn send_pings(
     *cooldown = PING_INTERVAL_SECS;
 
     let seq = outstanding.issue(Instant::now());
-    for lobby in lobbies.iter() {
+    for (lobby, awaiting) in lobbies.iter() {
+        // A lobby waiting on a host that has been named but not reached has nobody to ping. One
+        // that has lost its host and heard of no successor keeps pinging the old one: an answer
+        // is how a host that only froze is taken back.
+        if awaiting.is_some_and(|awaiting| awaiting.successor.is_some()) {
+            continue;
+        }
         commands.entity(lobby).trigger(move |entity| LobbyMessage {
             entity,
             message: EnsemblePing {
@@ -489,8 +497,9 @@ pub(crate) fn tick_last_pong(time: Res<Time>, mut peers: Query<&mut PeerLastPong
 ///
 /// On the host, a client that has not answered in time is despawned exactly as a backend does
 /// on disconnect, so `on_lobby_client_removed` tells everyone else and the roster shrinks. On a
-/// client, a host that has not answered in time ends the session: the lobby goes, the identity
-/// goes with it (as it does when a backend loses the host), and [`LobbyLeft`] says why.
+/// client, a host that has not answered in time is lost: a lobby that can migrate waits for a
+/// successor (see [`AwaitingHost`]), and any other ends the session — the lobby goes, the identity
+/// goes with it (as it does when a backend loses the host), and `LobbyLeft` says why.
 pub(crate) fn detect_dead_peers(
     mut commands: Commands,
     timeout: Res<PeerTimeout>,
@@ -506,9 +515,12 @@ pub(crate) fn detect_dead_peers(
     >,
     client_lobbies: Query<
         (Entity, &PeerLastPong, Option<&LivenessGrace>),
-        (Or<(With<Lobby>, With<PendingLobby>)>, Without<Host>),
+        (
+            Or<(With<Lobby>, With<PendingLobby>)>,
+            Without<Host>,
+            Without<AwaitingHost>,
+        ),
     >,
-    mut left: MessageWriter<LobbyLeft>,
 ) {
     let Some(base) = timeout.0 else {
         return;
@@ -531,18 +543,18 @@ pub(crate) fn detect_dead_peers(
         return;
     }
 
+    // A lobby already waiting for a host is on the migration's clock instead of this one.
     for (entity, last_pong, grace) in client_lobbies.iter() {
         let limit = limit_for(grace);
         if last_pong.0 > limit {
             warn!(
-                "leaving the session: the host has not answered a ping for {:.1}s (limit \
-                 {limit:.1}s)",
+                "the host has not answered a ping for {:.1}s (limit {limit:.1}s)",
                 last_pong.0
             );
-            commands.entity(entity).try_despawn();
-            commands.remove_resource::<LocalMultiplayerPlayerId>();
-            left.write(LobbyLeft {
-                reason: LobbyLeftReason::PeerTimeout,
+            // Waits for a successor if the lobby can have one, and ends the session as a
+            // `PeerTimeout` if it cannot.
+            commands.queue(move |world: &mut World| {
+                host_lost(world, entity, HostLossCause::Silence);
             });
         }
     }

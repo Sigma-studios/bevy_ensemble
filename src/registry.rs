@@ -9,6 +9,7 @@ use crate::{
     HandshakeVerified, Host, HostUuid, Instant, Lobby, LobbyClient, LobbyClientPlayerUuid,
     PendingLobby, PlayerUUID,
     messages::{EnsembleMessage, MessageAuthority, ReceivedEnsembleMessage},
+    migration::VerifiedHost,
 };
 
 const MESSAGE_TYPE_INDEX_BYTES: usize = std::mem::size_of::<u16>();
@@ -580,8 +581,8 @@ pub(crate) fn decode_verified_packet(
 /// Whether `sender`'s protocol handshake has been compared and matched.
 ///
 /// On a host: the `LobbyClient` standing for `sender` carries [`HandshakeVerified`]. On a
-/// client: `sender` is the host and the client's lobby carries it. A peer with no lobby of any
-/// kind verifies nobody.
+/// client: `sender` is the host, the client's lobby carries it, and the host it was compared with
+/// ([`VerifiedHost`]) is `sender`. A peer with no lobby of any kind verifies nobody.
 fn peer_is_verified(world: &mut World, sender: PlayerUUID) -> bool {
     let is_host = {
         let mut hosts =
@@ -600,12 +601,17 @@ fn peer_is_verified(world: &mut World, sender: PlayerUUID) -> bool {
     if !host_is_sender {
         return false;
     }
-    let mut lobbies = world.query_filtered::<(), (
+    // The marker says a host was verified; `VerifiedHost` says which. A lobby that followed a new
+    // host has the marker taken away until the new one is compared, and this is the second lock
+    // on the same door.
+    let mut lobbies = world.query_filtered::<Option<&VerifiedHost>, (
         Or<(With<Lobby>, With<PendingLobby>)>,
         Without<Host>,
         With<HandshakeVerified>,
     )>();
-    lobbies.iter(world).next().is_some()
+    lobbies
+        .iter(world)
+        .any(|verified| verified.is_none_or(|verified| verified.0 == sender))
 }
 
 fn decode_one(

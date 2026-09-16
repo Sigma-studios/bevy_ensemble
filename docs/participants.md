@@ -63,6 +63,17 @@ Participant synchronization is **host-authoritative** and fully automatic:
 
 You don't need to manage this yourself. Just query the participant entities to see who's in the lobby.
 
+## When the Host Changes
+
+In a lobby that migrates (see [Lobbies](lobbies.md)), participant entities survive the host changing:
+
+- The old host's participant is despawned on every peer, and the new host's `is_host` becomes `true`.
+- Everyone else's entity stays, with its `PlayerData` and anything the game attached.
+- Participants the platform says have left in the meantime are despawned.
+- On the new host, a participant that has not reconnected yet carries `AwaitingSeat`. It is removed when
+  the player arrives, or the participant is dropped (and everyone told) after
+  `HostMigratable::reach_within`.
+
 ## Player Identity
 
 Each player has a `PlayerUUID` (a `u128`) that uniquely identifies them for the session. The local player's UUID is stored in the `LocalMultiplayerPlayerId` resource:

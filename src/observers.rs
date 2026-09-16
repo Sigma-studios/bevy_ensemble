@@ -5,6 +5,7 @@ use crate::{
     RemoveLobbyParticipant, SendMode,
     components::LobbyParticipants,
     messages::{EnsembleMessage, LobbyClientMessage, LobbyMessage},
+    migration::AwaitingHost,
     registry::{EnsembleMessageRegistry, encode_ensemble_message},
 };
 
@@ -13,11 +14,15 @@ use crate::{
 /// - On a **host** lobby: iterates all [`LobbyClient`] participants and triggers
 ///   a [`LobbyClientMessage`] on each.
 /// - On a **client** lobby: triggers a [`LobbyClientMessage`] on the lobby entity itself.
+///
+/// On a client lobby that is switching to a named new host, nothing is sent: there is no host
+/// yet to send it to. See [`AwaitingHost`].
 pub(crate) fn encode_lobby_message<T: EnsembleMessage>(
     message: On<LobbyMessage<T>>,
     host_lobbies: Query<(), (With<Lobby>, With<Host>)>,
     participants: Query<&LobbyParticipants>,
     lobby_clients: Query<(), With<LobbyClient>>,
+    awaiting: Query<&AwaitingHost>,
     mut commands: Commands,
 ) {
     let send_mode = message.send_mode;
@@ -41,6 +46,17 @@ pub(crate) fn encode_lobby_message<T: EnsembleMessage>(
                     send_mode,
                 });
         }
+        return;
+    }
+
+    if awaiting
+        .get(message.entity)
+        .is_ok_and(|awaiting| awaiting.successor.is_some())
+    {
+        debug!(
+            "not sending a `{}`: switching to a new host that has not been reached",
+            std::any::type_name::<T>()
+        );
         return;
     }
 

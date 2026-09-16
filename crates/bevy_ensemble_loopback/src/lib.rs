@@ -88,9 +88,15 @@
 //! - **Leaving, rejoining, rehosting.** [`disconnect`](LoopbackNetwork::disconnect) models a
 //!   dropped connection. [`leave`](LoopbackNetwork::leave) models pressing Leave;
 //!   [`rejoin`](LoopbackNetwork::rejoin) the same app coming back with the same uuid;
-//!   [`rehost`](LoopbackNetwork::rehost) the host quitting and another peer hosting;
+//!   [`rehost`](LoopbackNetwork::rehost) the host quitting and another peer hosting a new lobby;
 //!   [`half_open`](LoopbackNetwork::half_open) a peer that still hears everyone and is heard by
 //!   nobody, which is what an expired NAT binding looks like.
+//! - **The host going, and the lobby staying.** [`set_host_migration`](LoopbackNetwork::set_host_migration)
+//!   makes lobbies migratable, as a backend does when its arbiter will name a successor.
+//!   [`lose_host`](LoopbackNetwork::lose_host) is the host becoming unreachable — quitting,
+//!   crashing, or falling silent — and [`name_host`](LoopbackNetwork::name_host) is the arbiter's
+//!   decision, apart so a test can look at the wait in between;
+//!   [`migrate`](LoopbackNetwork::migrate) is both.
 //! - **The wire itself.** [`trace_packets`](LoopbackNetwork::trace_packets) records every packet
 //!   with its fate, so a test can assert that a secret never left a peer, that a burst stayed in
 //!   order, or that a lost snapshot was the one it meant to lose.
@@ -118,10 +124,10 @@
 
 use bevy::prelude::*;
 use bevy_ensemble::{
-    EnsembleSet, EnsembleTransportAppExt, Host, HostUuid, Instant, Lobby, LobbyClient,
-    LobbyClientPlayerUuid, LobbyParticipantOf, LocalMultiplayerPlayerId, NetPreset, PeerRtt,
-    PeerRttJitter, PendingLobby, PlayerUUID, SendMode, SerializedLobbyPacket,
-    decode_ensemble_packet,
+    AwaitingHost, EnsembleSet, EnsembleTransportAppExt, Host, HostLost, HostMigratable, HostUuid,
+    Instant, LeaveLobby, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyLeft, LobbyLeftReason,
+    LobbyParticipantOf, LocalMultiplayerPlayerId, NetPreset, NewHostNamed, PeerRtt, PeerRttJitter,
+    PendingLobby, PlayerUUID, SendMode, SerializedLobbyPacket, decode_ensemble_packet,
 };
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
@@ -151,7 +157,24 @@ impl Plugin for LoopbackTransportPlugin {
             .init_resource::<Outbox>()
             .init_resource::<Inbox>()
             .add_observer(capture_outbound_packet)
-            .add_systems(PreUpdate, drain_inbox.in_set(EnsembleSet::ReceivePackets));
+            .add_systems(PreUpdate, drain_inbox.in_set(EnsembleSet::ReceivePackets))
+            .add_systems(Update, leave_on_request);
+    }
+}
+
+/// [`LeaveLobby`], serviced as the WebRTC backend services it: the lobby entities go, and with them
+/// everything that hung off them. What that means for the network — a host gone, a seat to
+/// remove — is the test's to say through [`LoopbackNetwork`], as it is the arbiter's elsewhere.
+fn leave_on_request(
+    mut commands: Commands,
+    mut requests: MessageReader<LeaveLobby>,
+    lobbies: Query<Entity, Or<(With<Lobby>, With<PendingLobby>)>>,
+) {
+    if requests.read().next().is_none() {
+        return;
+    }
+    for lobby in lobbies.iter() {
+        commands.entity(lobby).try_despawn();
     }
 }
 
@@ -437,6 +460,22 @@ struct Peer {
     is_host: bool,
     lobby: Option<Entity>,
     attachment: Attachment,
+    /// Not running at all: skipped by every step. A crashed process, from the outside.
+    crashed: bool,
+}
+
+/// How the host becomes unreachable, for [`LoopbackNetwork::lose_host`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostDeparture {
+    /// The host leaves: its lobby goes, and its connections close, which every client's transport
+    /// notices.
+    Quits,
+    /// The host's process dies: it stops running, and its connections drop, which every client's
+    /// transport notices.
+    Crashes,
+    /// The host keeps running and nothing reaches it or leaves it, and no transport says so: an
+    /// expired binding, a frozen machine. Clients notice by their pings going unanswered.
+    FallsSilent,
 }
 
 type Corruption = Box<dyn FnOnce(&mut Vec<u8>)>;
@@ -466,11 +505,17 @@ pub struct LoopbackNetwork {
     sent: HashMap<(usize, usize), (u64, u64)>,
     pending_drops: HashMap<(usize, usize), usize>,
     pending_corruptions: HashMap<(usize, usize), VecDeque<Corruption>>,
-    /// Every `LobbyClient` entity the host has had, and who it stood for. A packet addressed
-    /// to a client that was despawned this frame — the kick notification is exactly that — still
-    /// has somewhere to go, as it does on a transport that keeps the connection open a moment
-    /// longer than the entity.
-    known_clients: HashMap<Entity, PlayerUUID>,
+    /// Every `LobbyClient` entity each host has had, keyed by the hosting peer, and who it stood
+    /// for. A packet addressed to a client that was despawned this frame — the kick notification
+    /// is exactly that — still has somewhere to go, as it does on a transport that keeps the
+    /// connection open a moment longer than the entity. Keyed by host because an entity id means
+    /// nothing outside the world it came from, and a lobby that changes hands has had two.
+    known_clients: HashMap<(usize, Entity), PlayerUUID>,
+    /// Put on every lobby, when set: see [`set_host_migration`](Self::set_host_migration).
+    migration: Option<HostMigratable>,
+    /// The host [`lose_host`](Self::lose_host) took away, until [`name_host`](Self::name_host)
+    /// replaces it.
+    lost_host: Option<PeerId>,
 }
 
 impl LoopbackNetwork {
@@ -497,6 +542,8 @@ impl LoopbackNetwork {
             pending_drops: HashMap::new(),
             pending_corruptions: HashMap::new(),
             known_clients: HashMap::new(),
+            migration: None,
+            lost_host: None,
         };
         network.seed(0x2545_f491_4f6c_dd1d);
         network
@@ -528,7 +575,9 @@ impl LoopbackNetwork {
     pub fn add_host(&mut self, uuid: PlayerUUID, mut app: App) -> PeerId {
         let lobby = app.world_mut().spawn((Lobby, Host)).id();
         app.world_mut().insert_resource(HostUuid(uuid));
-        self.push_peer(app, uuid, true, Some(lobby), Attachment::Connected)
+        let peer = self.push_peer(app, uuid, true, Some(lobby), Attachment::Connected);
+        self.mark_migratable(peer);
+        peer
     }
 
     /// Attach `app` as a client and open the connection.
@@ -543,7 +592,8 @@ impl LoopbackNetwork {
         let lobby = app.world_mut().spawn(Lobby).id();
         self.tell_who_the_host_is(&mut app);
         let peer = self.push_peer(app, uuid, false, Some(lobby), Attachment::Connected);
-        self.spawn_lobby_client(uuid);
+        self.mark_migratable(peer);
+        self.spawn_lobby_client(self.host(), uuid);
         peer
     }
 
@@ -564,7 +614,9 @@ impl LoopbackNetwork {
     pub fn add_pending_client(&mut self, uuid: PlayerUUID, mut app: App) -> PeerId {
         let lobby = app.world_mut().spawn(PendingLobby).id();
         self.tell_who_the_host_is(&mut app);
-        self.push_peer(app, uuid, false, Some(lobby), Attachment::Pending)
+        let peer = self.push_peer(app, uuid, false, Some(lobby), Attachment::Pending);
+        self.mark_migratable(peer);
+        peer
     }
 
     /// Finish a pending client's join: the client's lobby becomes a [`Lobby`], the host gets its
@@ -587,7 +639,7 @@ impl LoopbackNetwork {
             .remove::<PendingLobby>()
             .insert(Lobby);
         self.peers[peer.0].attachment = Attachment::Connected;
-        self.spawn_lobby_client(uuid);
+        self.spawn_lobby_client(self.host(), uuid);
     }
 
     /// Set or clear this peer's `LocalMultiplayerPlayerId` after construction.
@@ -621,13 +673,13 @@ impl LoopbackNetwork {
             is_host,
             lobby,
             attachment,
+            crashed: false,
         });
         self.apply_netsim(peer);
         peer
     }
 
-    fn spawn_lobby_client(&mut self, uuid: PlayerUUID) {
-        let host = self.host();
+    fn spawn_lobby_client(&mut self, host: PeerId, uuid: PlayerUUID) {
         let host_lobby = self.peers[host.0]
             .lobby
             .expect("the host has a lobby while it is hosting");
@@ -638,8 +690,29 @@ impl LoopbackNetwork {
         ));
     }
 
+    /// Make `peer`'s lobby migratable, or not, to match [`set_host_migration`](Self::set_host_migration).
+    fn mark_migratable(&mut self, peer: PeerId) {
+        let migration = self.migration;
+        let Some(lobby) = self.peers[peer.0].lobby else {
+            return;
+        };
+        let Ok(mut lobby) = self.peers[peer.0].app.world_mut().get_entity_mut(lobby) else {
+            return;
+        };
+        match migration {
+            Some(migration) => {
+                lobby.insert(migration);
+            }
+            None => {
+                lobby.remove::<HostMigratable>();
+            }
+        }
+    }
+
     fn despawn_lobby_client(&mut self, uuid: PlayerUUID) {
-        let host = self.host();
+        let Some(host) = self.try_host() else {
+            return;
+        };
         let host_world = self.peers[host.0].app.world_mut();
         let client_entity = host_world
             .query_filtered::<(Entity, &LobbyClientPlayerUuid), With<LobbyClient>>()
@@ -686,8 +759,11 @@ impl LoopbackNetwork {
         let uuid = self.peers[peer.0].uuid;
         let was_disconnected = self.peers[peer.0].attachment == Attachment::Disconnected;
         self.peers[peer.0].attachment = Attachment::Connected;
-        if was_disconnected && !self.peers[peer.0].is_host {
-            self.spawn_lobby_client(uuid);
+        if was_disconnected
+            && !self.peers[peer.0].is_host
+            && let Some(host) = self.try_host()
+        {
+            self.spawn_lobby_client(host, uuid);
         }
     }
 
@@ -729,16 +805,17 @@ impl LoopbackNetwork {
         world.insert_resource(HostUuid(host));
         self.peers[peer.0].lobby = Some(lobby);
         self.peers[peer.0].attachment = Attachment::Connected;
-        self.spawn_lobby_client(uuid);
+        self.mark_migratable(peer);
+        self.spawn_lobby_client(self.host(), uuid);
     }
 
-    /// The host quits and `new_host` hosts instead.
+    /// The host quits and `new_host` hosts a new lobby instead.
     ///
     /// The old host's `(Lobby, Host)` goes, and with it every `LobbyClient` (they are its
-    /// participants); every client's `Lobby` goes, as it does when a host disappears; then
+    /// participants); every client's `Lobby` goes, as it does when a lobby cannot migrate; then
     /// `new_host` spawns its own `(Lobby, Host)`. Everyone else has [left](Self::leave) and has
-    /// to [`rejoin`](Self::rejoin) — there is no host migration in this stack, and this models
-    /// exactly that.
+    /// to [`rejoin`](Self::rejoin). A rehost is not a migration: for a lobby that keeps its
+    /// members, see [`migrate`](Self::migrate).
     pub fn rehost(&mut self, new_host: PeerId) {
         let old_host = self.host();
         assert_ne!(old_host, new_host, "already the host");
@@ -757,6 +834,7 @@ impl LoopbackNetwork {
         self.last_reliable_delivery.clear();
         self.next_seq.clear();
         self.known_clients.clear();
+        self.lost_host = None;
 
         let new_uuid = self.peers[new_host.0].uuid;
         let world = self.peers[new_host.0].app.world_mut();
@@ -765,18 +843,176 @@ impl LoopbackNetwork {
         self.peers[new_host.0].lobby = Some(lobby);
         self.peers[new_host.0].is_host = true;
         self.peers[new_host.0].attachment = Attachment::Connected;
+        self.peers[new_host.0].crashed = false;
+        self.mark_migratable(new_host);
+    }
+
+    // ---- host migration --------------------------------------------------------------------
+
+    /// Make every lobby migratable with these waits — the ones that exist and the ones added after
+    /// — or, with `None`, none of them. Off by default, as it is for a backend that has no party
+    /// to name a successor.
+    pub fn set_host_migration(&mut self, migration: Option<HostMigratable>) {
+        self.migration = migration;
+        for index in 0..self.peers.len() {
+            self.mark_migratable(PeerId(index));
+        }
+    }
+
+    /// The host becomes unreachable, `how` it does. Returns the peer that was the host.
+    ///
+    /// For [`Quits`](HostDeparture::Quits) and [`Crashes`](HostDeparture::Crashes) every client's
+    /// transport notices: a migratable lobby is told [`HostLost`] and waits, any other ends as a
+    /// backend ends it, with `LobbyLeft { HostGone }`. [`FallsSilent`](HostDeparture::FallsSilent)
+    /// tells nobody anything. Nothing in flight to or from the host arrives. Until
+    /// [`name_host`](Self::name_host), there is no host: [`host`](Self::host) panics and
+    /// [`try_host`](Self::try_host) says `None`.
+    ///
+    /// Except after [`FallsSilent`](HostDeparture::FallsSilent): nobody has noticed anything, so
+    /// the arbiter still counts it as the host. [`reconnect`](Self::reconnect) brings it back.
+    pub fn lose_host(&mut self, how: HostDeparture) -> PeerId {
+        let host = self.host();
+        self.in_flight
+            .retain(|packet| packet.to != host && packet.from != host);
+        if how != HostDeparture::FallsSilent {
+            self.lost_host = Some(host);
+            self.peers[host.0].is_host = false;
+        }
+        match how {
+            HostDeparture::Quits => {
+                self.peers[host.0].attachment = Attachment::Left;
+                if let Some(lobby) = self.peers[host.0].lobby.take()
+                    && let Ok(lobby) = self.peers[host.0].app.world_mut().get_entity_mut(lobby)
+                {
+                    lobby.despawn();
+                }
+            }
+            HostDeparture::Crashes => {
+                self.peers[host.0].attachment = Attachment::Left;
+                self.peers[host.0].crashed = true;
+            }
+            HostDeparture::FallsSilent => {
+                self.peers[host.0].attachment = Attachment::Disconnected;
+                return host;
+            }
+        }
+
+        for index in 0..self.peers.len() {
+            let peer = &mut self.peers[index];
+            if index == host.0 || peer.attachment == Attachment::Left {
+                continue;
+            }
+            let Some(lobby) = peer.lobby else {
+                continue;
+            };
+            let world = peer.app.world_mut();
+            let Ok(entity) = world.get_entity(lobby) else {
+                continue;
+            };
+            let promoted = entity.contains::<Lobby>();
+            if promoted && entity.contains::<HostMigratable>() {
+                world.trigger(HostLost { entity: lobby });
+                world.flush();
+            } else {
+                world.despawn(lobby);
+                world.remove_resource::<LocalMultiplayerPlayerId>();
+                world.remove_resource::<HostUuid>();
+                world.write_message(LobbyLeft {
+                    reason: LobbyLeftReason::HostGone,
+                });
+                peer.lobby = None;
+                peer.attachment = Attachment::Left;
+            }
+        }
+        host
+    }
+
+    /// The arbiter names `new_host`: every member's lobby is told [`NewHostNamed`], with the
+    /// members in join order, and the new host is given a seat for every member that is connected.
+    /// Pending members are seated when they are [promoted](Self::promote).
+    ///
+    /// Called after [`lose_host`](Self::lose_host), it is the successor being named. Called while
+    /// a host is still reachable, it is an arbiter replacing a host that is still talking — a
+    /// split brain, where the old host goes on running and nobody listens to it.
+    pub fn name_host(&mut self, new_host: PeerId) {
+        let previous = self
+            .try_host()
+            .or(self.lost_host)
+            .expect("a host to replace");
+        assert_ne!(previous, new_host, "already the host");
+        let previous_uuid = self.peers[previous.0].uuid;
+        let new_uuid = self.peers[new_host.0].uuid;
+        let members: Vec<PeerId> = self
+            .members()
+            .into_iter()
+            .filter(|member| *member != previous)
+            .collect();
+        let member_uuids: Vec<PlayerUUID> = members
+            .iter()
+            .map(|member| self.peers[member.0].uuid)
+            .collect();
+
+        for member in &members {
+            let peer = &mut self.peers[member.0];
+            let Some(lobby) = peer.lobby else {
+                continue;
+            };
+            let world = peer.app.world_mut();
+            if world.get_entity(lobby).is_err() {
+                continue;
+            }
+            world.trigger(NewHostNamed {
+                entity: lobby,
+                previous: previous_uuid,
+                new_host: new_uuid,
+                members: Some(member_uuids.clone()),
+            });
+            world.flush();
+        }
+
+        self.peers[previous.0].is_host = false;
+        self.peers[new_host.0].is_host = true;
+        self.lost_host = None;
+        for member in members {
+            if member != new_host && self.peers[member.0].attachment == Attachment::Connected {
+                self.spawn_lobby_client(new_host, self.peers[member.0].uuid);
+            }
+        }
+    }
+
+    /// The host crashes and `new_host` is named in its place, in one call.
+    pub fn migrate(&mut self, new_host: PeerId) {
+        self.lose_host(HostDeparture::Crashes);
+        self.name_host(new_host);
+    }
+
+    /// Everyone still in the lobby as the arbiter sees it, in the order they joined: every peer
+    /// that has not left, the host included while it is reachable.
+    pub fn members(&self) -> Vec<PeerId> {
+        self.peers
+            .iter()
+            .enumerate()
+            .filter(|(_, peer)| peer.attachment != Attachment::Left)
+            .map(|(index, _)| PeerId(index))
+            .collect()
     }
 
     // ---- looking around --------------------------------------------------------------------
 
     /// The host peer.
+    ///
+    /// # Panics
+    ///
+    /// Between [`lose_host`](Self::lose_host) and [`name_host`](Self::name_host), when there is
+    /// none. See [`try_host`](Self::try_host).
     pub fn host(&self) -> PeerId {
-        PeerId(
-            self.peers
-                .iter()
-                .position(|peer| peer.is_host)
-                .expect("a network always has a host"),
-        )
+        self.try_host()
+            .expect("no host is named (between lose_host and name_host)")
+    }
+
+    /// The host peer, if one is named.
+    pub fn try_host(&self) -> Option<PeerId> {
+        self.peers.iter().position(|peer| peer.is_host).map(PeerId)
     }
 
     pub fn peers(&self) -> impl Iterator<Item = PeerId> + '_ {
@@ -1019,7 +1255,9 @@ impl LoopbackNetwork {
     /// Update every peer's app once.
     pub fn update_all(&mut self) {
         for peer in &mut self.peers {
-            peer.app.update();
+            if !peer.crashed {
+                peer.app.update();
+            }
         }
     }
 
@@ -1040,7 +1278,9 @@ impl LoopbackNetwork {
     pub fn step_only(&mut self, peers: &[PeerId]) {
         self.advance(1);
         for peer in peers {
-            self.peers[peer.0].app.update();
+            if !self.peers[peer.0].crashed {
+                self.peers[peer.0].app.update();
+            }
         }
         self.collect_outbound();
     }
@@ -1050,7 +1290,9 @@ impl LoopbackNetwork {
     pub fn step_with(&mut self, mut each: impl FnMut(PeerId, &mut App)) {
         self.advance(1);
         for index in 0..self.peers.len() {
-            each(PeerId(index), &mut self.peers[index].app);
+            if !self.peers[index].crashed {
+                each(PeerId(index), &mut self.peers[index].app);
+            }
         }
         self.collect_outbound();
     }
@@ -1085,13 +1327,29 @@ impl LoopbackNetwork {
     /// leave it with no headroom — a session that stalls constantly for a reason that exists only
     /// in the harness.
     pub fn publish_peer_rtt(&mut self) {
-        let host = self.host();
+        let Some(host) = self.try_host() else {
+            return;
+        };
+        let host_uuid = self.peers[host.0].uuid;
         let netsim = (self.netsim != NetPreset::Off).then(|| self.netsim.config());
 
         let mut per_client: Vec<(PlayerUUID, f64, f64)> = Vec::new();
         for index in 0..self.peers.len() {
             let peer = PeerId(index);
             if self.peers[index].is_host || !self.peers[index].attachment.can_receive() {
+                continue;
+            }
+            // Only a client connected to this host, as far as it knows: one still switching to a
+            // new host has no connection to measure, and one following another has another.
+            let world = self.peers[index].app.world();
+            let follows_host = world
+                .get_resource::<HostUuid>()
+                .is_some_and(|host| host.0 == host_uuid);
+            let switching = self.peers[index]
+                .lobby
+                .and_then(|lobby| world.get::<AwaitingHost>(lobby))
+                .is_some();
+            if !follows_host || switching {
                 continue;
             }
             let up = self.link_between(peer, host);
@@ -1167,33 +1425,46 @@ impl LoopbackNetwork {
         // Resolve each peer's outbox into (from, to, bytes, mode) before scheduling, because
         // scheduling needs `&mut self`.
         let mut resolved: Vec<(usize, usize, Vec<u8>, SendMode)> = Vec::new();
-        let host = self.host().0;
-
-        {
-            let world = self.peers[host].app.world_mut();
-            let current: Vec<(Entity, PlayerUUID)> = world
-                .query_filtered::<(Entity, &LobbyClientPlayerUuid), With<LobbyClient>>()
-                .iter(world)
-                .map(|(entity, uuid)| (entity, uuid.0))
-                .collect();
-            self.known_clients.extend(current);
-        }
 
         for index in 0..self.peers.len() {
+            // Each peer's role is its own world's, not the network's bookkeeping: a host the
+            // arbiter replaced still thinks it hosts, and still sends like one.
+            let world = self.peers[index].app.world_mut();
+            let hosting = world
+                .query_filtered::<(), (With<Host>, Or<(With<Lobby>, With<PendingLobby>)>)>()
+                .iter(world)
+                .next()
+                .is_some();
+            let host_uuid = world.get_resource::<HostUuid>().map(|host| host.0);
+            if hosting {
+                let current: Vec<(Entity, PlayerUUID)> = world
+                    .query_filtered::<(Entity, &LobbyClientPlayerUuid), With<LobbyClient>>()
+                    .iter(world)
+                    .map(|(entity, uuid)| (entity, uuid.0))
+                    .collect();
+                self.known_clients.extend(
+                    current
+                        .into_iter()
+                        .map(|(entity, uuid)| ((index, entity), uuid)),
+                );
+            }
+
             let packets =
                 std::mem::take(&mut self.peers[index].app.world_mut().resource_mut::<Outbox>().0);
             for (entity, bytes, send_mode) in packets {
-                let destination = if self.peers[index].is_host {
+                let target_uuid = if hosting {
                     // On a host the packet is addressed to one `LobbyClient` entity — possibly
                     // one that was despawned since the packet was encoded, which is what a kick
                     // notification always is.
-                    let Some(target_uuid) = self.known_clients.get(&entity).copied() else {
-                        continue;
-                    };
-                    self.peers.iter().position(|peer| peer.uuid == target_uuid)
+                    self.known_clients.get(&(index, entity)).copied()
                 } else {
-                    Some(host)
+                    // A client sends to whoever it believes its host is.
+                    host_uuid
                 };
+                let Some(target_uuid) = target_uuid else {
+                    continue;
+                };
+                let destination = self.peers.iter().position(|peer| peer.uuid == target_uuid);
                 let Some(destination) = destination else {
                     continue;
                 };

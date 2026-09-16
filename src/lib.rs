@@ -88,6 +88,7 @@ mod broadcast;
 mod components;
 pub mod handshake;
 mod messages;
+mod migration;
 #[cfg(feature = "netdebug")]
 mod netdebug;
 #[cfg(feature = "netmetrics")]
@@ -112,6 +113,10 @@ pub use broadcast::{
 pub use components::*;
 pub use handshake::{HandshakeVerified, ProtocolHandshake};
 pub use messages::*;
+pub use migration::{
+    AwaitingHost, AwaitingSeat, HostChanged, HostLossCause, HostLost, HostMigratable,
+    HostMigrationTimeouts, LobbyClosed, NewHostNamed, ParticipantDeparted, VerifiedHost,
+};
 #[cfg(feature = "netdebug")]
 pub use netdebug::{NetDebugConfig, NetDebugExtras, NetDebugPlugin};
 #[cfg(feature = "netmetrics")]
@@ -130,7 +135,7 @@ pub use registry::{
 };
 pub use route::PeerRoute;
 pub use session::{
-    JoinLobby, LeaveLobby, LobbyJoinFailed, LobbyLeft, LobbyLeftReason, RefreshLobbies,
+    CloseLobby, JoinLobby, LeaveLobby, LobbyJoinFailed, LobbyLeft, LobbyLeftReason, RefreshLobbies,
 };
 pub use transport::{EnsembleTransportAppExt, TransportBackend};
 pub use types::*;
@@ -204,6 +209,25 @@ impl Plugin for EnsemblePlugin {
             .register_control_message_type::<ping::EnsemblePong>(
                 "bevy_ensemble/Pong",
                 MessageAuthority::Any,
+            )
+            // Only a host may close its lobby for everyone.
+            .register_control_message_type::<migration::LobbyClosed>(
+                "bevy_ensemble/LobbyClosed",
+                MessageAuthority::HostOnly,
+            )
+            .add_message::<migration::HostChanged>()
+            .add_observer(migration::on_host_lost)
+            .add_observer(migration::on_new_host_named)
+            .add_observer(migration::on_participant_departed)
+            .add_systems(First, migration::finish_closing_lobbies)
+            .add_systems(
+                Update,
+                (
+                    migration::run_host_migration_clocks,
+                    migration::take_back_a_silent_host,
+                    migration::close_lobbies,
+                    migration::apply_lobby_closed,
+                ),
             )
             .add_observer(observers::on_lobby_client_removed)
             .add_observer(handshake::replay_held_packets)
