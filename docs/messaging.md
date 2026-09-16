@@ -30,7 +30,8 @@ app.register_ensemble_message_type::<ChatMessage>("chat")
 ```
 
 `MessageAuthority::HostOnly` makes a type one that only the host may send: a client that
-receives it from anyone else drops it, and the host never relays it.
+receives it from anyone else drops it, and the host never relays it. "The host" is whoever
+`HostUuid` names at the time, which changes when a lobby migrates to a new host.
 
 ## Sending Messages
 

@@ -15,6 +15,7 @@ about itself.
 |---|---|---|
 | Who sent a packet | the transport (WebRTC peer, Steam ID, loopback peer) | everyone |
 | Who the host is | `HostUuid`, set by the backend as part of joining, before any data flows | clients |
+| Who the host becomes | the arbiter the backend already trusts — the signalling server, Steam — through `NewHostNamed` | everyone |
 | A message's sender inside a broadcast envelope | the host, which overwrites it with the transport sender before relaying | clients |
 | A player's own data (`SyncPlayerData`) | accepted on the host only when the transport sender is that player | host |
 | The roster (`SyncLobbyParticipant`, `RemoveLobbyParticipant`) | the host only | clients |
@@ -38,6 +39,20 @@ introduced; Steam accepts P2P sessions and packets only from lobby members. The 
 authenticates before listing, hands out random lobby ids, rate-limits, and relays signals only
 between a lobby's host and one of its members.
 
+## When the host goes
+
+A lobby a backend marks `HostMigratable` outlives its host. The client's lobby waits
+(`AwaitingHost`) for the arbiter to name a successor, and trusts nothing new in the meantime:
+`HostUuid` still names the old host, so nobody else's `HostOnly` message is taken. When the
+arbiter names the new host, in the same world update `HostUuid` changes, the old host's held
+packets are discarded, and `HandshakeVerified` is removed from the lobby: the new host is read
+exactly as a host is read at a join, from the moment its protocol has been compared, and not
+before. Everything the old host sends afterwards is held and never read.
+
+A host that only stopped answering pings is waited for the same way, and is still the host if it
+answers before anyone is named. A lobby nobody names a host for ends with `LobbyLeft { HostGone }`
+(or `PeerTimeout`, for a silence) once `HostMigratable::successor_within` has passed.
+
 ## Liveness
 
 A peer that stops answering pings for `PeerTimeout` (5 s) is gone: the host despawns its
@@ -59,15 +74,19 @@ transport for as long as it takes ICE to give up.
 | A lobby member becomes a joiner's "host" by offering first | clients accept offers only from `HostUuid` |
 | Anyone on Steam joins a lobby by sending a packet | membership checks before spawning a client |
 | Two builds with different registrations play a silently corrupted session | protocol handshake at the join |
+| A member declares itself host when the host goes | peers never elect: only the arbiter's `NewHostNamed` changes `HostUuid` |
+| A new host's packets are read before its protocol was compared | following clears `HandshakeVerified`; `VerifiedHost` names the host a verification was for |
+| A replaced host that is still running keeps giving orders | after `HostChanged` its packets are held unread, and `HostOnly` from it is refused |
+| A host that leaves kicks every client on its way out | a seat removed with its lobby is not a kick (E5a) |
 | A dead or backgrounded peer stalls everyone until ICE gives up | `PeerTimeout` |
 
 ## Non-goals, stated
 
-- **Host migration.** When the host goes, the session ends, with `LobbyLeft { HostGone }` on
-  every client. The host is the authority and the relay; electing a new one means transferring
-  authoritative state to a peer that has only ever held a copy of it, and this stack does not
-  attempt that. A game that wants continuity rehosts: one client hosts a new lobby and the others
-  join it.
+- **Peer election, and state transfer.** When the host of a migratable lobby goes, the party
+  that named the host at the join names the next one; peers never vote. What moves is the lobby —
+  its participants, their player data, the connections — and not the host's authoritative game
+  state, which a client has only ever held a copy of. A netcode layer that can resume a match from
+  that copy (lockstep can) does so on `HostChanged`; any other starts over in the same lobby.
 - **Cheating by a client with its own inputs.** A client's input is its own to send. What the
   host makes of it is the game's simulation, not this layer's.
 - **Encryption beyond the transport's.** WebRTC data channels and Steam networking are encrypted

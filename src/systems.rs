@@ -7,6 +7,7 @@ use crate::{
         LobbyClientMessage, LobbyMessage, ReceivedEnsembleMessage, RemoveLobbyParticipant,
         StartHosting, SyncLobbyParticipant,
     },
+    migration::{AwaitingSeat, MigratedSeat},
     session::{LobbyLeft, LobbyLeftReason},
 };
 
@@ -101,22 +102,35 @@ pub(crate) fn add_host_lobby_participant(
 ///
 /// When a [`LobbyClient`] component is added to an entity that also has
 /// [`LobbyClientPlayerUuid`], this system spawns a corresponding participant.
+///
+/// A participant that already exists is a member a new host inherited, arriving at last: it stops
+/// [`AwaitingSeat`], and its seat is marked so its protocol is asked for again if need be.
 pub(crate) fn add_remote_lobby_participants(
     mut commands: Commands,
     added_lobby_clients: Query<
-        (&LobbyClientPlayerUuid, &LobbyParticipantOf),
+        (Entity, &LobbyClientPlayerUuid, &LobbyParticipantOf),
         (With<LobbyClient>, Added<LobbyClient>),
     >,
-    existing_participants: Query<(&LobbyParticipant, &LobbyParticipantOf)>,
+    existing_participants: Query<(
+        Entity,
+        &LobbyParticipant,
+        &LobbyParticipantOf,
+        Has<AwaitingSeat>,
+    )>,
 ) {
-    for (player_uuid, participant_of) in added_lobby_clients.iter() {
-        if existing_participants
-            .iter()
-            .any(|(participant, existing_participant_of)| {
-                existing_participant_of.0 == participant_of.0
-                    && participant.player_uuid == player_uuid.0
-            })
+    for (seat, player_uuid, participant_of) in added_lobby_clients.iter() {
+        if let Some((participant, _, _, awaiting_seat)) =
+            existing_participants
+                .iter()
+                .find(|(_, participant, existing_participant_of, _)| {
+                    existing_participant_of.0 == participant_of.0
+                        && participant.player_uuid == player_uuid.0
+                })
         {
+            if awaiting_seat {
+                commands.entity(participant).try_remove::<AwaitingSeat>();
+                commands.entity(seat).try_insert(MigratedSeat);
+            }
             continue;
         }
 

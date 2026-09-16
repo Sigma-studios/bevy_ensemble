@@ -80,6 +80,15 @@ pub struct LobbyJoinFailed {
 #[derive(Message, Debug, Clone, Copy)]
 pub struct LeaveLobby;
 
+/// End the lobby this peer hosts, for everyone in it.
+///
+/// A host that sends [`LeaveLobby`] from a lobby that can migrate hands it to another member, and
+/// the session goes on without it. This is the other thing a host can mean — the game is over —
+/// and nobody takes the lobby over: every client ends its session with
+/// `LobbyLeft { HostGone }`, and the host leaves on the next frame. Ignored on a client.
+#[derive(Message, Debug, Clone, Copy)]
+pub struct CloseLobby;
+
 /// Registers the backend-neutral session requests.
 ///
 /// Added by [`EnsemblePlugin`](crate::EnsemblePlugin), so a game and a backend can both assume
@@ -88,6 +97,7 @@ pub(crate) fn register_session_messages(app: &mut App) {
     app.add_message::<RefreshLobbies>()
         .add_message::<JoinLobby>()
         .add_message::<LeaveLobby>()
+        .add_message::<CloseLobby>()
         .add_message::<LobbyJoinFailed>()
         .add_message::<LobbyLeft>();
 }
@@ -110,7 +120,8 @@ pub enum LobbyLeftReason {
     Left,
     /// The host removed this peer.
     Kicked,
-    /// The host's connection ended.
+    /// The host's connection ended, or it closed the lobby. In a lobby that can migrate, only
+    /// after no new host was named, or the one named could not be reached.
     HostGone,
     /// The host stopped answering pings for longer than [`PeerTimeout`](crate::PeerTimeout).
     PeerTimeout,

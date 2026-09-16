@@ -129,8 +129,20 @@ impl<T: EnsembleMessage> Plugin for PlayerDataPlugin<T> {
                     sync_existing_player_data_to_new_clients::<T>
                         .after(broadcast_changed_player_data::<T>),
                     apply_received_player_data::<T>,
+                    clear_pending_on_host_change::<T>.before(apply_received_player_data::<T>),
                 ),
             );
+    }
+}
+
+/// What was buffered under one host means nothing under the next: a client's requests to the
+/// old host would be replayed as the new host's own, and refused as sent by somebody else.
+fn clear_pending_on_host_change<T: EnsembleMessage>(
+    mut changes: MessageReader<crate::HostChanged>,
+    mut pending: ResMut<PendingPlayerData<T>>,
+) {
+    if changes.read().next().is_some() {
+        pending.pending.clear();
     }
 }
 

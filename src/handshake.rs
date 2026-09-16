@@ -22,9 +22,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     EnsembleMessageRegistry, Host, HostUuid, Lobby, LobbyClient, LobbyClientPlayerUuid,
-    LobbyJoinFailed, LobbyLeft, LobbyLeftReason, LocalMultiplayerPlayerId, ReceivedEnsembleMessage,
-    SendMode,
+    LobbyJoinFailed, LobbyLeft, LobbyLeftReason, LocalMultiplayerPlayerId, PeerLastPong,
+    ReceivedEnsembleMessage, SendMode,
     messages::{LobbyClientMessage, LobbyMessage},
+    migration::{AwaitingHost, MigratedSeat, VerifiedHost},
     registry::{HeldUntilVerified, PROTOCOL_VERSION, decode_verified_packet},
 };
 
@@ -90,20 +91,48 @@ pub struct HandshakeVerified;
 /// the two promotions happen in whichever order the two ready handshakes land, and a
 /// handshake that found no seat was dropped and never resent.
 #[derive(Resource, Debug, Default)]
-pub(crate) struct ProtocolMatched(std::collections::HashSet<u128>);
+pub(crate) struct ProtocolMatched(pub(crate) std::collections::HashSet<u128>);
 
-/// State our protocol to each new peer, once.
+/// How often a new host states its protocol again to a member it inherited that has not answered.
+const MIGRATED_SEAT_REANNOUNCE_SECS: f32 = 1.0;
+
+/// State our protocol to each new peer, once — and, on a host that inherited its members, again
+/// every second to each one that has not answered.
+///
+/// Once is enough at a join, where the client is waiting for exactly this. A member following a
+/// new host may still be on the old one when the first announcement lands, and refuse it as not
+/// from its host; nothing else would ever ask it again.
 pub(crate) fn announce_protocol(
     mut commands: Commands,
     registry: Res<EnsembleMessageRegistry>,
     new_clients: Query<Entity, Added<LobbyClient>>,
     new_client_lobbies: Query<Entity, (Added<Lobby>, Without<Host>)>,
+    unverified_migrated_seats: Query<
+        Entity,
+        (
+            With<MigratedSeat>,
+            With<LobbyClient>,
+            Without<HandshakeVerified>,
+        ),
+    >,
+    time: Res<Time>,
+    mut since_reannounce: Local<f32>,
 ) {
-    if new_clients.is_empty() && new_client_lobbies.is_empty() {
+    let mut reannounce: Vec<Entity> = Vec::new();
+    if unverified_migrated_seats.is_empty() {
+        *since_reannounce = 0.0;
+    } else {
+        *since_reannounce += time.delta_secs();
+        if *since_reannounce >= MIGRATED_SEAT_REANNOUNCE_SECS {
+            *since_reannounce = 0.0;
+            reannounce.extend(unverified_migrated_seats.iter());
+        }
+    }
+    if new_clients.is_empty() && new_client_lobbies.is_empty() && reannounce.is_empty() {
         return;
     }
     let ours = ProtocolHandshake::of(&registry);
-    for client in new_clients.iter() {
+    for client in new_clients.iter().chain(reannounce) {
         let message = ours.clone();
         commands
             .entity(client)
@@ -171,7 +200,9 @@ pub(crate) fn verify_promoted_peers(
     if let Some(host) = host {
         for lobby in promoted_lobbies.iter() {
             if matched.0.remove(&host.0) {
-                commands.entity(lobby).try_insert(HandshakeVerified);
+                commands
+                    .entity(lobby)
+                    .try_insert((HandshakeVerified, VerifiedHost(host.0)));
             }
         }
     }
@@ -185,7 +216,7 @@ pub(crate) fn verify_protocol(
     mut held: ResMut<HeldUntilVerified>,
     mut matched: ResMut<ProtocolMatched>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
-    client_lobby: Option<Single<Entity, (With<Lobby>, Without<Host>)>>,
+    client_lobby: Option<Single<(Entity, Option<&AwaitingHost>), (With<Lobby>, Without<Host>)>>,
     lobby_clients: Query<(Entity, &LobbyClientPlayerUuid), With<LobbyClient>>,
     mut join_failed: MessageWriter<LobbyJoinFailed>,
     mut left: MessageWriter<LobbyLeft>,
@@ -208,8 +239,27 @@ pub(crate) fn verify_protocol(
                         matched.0.insert(sender);
                     }
                 }
-            } else if let Some(lobby) = client_lobby.as_ref() {
-                commands.entity(**lobby).try_insert(HandshakeVerified);
+            } else if let Some((lobby, awaiting)) = client_lobby.as_deref().copied() {
+                commands
+                    .entity(lobby)
+                    .try_insert((HandshakeVerified, VerifiedHost(sender)));
+                // Following a new host: this is the moment it is reached. It announced first,
+                // because it was the one that made a seat; it has not heard this peer's protocol,
+                // and at a join the client's own announcement went out when its lobby appeared,
+                // which this lobby did long ago. So it is answered here.
+                if awaiting.is_some_and(|awaiting| awaiting.successor == Some(sender)) {
+                    info!("reached the new host {sender:#x}; the session goes on");
+                    let answer = ours.clone();
+                    commands
+                        .entity(lobby)
+                        .try_remove::<AwaitingHost>()
+                        .try_insert(PeerLastPong(0.0))
+                        .trigger(move |entity| LobbyClientMessage {
+                            entity,
+                            message: answer,
+                            send_mode: SendMode::Reliable,
+                        });
+                }
             } else {
                 matched.0.insert(sender);
             }
@@ -229,12 +279,12 @@ pub(crate) fn verify_protocol(
             join_failed.write(LobbyJoinFailed {
                 reason: format!("A player's build does not match this one: {difference}"),
             });
-        } else if let Some(lobby) = client_lobby.as_ref() {
+        } else if let Some((lobby, _)) = client_lobby.as_deref().copied() {
             error!(
                 "leaving: the host's protocol does not match ({difference}). Build both peers \
                  from the same commit."
             );
-            commands.entity(**lobby).try_despawn();
+            commands.entity(lobby).try_despawn();
             commands.remove_resource::<LocalMultiplayerPlayerId>();
             join_failed.write(LobbyJoinFailed {
                 reason: format!("Your build does not match the host's: {difference}"),

@@ -106,11 +106,64 @@ fn leave_lobby(mut commands: Commands, lobby: Single<Entity, With<Lobby>>) {
 }
 ```
 
-When the host leaves, all clients will detect the disconnection through the platform backend and have their lobby entities despawned automatically.
+What happens when the *host* leaves depends on the backend. If the lobby can migrate — the backend put
+`HostMigratable` on it — another member becomes the host of the same lobby; see below. Otherwise every
+client detects the disconnection through the platform backend and has its lobby entity despawned, with
+`LobbyLeft { HostGone }`.
+
+A host that wants the game over for everyone, rather than handed over, writes `CloseLobby`:
+
+```rust,ignore
+fn end_game(mut writer: MessageWriter<CloseLobby>) {
+    writer.write(CloseLobby);
+}
+```
+
+## When the Host Leaves
+
+In a migratable lobby, losing the host is a wait, not an ending:
+
+```text
+ client lobby ── host lost ──▶ Lobby + AwaitingHost { successor: None }
+                                      │
+                         arbiter names the new host
+                          ┌───────────┴────────────┐
+                    it is this peer            it is another peer
+                          │                        │
+                   Lobby + Host             Lobby + AwaitingHost { successor: Some(..) }
+                                                   │
+                                        protocols compared with it
+                                                   │
+                                                 Lobby
+```
+
+- The lobby **entity** stays: participants, `PlayerData`, anything the game put on them.
+- `HostChanged { lobby, previous, new, promoted }` is written on every peer when the arbiter names
+  the new host. `Added<Lobby>` does not fire again; `Added<Host>` marks a promotion.
+- `AwaitingHost` is on the lobby while this peer waits. A game can show "the host left — waiting
+  for a new one" from `Added<AwaitingHost>`.
+- Messages in flight to or from the old host are lost, and a client drops what it sends while it is
+  switching to the new host.
+- If nobody is named within `HostMigratable::successor_within`, or the new host cannot be reached
+  within `reach_within`, the session ends with `LobbyLeft { HostGone }`. A game can shorten or
+  lengthen both with the `HostMigrationTimeouts` resource.
+
+```rust,ignore
+// Am I waiting for a host?
+fn waiting(lobby: Option<Single<&AwaitingHost, With<Lobby>>>) {
+    if let Some(awaiting) = lobby {
+        println!("waiting {:.0}s for a new host", awaiting.waited.as_secs_f64());
+    }
+}
+```
+
+Which peer becomes host is the platform's decision: the earliest-joined member on the WebRTC
+signalling server, Steam's own choice of lobby owner on Steam.
 
 ## Host vs Client
 
-The **host** is the authoritative peer:
+The **host** is the authoritative peer — and in a migratable lobby, the role can move to another peer
+while the lobby entity stays, so query `With<Host>` each frame rather than deciding once:
 
 - The host's participant list is the source of truth, synced automatically to all clients.
 - When a `LobbyMessage` is triggered on a host lobby, it is forwarded to **all** connected clients.

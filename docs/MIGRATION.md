@@ -4,6 +4,53 @@ One section per phase of the netcode overhaul, in the order they landed. Each na
 what to change in a consumer, and why. Both peers of a session must be built from the same
 commit; the join handshake enforces it from phase E2 onward.
 
+## E5c — the lobby outlives its host, in the core
+
+Nothing changes for a game until its backend marks a lobby `HostMigratable`; no shipped backend
+does yet. The wire hash changes (`bevy_ensemble/LobbyClosed` is registered), so both peers must be
+rebuilt, as for any registration.
+
+### New: a lobby that waits for a new host
+
+A backend inserts `HostMigratable { successor_within, reach_within }` on a lobby whose platform will
+name a successor, triggers `HostLost` when its transport loses the host, and `NewHostNamed` when the
+platform names one. The core does the rest: `AwaitingHost` on a client's lobby while it waits, a
+promotion (`Host` inserted on the existing lobby entity, `HostUuid` changed, `AwaitingSeat` on the
+participants not yet reconnected) or a follow (`HostUuid` changed, the protocol compared again before
+anything from the new host is read), and `HostChanged { lobby, previous, new, promoted }` on every
+peer. A host that stopped answering pings is waited for too, and taken back if it answers. See
+`docs/lobbies.md` and `docs/backends.md`.
+
+**What to change** Nothing to keep today's behaviour. To support a lobby that migrates:
+- Read `HostChanged` where you now react to a lost session. `Added<Lobby>` does not fire again;
+  `Added<Host>` marks a promotion. Query `With<Host>` each frame rather than deciding a role once.
+- Keying "the session ended" on a `(Lobby, Without<Host>)` query going empty now fires on a client
+  that is promoted: read `LobbyLeft`, or check for no lobby at all.
+- `PeerRtt` and its siblings are removed from a lobby that changes host, and come back.
+- `LeaveLobby` by a host of a migratable lobby hands it over. Write `CloseLobby` to end it for
+  everyone.
+- `HostGone` in a migratable lobby arrives only after `successor_within` has passed without a new
+  host; show `AwaitingHost` meanwhile.
+
+### New: `CloseLobby`
+
+A host ends its lobby for everyone: clients are told (`LobbyClosed`, host-only) and end their session
+with `LobbyLeft { HostGone }`, and the host writes `LeaveLobby` on the next frame. Ignored on a client.
+
+### `VerifiedHost` next to `HandshakeVerified`
+
+A client's lobby now records which host its protocol was compared with, and a packet is read only from
+that host. A backend that inserted `HandshakeVerified` itself on a client lobby keeps working: with no
+`VerifiedHost`, the marker counts for whoever `HostUuid` names, as before.
+
+### Loopback
+
+`set_host_migration`, `lose_host(HostDeparture::{Quits, Crashes, FallsSilent})`, `name_host`,
+`migrate`, `try_host` and `members`; `LeaveLobby` is serviced by despawning the lobby. A client now sends
+to the peer its own `HostUuid` names rather than to the network's host, and a host's seats are
+remembered per host, so a replaced host that keeps running is routed as the host it thinks it is.
+`host()` panics between `lose_host` and `name_host`.
+
 ## E5b — the signalling server can hand a lobby over
 
 Nothing changes for any client yet: no released client declares the capability this adds, and

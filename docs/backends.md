@@ -138,7 +138,31 @@ When a remote player disconnects from a hosted lobby:
 When the host disconnects (detected on the client side):
 
 1. Close the platform-level connection.
-2. Despawn the client's lobby entity.
+2. If the lobby is `HostMigratable` and promoted, trigger `HostLost` on it instead of despawning; see
+   below. Otherwise despawn the client's lobby entity.
+
+Never notify a seat that it was removed when it is removed *with* its lobby: that is the host leaving,
+not a kick. A relationship despawns its sources after itself, so by the time a seat's removal is
+observed, check that its lobby is still `(Lobby, Host)`.
+
+## Host Migration (optional)
+
+A backend whose platform has a party that decides who hosts — a signalling server, Steam's lobby
+owner — can let a lobby outlive its host. The core does the waiting, the promotion, the following and
+the re-verification; the backend reports what its platform says:
+
+| When | The backend |
+|------|-------------|
+| The platform says the lobby will survive its host | inserts `HostMigratable { successor_within, reach_within }` on the lobby entity |
+| Its transport says the host is gone | triggers `HostLost` on a promoted migratable lobby, instead of tearing down |
+| The platform names the new host | points its transport at it — or, on the new host, opens a connection to every member — then triggers `NewHostNamed { previous, new_host, members }` on the lobby, **before** letting anything from the new host through |
+| On the new host, a member connects | spawns its `LobbyClient` seat as for a join; the core finds the existing participant |
+| The platform says a member left while there was no host to say so | triggers `ParticipantDeparted` on the lobby |
+| The host writes `CloseLobby` | nothing, or tells its platform the lobby is over; the core announces it and writes `LeaveLobby` on the next frame |
+
+`successor_within` should outlast however long the platform takes to notice a host is gone.
+Lobbies without `HostMigratable` behave exactly as before, so a backend that does none of this is
+unaffected.
 
 ## Connection State and ICE Restart
 
