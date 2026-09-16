@@ -583,6 +583,28 @@ fn a_kicked_client_learns_why() {
     );
 }
 
+/// A host that leaves takes its seats with its lobby, and not one of those players is told it was
+/// removed: the host going is not everybody being kicked. The WebRTC backend's own notice used to
+/// be sent for those seats, and turned every host that quit into a lobby of kicked players.
+#[test]
+fn a_host_that_quits_kicks_nobody() {
+    let (mut net, host, a, b) = trio();
+    let lobby = net.lobby(host);
+    net.app_mut(host).world_mut().despawn(lobby);
+    net.run(6);
+    for client in [a, b] {
+        assert!(
+            has_lobby(&mut net, client),
+            "the host leaving did not remove this client"
+        );
+        assert_eq!(
+            net.app(client).world().resource::<Departures>().0,
+            vec![],
+            "and told it nothing"
+        );
+    }
+}
+
 // ── Liveness grace ───────────────────────────────────────────────────────────
 
 /// A transport that knows why a peer is silent (an ICE restart in flight) can hold the

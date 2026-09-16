@@ -403,6 +403,7 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
                 MessageAuthority::HostOnly,
             )
             .init_resource::<systems::UntrustedPacketDrops>()
+            .init_resource::<systems::DeferredSignals>()
             .add_systems(
                 Update,
                 (

@@ -317,6 +317,10 @@ pub(crate) fn apply_lobby_events(
             LobbyEvent::SignallingClosed => {
                 warn!("lost the signalling server");
                 lobby_conn.signalling_lost = true;
+                // Before anything is despawned: the seats are despawned below while their lobby
+                // still stands, which reads as each of them being kicked. Nobody here is being
+                // removed from a session that goes on; the session is over for all of them.
+                socket.disconnect_all();
                 let mut had_lobby = false;
                 let mut was_joining = false;
                 for (lobby, pending) in all_lobbies.iter() {
@@ -692,9 +696,6 @@ pub(crate) fn time_out_pending_lobbies(
     }
 }
 
-/// Each frame, pump signals between the WS handler and the EnsembleSocket:
-/// 1. Drain incoming signals from LobbyConnection's signal_rx and feed them to socket.receive_signal()
-/// 2. Drain outbound signals from socket.drain_signals() and send them as ClientMessage::Signal
 /// What kind of signal this is, for a log line. The bodies are an SDP blob or a candidate line,
 /// neither of which belongs in a log; which of the three it is, and who it is for, is the part
 /// that answers questions.
@@ -706,8 +707,109 @@ fn signal_kind(signal: &PeerSignal) -> &'static str {
     }
 }
 
+/// How long an offer this peer cannot answer yet is held for the lobby event that would let it.
+///
+/// That event is already on its way when the offer arrives — the server sends it first, on the
+/// same WebSocket — so the wait is a frame or two. The rest is margin for a slow frame; an offer
+/// still unanswerable after it is from a peer this side will never answer.
+const DEFERRED_OFFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How many peers' offers are held at once. A handful covers every honest case, and the cap is
+/// what keeps a member sending offers in a loop from growing the buffer without bound.
+const MAX_DEFERRED_OFFERS: usize = 8;
+
+/// Signals from peers whose offer arrived before this side had a reason to answer it.
+///
+/// Lobby events and peer signals leave the WebSocket task on separate channels. The server sends
+/// a joiner `LobbyJoined` before the host's offer, but if the task has pushed the offer and not
+/// yet the event when the frame drains them, the offer is judged before its sender is known to be
+/// the host. It used to be refused, and an offer is sent once: the join then waited out its
+/// timeout for a data channel nobody was going to open. Now it is held — along with every later
+/// signal from the same peer, which mean nothing until the offer is applied — and judged again
+/// each frame until its sender can be answered or the hold runs out.
+#[derive(Resource, Default)]
+pub(crate) struct DeferredSignals(Vec<DeferredPeer>);
+
+struct DeferredPeer {
+    sender: u128,
+    since: bevy_ensemble::Instant,
+    signals: Vec<PeerSignal>,
+}
+
+impl DeferredSignals {
+    /// Route one signal as it arrives: returned if it is to be applied now, kept or dropped if
+    /// not. `answerable` is whether an offer from `sender` would be accepted this frame.
+    fn admit(
+        &mut self,
+        sender: u128,
+        signal: PeerSignal,
+        answerable: bool,
+        now: bevy_ensemble::Instant,
+    ) -> Option<PeerSignal> {
+        if let Some(held) = self.0.iter_mut().find(|held| held.sender == sender) {
+            held.signals.push(signal);
+            return None;
+        }
+        // An offer is the one signal that *creates* a connection; the others only apply to one
+        // that exists, and the socket already discards those for unknown peers. So the trust
+        // decision is made here, once, on the offer.
+        if answerable || !matches!(signal, PeerSignal::Offer(_)) {
+            return Some(signal);
+        }
+        if self.0.len() >= MAX_DEFERRED_OFFERS {
+            warn!(
+                "ignoring an offer from peer {sender:#x}: this peer cannot answer it, and already \
+                 holds {MAX_DEFERRED_OFFERS} others waiting to be answerable"
+            );
+            return None;
+        }
+        debug!("holding an offer from peer {sender:#x} until this peer can answer it");
+        self.0.push(DeferredPeer {
+            sender,
+            since: now,
+            signals: vec![signal],
+        });
+        None
+    }
+
+    /// Everything held from peers that can now be answered, in the order it arrived. A peer held
+    /// past [`DEFERRED_OFFER_TIMEOUT`] is dropped with its signals.
+    fn release(
+        &mut self,
+        answerable: impl Fn(u128) -> bool,
+        now: bevy_ensemble::Instant,
+    ) -> Vec<(u128, PeerSignal)> {
+        let mut released = Vec::new();
+        self.0.retain_mut(|held| {
+            let sender = held.sender;
+            if answerable(sender) {
+                released.extend(
+                    std::mem::take(&mut held.signals)
+                        .into_iter()
+                        .map(|s| (sender, s)),
+                );
+                return false;
+            }
+            if now.duration_since(held.since) < DEFERRED_OFFER_TIMEOUT {
+                return true;
+            }
+            warn!(
+                "ignoring an offer from peer {sender:#x}: held for {}s and this peer still has no \
+                 reason to answer it, so that peer has no business opening a connection",
+                DEFERRED_OFFER_TIMEOUT.as_secs()
+            );
+            false
+        });
+        released
+    }
+}
+
+/// Each frame, pump signals between the WS handler and the EnsembleSocket:
+/// 1. Drain incoming signals from LobbyConnection's signal_rx and feed them to socket.receive_signal()
+/// 2. Drain outbound signals from socket.drain_signals() and send them as ClientMessage::Signal
 pub(crate) fn pump_socket_signals(
     mut socket: ResMut<crate::EnsembleSocketRes>,
+    mut deferred: ResMut<DeferredSignals>,
     lobby_conn: Res<LobbyConnection>,
     host_lobbies: Query<(), (Or<(With<Lobby>, With<PendingLobby>)>, With<Host>)>,
     client_lobbies: Query<
@@ -722,6 +824,15 @@ pub(crate) fn pump_socket_signals(
     } else {
         (PeerRole::None, None)
     };
+    let now = bevy_ensemble::Instant::now();
+
+    for (sender, signal) in deferred.release(|sender| accept_offer_from(role, host, sender), now) {
+        info!(
+            "<- {} from peer {sender:#x}, held until it could be answered",
+            signal_kind(&signal)
+        );
+        socket.receive_signal(sender, signal);
+    }
 
     if let Ok(mut signal_rx) = lobby_conn.signal_rx.lock() {
         while let Ok((sender, signal)) = signal_rx.try_recv() {
@@ -730,17 +841,10 @@ pub(crate) fn pump_socket_signals(
             // while its candidates do not is a different bug from one that never sends them, and
             // the two are indistinguishable from either end alone.
             info!("<- {} from peer {sender:#x}", signal_kind(&signal));
-            // An offer is the one signal that *creates* a connection; the others only apply to
-            // one that exists, and the socket already discards those for unknown peers. So the
-            // trust decision is made here, once, on the offer.
-            if matches!(signal, PeerSignal::Offer(_)) && !accept_offer_from(role, host, sender) {
-                warn!(
-                    "ignoring an offer from peer {sender:#x}: this peer is {role:?} and its \
-                     host is {host:#x?}, so that peer has no business opening a connection"
-                );
-                continue;
+            let answerable = accept_offer_from(role, host, sender);
+            if let Some(signal) = deferred.admit(sender, signal, answerable, now) {
+                socket.receive_signal(sender, signal);
             }
-            socket.receive_signal(sender, signal);
         }
     }
 
@@ -1013,34 +1117,195 @@ mod trust_tests {
     }
 }
 
+/// Whether a seat being removed is its player being removed from a session that goes on — a
+/// kick, a timeout, a refused protocol — rather than the seat going with the host's own lobby.
+///
+/// Only the first is news to the player. When the host leaves, its lobby is despawned and the
+/// seats follow it; a relationship despawns its sources through deferred commands, so by the time
+/// a seat's removal is observed the lobby is already gone. Telling each of those players it had
+/// been removed made every host that left kick everybody on its way out: each client ended its
+/// session as `Kicked` rather than finding out the host was gone.
+pub(crate) fn seat_removal_is_a_kick(
+    seat_of: Option<&LobbyParticipantOf>,
+    hosted_lobbies: &Query<(), (With<Lobby>, With<Host>)>,
+) -> bool {
+    seat_of.is_some_and(|seat_of| hosted_lobbies.contains(seat_of.0))
+}
+
 /// Sends a removal notification and disconnects the WebRTC peer when a
 /// [`LobbyClient`] is removed.
 ///
 /// The removal packet must be sent directly here (not via deferred commands)
 /// because observer ordering is non-deterministic and `disconnect_peer` severs
 /// the connection immediately — any deferred message would arrive too late.
+///
+/// Sent only for a kick; see [`seat_removal_is_a_kick`].
 pub(crate) fn disconnect_removed_lobby_client(
     trigger: On<Remove, LobbyClient>,
-    query: Query<(&LobbyClientWebrtcUuid, &LobbyClientPlayerUuid)>,
+    query: Query<(
+        &LobbyClientWebrtcUuid,
+        &LobbyClientPlayerUuid,
+        Option<&LobbyParticipantOf>,
+    )>,
+    hosted_lobbies: Query<(), (With<Lobby>, With<Host>)>,
     registry: Res<bevy_ensemble::EnsembleMessageRegistry>,
     mut socket: ResMut<crate::EnsembleSocketRes>,
 ) {
-    let Ok((webrtc_uuid, player_uuid)) = query.get(trigger.event_target()) else {
+    let Ok((webrtc_uuid, player_uuid, seat_of)) = query.get(trigger.event_target()) else {
         return;
     };
 
-    // We send the removal packet manually here because Bevy does not
-    // guarantee observer execution order. If this observer runs before the
-    // core `on_lobby_client_removed`, the peer will be disconnected before
-    // the deferred LobbyClientMessage ever flushes, so the kicked client
-    // would never learn it was removed.
-    // TODO: fix this once observer ordering lands (bevyengine/bevy#14890)
-    let packet = encode_ensemble_message(
-        &registry,
-        &RemoveLobbyParticipant {
-            player_uuid: player_uuid.0,
-        },
-    );
-    socket.send(packet.into_boxed_slice(), webrtc_uuid.0);
+    if seat_removal_is_a_kick(seat_of, &hosted_lobbies) {
+        // We send the removal packet manually here because Bevy does not
+        // guarantee observer execution order. If this observer runs before the
+        // core `on_lobby_client_removed`, the peer will be disconnected before
+        // the deferred LobbyClientMessage ever flushes, so the kicked client
+        // would never learn it was removed.
+        // TODO: fix this once observer ordering lands (bevyengine/bevy#14890)
+        let packet = encode_ensemble_message(
+            &registry,
+            &RemoveLobbyParticipant {
+                player_uuid: player_uuid.0,
+            },
+        );
+        socket.send(packet.into_boxed_slice(), webrtc_uuid.0);
+    }
     socket.disconnect_peer(webrtc_uuid.0);
+}
+
+#[cfg(test)]
+mod departure_tests {
+    use bevy::prelude::*;
+    use bevy_ensemble::{Host, Lobby, LobbyClient, LobbyParticipantOf};
+
+    use super::seat_removal_is_a_kick;
+
+    #[derive(Resource, Default)]
+    struct Verdicts(Vec<bool>);
+
+    fn record_verdict(
+        trigger: On<Remove, LobbyClient>,
+        seats: Query<Option<&LobbyParticipantOf>>,
+        hosted_lobbies: Query<(), (With<Lobby>, With<Host>)>,
+        mut verdicts: ResMut<Verdicts>,
+    ) {
+        let seat_of = seats.get(trigger.event_target()).ok().flatten();
+        verdicts
+            .0
+            .push(seat_removal_is_a_kick(seat_of, &hosted_lobbies));
+    }
+
+    /// A seat removed on its own is a kick; the seats that go with the host's lobby are not. The
+    /// second half rests on the lobby being gone by the time its seats' removal is observed,
+    /// which is Bevy's to guarantee, and this is what notices if it stops.
+    #[test]
+    fn a_seat_removed_with_its_lobby_is_not_told_it_was_kicked() {
+        let mut app = App::new();
+        app.init_resource::<Verdicts>().add_observer(record_verdict);
+        let world = app.world_mut();
+        let lobby = world.spawn((Lobby, Host)).id();
+        let kicked = world.spawn((LobbyClient, LobbyParticipantOf(lobby))).id();
+        world.spawn((LobbyClient, LobbyParticipantOf(lobby)));
+        world.spawn((LobbyClient, LobbyParticipantOf(lobby)));
+
+        world.despawn(kicked);
+        world.flush();
+        assert_eq!(world.resource::<Verdicts>().0, [true], "a kick");
+
+        world.despawn(lobby);
+        world.flush();
+        assert_eq!(
+            world.resource::<Verdicts>().0,
+            [true, false, false],
+            "the host leaving is not two more kicks"
+        );
+    }
+}
+
+#[cfg(test)]
+mod deferred_signal_tests {
+    use std::time::Duration;
+
+    use bevy_ensemble::Instant;
+    use bevy_ensemble_sockets::PeerSignal;
+
+    use super::{DEFERRED_OFFER_TIMEOUT, DeferredSignals, MAX_DEFERRED_OFFERS, signal_kind};
+
+    const HOST: u128 = 0xA;
+    const OTHER: u128 = 0xB;
+
+    fn offer() -> PeerSignal {
+        PeerSignal::Offer(String::new())
+    }
+
+    fn candidate() -> PeerSignal {
+        PeerSignal::IceCandidate(String::new())
+    }
+
+    fn kinds(signals: &[(u128, PeerSignal)]) -> Vec<(u128, &'static str)> {
+        signals
+            .iter()
+            .map(|(sender, signal)| (*sender, signal_kind(signal)))
+            .collect()
+    }
+
+    /// The offer that arrived a frame before `LobbyJoined` named its sender: held, with the
+    /// candidates behind it, and applied in order once the sender is the host.
+    #[test]
+    fn a_deferred_offer_is_answered_once_its_sender_is_the_host() {
+        let now = Instant::now();
+        let mut deferred = DeferredSignals::default();
+
+        assert!(deferred.admit(HOST, offer(), false, now).is_none());
+        assert!(
+            deferred.admit(HOST, candidate(), false, now).is_none(),
+            "a candidate means nothing before its offer, so it waits behind it"
+        );
+        assert!(
+            deferred.release(|_| false, now).is_empty(),
+            "not answerable yet"
+        );
+
+        let released = deferred.release(|sender| sender == HOST, now);
+        assert_eq!(
+            kinds(&released),
+            [(HOST, "offer"), (HOST, "candidate")],
+            "released in arrival order"
+        );
+        assert!(deferred.release(|_| true, now).is_empty(), "and only once");
+    }
+
+    #[test]
+    fn a_deferred_offer_expires() {
+        let now = Instant::now();
+        let mut deferred = DeferredSignals::default();
+        deferred.admit(OTHER, offer(), false, now);
+
+        let later = now + DEFERRED_OFFER_TIMEOUT + Duration::from_millis(1);
+        assert!(deferred.release(|_| false, later).is_empty());
+        assert!(
+            deferred.release(|_| true, later).is_empty(),
+            "an offer dropped on expiry is not answered later"
+        );
+    }
+
+    /// Nothing is delayed that did not need to be: an answerable offer, and every signal that is
+    /// not an offer from a peer with nothing held.
+    #[test]
+    fn a_signal_with_no_reason_to_wait_is_applied_at_once() {
+        let now = Instant::now();
+        let mut deferred = DeferredSignals::default();
+        assert!(deferred.admit(HOST, offer(), true, now).is_some());
+        assert!(deferred.admit(OTHER, candidate(), false, now).is_some());
+    }
+
+    #[test]
+    fn no_more_offers_are_held_than_the_cap() {
+        let now = Instant::now();
+        let mut deferred = DeferredSignals::default();
+        for sender in 0..(MAX_DEFERRED_OFFERS as u128 + 3) {
+            deferred.admit(sender, offer(), false, now);
+        }
+        assert_eq!(deferred.release(|_| true, now).len(), MAX_DEFERRED_OFFERS);
+    }
 }
