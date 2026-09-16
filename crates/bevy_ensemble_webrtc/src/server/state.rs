@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -55,14 +54,32 @@ pub struct LobbyState {
     pub code: String,
     pub host_uuid: u128,
     pub host_name: String,
-    pub members: HashSet<u128>,
+    /// Everyone in the lobby, the host included, in the order they joined.
+    ///
+    /// Ordered because the order decides something: when the host of a migratable lobby leaves,
+    /// the member who has been in it longest takes over.
+    pub members: Vec<u128>,
     pub max_players: u32,
+    /// Whether this lobby outlives its host. Fixed at creation, from what the host declared: a
+    /// host that cannot be told [`HostChanged`](ServerMessage::HostChanged) is running a build
+    /// whose members cannot be told it either.
+    pub host_migration: bool,
 }
 
 pub struct ConnectionHandle {
     pub display_name: String,
     pub lobby_id: Option<u64>,
     pub sender: mpsc::UnboundedSender<ServerMessage>,
+    /// The `CAPABILITY_*` bits this connection declared; zero for a client older than the
+    /// declaration.
+    pub capabilities: u64,
+}
+
+impl ConnectionHandle {
+    /// Whether this connection declared `capability`, and so can decode what belongs to it.
+    pub fn declares(&self, capability: u64) -> bool {
+        self.capabilities & capability == capability
+    }
 }
 
 impl Default for ServerState {
@@ -110,11 +127,18 @@ impl ServerState {
         }
     }
 
-    pub fn send_to_all_except(&self, members: &HashSet<u128>, except: u128, msg: ServerMessage) {
+    pub fn send_to_all_except(&self, members: &[u128], except: u128, msg: ServerMessage) {
         for &uuid in members {
             if uuid != except {
                 self.send_to(uuid, msg.clone());
             }
         }
+    }
+
+    /// Whether the connection `uuid` declared `capability`. False for a connection that is gone.
+    pub fn declares(&self, uuid: u128, capability: u64) -> bool {
+        self.connections
+            .get(&uuid)
+            .is_some_and(|conn| conn.declares(capability))
     }
 }

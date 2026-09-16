@@ -131,6 +131,9 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
     };
 
     let mut player_uuid: Option<u128> = None;
+    // Kept here as well as on the handle, so a declaration that arrives before `Authenticate`
+    // still applies once there is a handle to put it on.
+    let mut capabilities: u64 = 0;
     let mut limiter = RateLimiter::new(&state.limits, Instant::now());
     let idle_timeout = state.limits.idle_timeout;
 
@@ -190,6 +193,7 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                         display_name,
                         lobby_id: None,
                         sender: tx.clone(),
+                        capabilities,
                     },
                 );
 
@@ -232,8 +236,9 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                     continue;
                 }
 
-                let response = lobby::create_lobby(&state, uuid, max_players);
-                let _ = tx.send(response);
+                if let Err(refusal) = lobby::create_lobby(&state, uuid, max_players) {
+                    let _ = tx.send(refusal);
+                }
             }
 
             ClientMessage::JoinLobby { lobby_id } => {
@@ -242,8 +247,9 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                     continue;
                 };
 
-                let response = lobby::join_lobby(&state, uuid, lobby_id);
-                let _ = tx.send(response);
+                if let Err(refusal) = lobby::join_lobby(&state, uuid, lobby_id) {
+                    let _ = tx.send(refusal);
+                }
             }
 
             ClientMessage::JoinLobbyByCode { code } => {
@@ -256,13 +262,31 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                     continue;
                 }
 
-                let response = lobby::join_lobby_by_code(&state, uuid, &code);
-                let _ = tx.send(response);
+                if let Err(refusal) = lobby::join_lobby_by_code(&state, uuid, &code) {
+                    let _ = tx.send(refusal);
+                }
             }
 
             ClientMessage::LeaveLobby => {
                 if let Some(uuid) = player_uuid {
                     lobby::leave_lobby(&state, uuid);
+                }
+            }
+
+            ClientMessage::CloseLobby => {
+                if let Some(uuid) = player_uuid {
+                    lobby::close_lobby(&state, uuid);
+                }
+            }
+
+            ClientMessage::DeclareCapabilities {
+                capabilities: declared,
+            } => {
+                capabilities = declared;
+                if let Some(uuid) = player_uuid {
+                    if let Some(mut conn) = state.connections.get_mut(&uuid) {
+                        conn.capabilities = declared;
+                    }
                 }
             }
 

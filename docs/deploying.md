@@ -120,6 +120,30 @@ encrypts what it carries regardless. `turns:` on 443 — the transport that gets
 blocking UDP outright — is not implemented here; that is the case for coturn alongside, if it ever
 comes up.
 
+## Upgrading a server several games share
+
+Games pin this crate at different commits, and every one of them talks to the same server. So the
+protocol only ever grows at the end of its enums (postcard numbers variants by position:
+inserting one renumbers everything after it, silently), and nothing new is sent to a client that
+has not said it understands it.
+
+A client says so with `DeclareCapabilities`, right after `Authenticate`. A server too old to know
+that message fails to decode it, logs `Failed to decode client message`, and carries on — so an
+old server treats a new client exactly as it always has. `tests/protocol_compat.rs` holds frozen
+copies of the enums from before the first addition and checks both halves of that.
+
+Host migration is the first capability. Which lobbies get it:
+
+| Server | Host's build | Member's build | When the host leaves, that member… |
+|---|---|---|---|
+| new | declares | declares | is told `HostChanged`; the earliest-joined such member hosts |
+| new | declares | old | gets `Disconnected`, as before, and is never chosen |
+| new | old | any | gets `Disconnected`, as before |
+| old | any | any | gets `Disconnected`, as before |
+
+Deploy the server first. A new client against an old server loses nothing it had; an old client
+against a new server is never sent anything it cannot read.
+
 ## Checking it works
 
 Startup must log **two** lines, not one:

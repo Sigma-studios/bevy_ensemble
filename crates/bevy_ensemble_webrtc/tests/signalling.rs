@@ -5,7 +5,9 @@
 
 use std::time::Duration;
 
-use bevy_ensemble_webrtc::protocol::{ClientMessage, ServerMessage, decode, encode};
+use bevy_ensemble_webrtc::protocol::{
+    CAPABILITY_HOST_MIGRATION, ClientMessage, ServerMessage, decode, encode,
+};
 use bevy_ensemble_webrtc::server::test_support::SignallingServer;
 use bevy_ensemble_webrtc::server::{Limits, MAX_PLAYERS};
 use futures_util::{SinkExt, StreamExt};
@@ -107,6 +109,97 @@ async fn join_by_code(ws: &mut Ws, code: &str) -> ServerMessage {
 async fn list_lobbies(ws: &mut Ws) -> ServerMessage {
     send(ws, &ClientMessage::ListLobbies).await;
     recv(ws).await
+}
+
+/// A fresh, authenticated connection that declares host migration, the way a client that
+/// supports it connects: `Authenticate`, then the declaration.
+async fn migrating_player(server: &SignallingServer, name: &str) -> (Ws, u128) {
+    let (mut ws, uuid) = player(server, name).await;
+    send(
+        &mut ws,
+        &ClientMessage::DeclareCapabilities {
+            capabilities: CAPABILITY_HOST_MIGRATION,
+        },
+    )
+    .await;
+    (ws, uuid)
+}
+
+/// Create a lobby as a migrating player: `LobbyCreated`, then `LobbyMigratable` for the same id.
+async fn create_migratable_lobby(ws: &mut Ws) -> (u64, String) {
+    let (lobby_id, code) = create_lobby(ws, 8).await;
+    match recv(ws).await {
+        ServerMessage::LobbyMigratable { lobby_id: id, .. } => assert_eq!(id, lobby_id),
+        other => panic!("expected LobbyMigratable after LobbyCreated, got {other:?}"),
+    }
+    (lobby_id, code)
+}
+
+/// Join as a migrating player: `LobbyJoined`, then `LobbyMigratable`. Returns the host it named.
+async fn join_migratable(ws: &mut Ws, code: &str) -> u128 {
+    let host = match join_by_code(ws, code).await {
+        ServerMessage::LobbyJoined { host_uuid, .. } => host_uuid,
+        other => panic!("expected LobbyJoined, got {other:?}"),
+    };
+    assert!(matches!(
+        recv(ws).await,
+        ServerMessage::LobbyMigratable { .. }
+    ));
+    host
+}
+
+/// Everything the server sends until it has been quiet for [`SILENCE`].
+async fn drain(ws: &mut Ws) -> Vec<ServerMessage> {
+    let mut messages = Vec::new();
+    while let Ok(Some(Ok(frame))) = tokio::time::timeout(SILENCE, ws.next()).await {
+        if let Message::Binary(bytes) = frame {
+            messages.push(decode::<ServerMessage>(&bytes).expect("decode a server message"));
+        }
+    }
+    messages
+}
+
+/// The one `HostChanged` among what the server sends before going quiet.
+async fn host_change(ws: &mut Ws) -> (u128, u128, String, Vec<u128>) {
+    let changes: Vec<_> = drain(ws)
+        .await
+        .into_iter()
+        .filter_map(|message| match message {
+            ServerMessage::HostChanged {
+                previous_host,
+                new_host,
+                code,
+                members,
+                ..
+            } => Some((previous_host, new_host, code, members)),
+            _ => None,
+        })
+        .collect();
+    match <[_; 1]>::try_from(changes) {
+        Ok([change]) => change,
+        Err(changes) => panic!("expected one HostChanged, got {changes:?}"),
+    }
+}
+
+/// A migratable lobby hosted by `host`, joined in order by a migrating player per name, with every
+/// join announcement drained.
+async fn migratable_lobby(
+    server: &SignallingServer,
+    names: &[&str],
+) -> ((Ws, u128), String, Vec<(Ws, u128)>) {
+    let (mut host, host_uuid) = migrating_player(server, "host").await;
+    let (_, code) = create_migratable_lobby(&mut host).await;
+    let mut members = Vec::new();
+    for name in names {
+        let (mut ws, uuid) = migrating_player(server, name).await;
+        assert_eq!(join_migratable(&mut ws, &code).await, host_uuid);
+        members.push((ws, uuid));
+    }
+    drain(&mut host).await;
+    for (ws, _) in &mut members {
+        drain(ws).await;
+    }
+    ((host, host_uuid), code, members)
 }
 
 #[tokio::test]
@@ -375,4 +468,374 @@ async fn max_players_is_clamped() {
     assert_eq!(max_of(huge_id), MAX_PLAYERS);
     assert_eq!(max_of(zero_id), MAX_PLAYERS);
     assert_eq!(max_of(small_id), 3);
+}
+
+// ── Host migration ───────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_host_leaving_a_migratable_lobby_hands_it_to_the_earliest_joined_member() {
+    let server = SignallingServer::start();
+    let ((mut host, host_uuid), code, mut members) = migratable_lobby(&server, &["a", "b"]).await;
+    let (a_uuid, b_uuid) = (members[0].1, members[1].1);
+
+    send(&mut host, &ClientMessage::LeaveLobby).await;
+
+    for (ws, _) in &mut members {
+        assert_eq!(
+            host_change(ws).await,
+            (host_uuid, a_uuid, code.clone(), vec![a_uuid, b_uuid]),
+            "every member hears the same change"
+        );
+    }
+    // The leaving host is told the peers it had, as a leaving member always was.
+    let departed: Vec<_> = drain(&mut host).await;
+    assert!(
+        departed
+            .iter()
+            .all(|message| matches!(message, ServerMessage::PlayerLeft { .. })),
+        "the old host was sent {departed:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_successor_is_chosen_by_join_order_not_by_uuid() {
+    let server = SignallingServer::start();
+    let (mut host, _) = migrating_player(&server, "host").await;
+    let (_, code) = create_migratable_lobby(&mut host).await;
+
+    // Whichever of the two has the larger uuid joins first, so that neither end of the uuid order
+    // agrees with the join order by accident.
+    let mut pair = [
+        migrating_player(&server, "one").await,
+        migrating_player(&server, "two").await,
+    ];
+    pair.sort_by_key(|(_, uuid)| std::cmp::Reverse(*uuid));
+    let [(mut first, first_uuid), (mut second, second_uuid)] = pair;
+    assert!(first_uuid > second_uuid);
+    join_migratable(&mut first, &code).await;
+    join_migratable(&mut second, &code).await;
+    drain(&mut first).await;
+
+    send(&mut host, &ClientMessage::LeaveLobby).await;
+    let (_, new_host, _, members) = host_change(&mut second).await;
+    assert_eq!(new_host, first_uuid);
+    assert_eq!(members, [first_uuid, second_uuid]);
+}
+
+#[tokio::test]
+async fn a_lobby_whose_host_never_declared_migration_ends_as_it_always_did() {
+    let server = SignallingServer::start();
+    let (mut host, _) = player(&server, "old host").await;
+    let (_, code) = create_lobby(&mut host, 4).await;
+    let (mut member, _) = migrating_player(&server, "member").await;
+    assert!(matches!(
+        join_by_code(&mut member, &code).await,
+        ServerMessage::LobbyJoined { .. }
+    ));
+
+    send(&mut host, &ClientMessage::LeaveLobby).await;
+    match recv(&mut member).await {
+        ServerMessage::Disconnected { reason } => assert_eq!(reason, "Host left the lobby"),
+        other => panic!("expected Disconnected, got {other:?} (and no LobbyMigratable before it)"),
+    }
+    match list_lobbies(&mut member).await {
+        ServerMessage::LobbyList { lobbies } => assert!(lobbies.is_empty()),
+        other => panic!("expected LobbyList, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_member_that_never_declared_migration_is_disconnected_and_never_chosen() {
+    let server = SignallingServer::start();
+    let (mut host, host_uuid) = migrating_player(&server, "host").await;
+    let (_, code) = create_migratable_lobby(&mut host).await;
+
+    // The old build joins first, so it would be the successor if capability did not decide.
+    let (mut old, _) = player(&server, "old build").await;
+    assert!(matches!(
+        join_by_code(&mut old, &code).await,
+        ServerMessage::LobbyJoined { .. }
+    ));
+    let (mut new, new_uuid) = migrating_player(&server, "new build").await;
+    join_migratable(&mut new, &code).await;
+
+    send(&mut host, &ClientMessage::LeaveLobby).await;
+
+    assert_eq!(
+        host_change(&mut new).await,
+        (host_uuid, new_uuid, code, vec![new_uuid])
+    );
+    let told_old = drain(&mut old).await;
+    assert!(
+        matches!(
+            &told_old[..],
+            [ServerMessage::PlayerJoined { .. }, ServerMessage::Disconnected { reason }]
+                if reason == "Host left the lobby"
+        ),
+        "the old build was sent {told_old:?}, which must hold nothing it cannot decode"
+    );
+}
+
+#[tokio::test]
+async fn a_migratable_lobby_with_no_capable_member_left_is_removed() {
+    let server = SignallingServer::start();
+    let (mut host, _) = migrating_player(&server, "host").await;
+    let (_, code) = create_migratable_lobby(&mut host).await;
+    let (mut old, _) = player(&server, "old build").await;
+    join_by_code(&mut old, &code).await;
+
+    send(&mut host, &ClientMessage::LeaveLobby).await;
+    assert!(matches!(
+        recv(&mut old).await,
+        ServerMessage::Disconnected { .. }
+    ));
+    match list_lobbies(&mut old).await {
+        ServerMessage::LobbyList { lobbies } => assert!(lobbies.is_empty()),
+        other => panic!("expected LobbyList, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn after_a_change_signals_are_relayed_only_to_and_from_the_new_host() {
+    let server = SignallingServer::start();
+    let ((mut host, host_uuid), _, mut members) = migratable_lobby(&server, &["a", "b", "c"]).await;
+    send(&mut host, &ClientMessage::LeaveLobby).await;
+    for (ws, _) in &mut members {
+        host_change(ws).await;
+    }
+    let [(mut a, a_uuid), (mut b, b_uuid), (mut c, c_uuid)] =
+        <[_; 3]>::try_from(members).unwrap_or_else(|_| unreachable!());
+
+    let signal = |receiver_uuid: u128, data: &str| ClientMessage::Signal {
+        receiver_uuid,
+        data: data.into(),
+    };
+    // Member to member, and to the host that left: dropped. Sent first, so that had either been
+    // carried it would already be waiting by the time the checks below read.
+    send(&mut b, &signal(c_uuid, "b->c")).await;
+    send(&mut b, &signal(host_uuid, "b->old host")).await;
+    // To and from the new host: carried.
+    send(&mut b, &signal(a_uuid, "b->a")).await;
+    send(&mut a, &signal(b_uuid, "a->b")).await;
+
+    assert!(
+        matches!(recv(&mut a).await, ServerMessage::Signal { sender_uuid, data } if sender_uuid == b_uuid && data == "b->a")
+    );
+    assert!(
+        matches!(recv(&mut b).await, ServerMessage::Signal { sender_uuid, data } if sender_uuid == a_uuid && data == "a->b")
+    );
+    let leaked_to_c = drain(&mut c).await;
+    assert!(leaked_to_c.is_empty(), "c was sent {leaked_to_c:?}");
+    let leaked_to_old_host: Vec<_> = drain(&mut host)
+        .await
+        .into_iter()
+        .filter(|message| matches!(message, ServerMessage::Signal { .. }))
+        .collect();
+    assert!(leaked_to_old_host.is_empty());
+}
+
+#[tokio::test]
+async fn a_join_after_a_change_names_the_new_host() {
+    let server = SignallingServer::start();
+    let ((mut host, _), code, mut members) = migratable_lobby(&server, &["a", "b"]).await;
+    send(&mut host, &ClientMessage::LeaveLobby).await;
+    for (ws, _) in &mut members {
+        host_change(ws).await;
+    }
+    let (a_uuid, b_uuid) = (members[0].1, members[1].1);
+
+    let (mut late, late_uuid) = migrating_player(&server, "late").await;
+    match join_by_code(&mut late, &code).await {
+        ServerMessage::LobbyJoined {
+            host_uuid,
+            existing_members,
+            ..
+        } => {
+            assert_eq!(host_uuid, a_uuid);
+            assert_eq!(existing_members, [a_uuid, b_uuid]);
+        }
+        other => panic!("expected LobbyJoined, got {other:?}"),
+    }
+    assert!(matches!(
+        recv(&mut late).await,
+        ServerMessage::LobbyMigratable { .. }
+    ));
+    for (ws, _) in &mut members {
+        assert!(
+            matches!(recv(ws).await, ServerMessage::PlayerJoined { player_uuid } if player_uuid == late_uuid)
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_listing_shows_the_new_hosts_name_under_the_same_code() {
+    let server = SignallingServer::start();
+    let ((mut host, _), code, mut members) = migratable_lobby(&server, &["a", "b"]).await;
+    send(&mut host, &ClientMessage::LeaveLobby).await;
+    host_change(&mut members[0].0).await;
+
+    let ServerMessage::LobbyList { lobbies } = list_lobbies(&mut members[0].0).await else {
+        panic!("expected LobbyList");
+    };
+    let [lobby] = &lobbies[..] else {
+        panic!("expected one lobby, got {lobbies:?}");
+    };
+    assert_eq!(lobby.code, code);
+    assert_eq!(lobby.host_name, "a");
+    assert_eq!(lobby.player_count, 2);
+}
+
+/// A join and the host leaving, sent at the same moment from two connections, over and over: the
+/// joiner always learns the lobby is migratable before any change to it, and always ends up
+/// knowing who the host is.
+#[tokio::test]
+async fn a_joiner_hears_that_the_lobby_is_migratable_before_any_host_change() {
+    let server = SignallingServer::start();
+    for round in 0..20 {
+        // By hand: only the joiner's stream is read, so nobody else needs draining.
+        let (mut host, _) = migrating_player(&server, "host").await;
+        let (_, code) = create_migratable_lobby(&mut host).await;
+        let (mut a, a_uuid) = migrating_player(&server, "a").await;
+        join_migratable(&mut a, &code).await;
+        let (mut joiner, _) = migrating_player(&server, "joiner").await;
+
+        let join = ClientMessage::JoinLobbyByCode { code: code.clone() };
+        tokio::join!(
+            send(&mut joiner, &join),
+            send(&mut host, &ClientMessage::LeaveLobby)
+        );
+
+        let told = drain(&mut joiner).await;
+        let joined = told
+            .iter()
+            .position(|m| matches!(m, ServerMessage::LobbyJoined { .. }));
+        let migratable = told
+            .iter()
+            .position(|m| matches!(m, ServerMessage::LobbyMigratable { .. }));
+        let changed = told
+            .iter()
+            .position(|m| matches!(m, ServerMessage::HostChanged { .. }));
+        let (Some(joined), Some(migratable)) = (joined, migratable) else {
+            panic!("round {round}: the joiner was sent {told:?}");
+        };
+        assert!(joined < migratable, "round {round}: {told:?}");
+        let host_known = match changed {
+            Some(changed) => {
+                assert!(migratable < changed, "round {round}: {told:?}");
+                matches!(&told[changed], ServerMessage::HostChanged { new_host, .. } if *new_host == a_uuid)
+            }
+            None => {
+                matches!(&told[joined], ServerMessage::LobbyJoined { host_uuid, .. } if *host_uuid == a_uuid)
+            }
+        };
+        assert!(host_known, "round {round}: the joiner was sent {told:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_successor_that_leaves_at_once_hands_over_to_the_next() {
+    let server = SignallingServer::start();
+    let ((mut host, _), code, mut members) = migratable_lobby(&server, &["a", "b"]).await;
+    let (a_uuid, b_uuid) = (members[0].1, members[1].1);
+
+    send(&mut host, &ClientMessage::LeaveLobby).await;
+    host_change(&mut members[0].0).await;
+    send(&mut members[0].0, &ClientMessage::LeaveLobby).await;
+
+    let told_b = drain(&mut members[1].0).await;
+    let changes: Vec<_> = told_b
+        .iter()
+        .filter_map(|m| match m {
+            ServerMessage::HostChanged {
+                previous_host,
+                new_host,
+                code,
+                members,
+                ..
+            } => Some((*previous_host, *new_host, code.clone(), members.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        changes.last(),
+        Some(&(a_uuid, b_uuid, code, vec![b_uuid])),
+        "b was sent {told_b:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_idle_host_is_replaced_after_the_idle_timeout() {
+    let server = SignallingServer::start_with(Limits {
+        idle_timeout: Duration::from_secs(1),
+        ..Limits::default()
+    });
+    // Built by hand rather than with `migratable_lobby`, whose draining would outlast a one-second
+    // idle timeout on every connection, not only the host's.
+    let (mut host, host_uuid) = migrating_player(&server, "host").await;
+    let (_, code) = create_migratable_lobby(&mut host).await;
+    let (mut a, a_uuid) = migrating_player(&server, "a").await;
+    join_migratable(&mut a, &code).await;
+    let (a, a_uuid) = (&mut a, &a_uuid);
+
+    // The host says nothing more; the member keeps its own connection alive while it waits.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the member was never told the silent host was replaced"
+        );
+        send(a, &ClientMessage::KeepAlive).await;
+        if let Ok(Some(Ok(Message::Binary(bytes)))) =
+            tokio::time::timeout(Duration::from_millis(300), a.next()).await
+        {
+            if let ServerMessage::HostChanged {
+                previous_host,
+                new_host,
+                ..
+            } = decode::<ServerMessage>(&bytes).unwrap()
+            {
+                assert_eq!((previous_host, new_host), (host_uuid, *a_uuid));
+                break;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_closed_lobby_is_not_migrated() {
+    let server = SignallingServer::start();
+    let ((mut host, _), _, mut members) = migratable_lobby(&server, &["a"]).await;
+
+    // From a member, closing is ignored.
+    send(&mut members[0].0, &ClientMessage::CloseLobby).await;
+    match list_lobbies(&mut members[0].0).await {
+        ServerMessage::LobbyList { lobbies } => assert_eq!(lobbies.len(), 1),
+        other => panic!("expected LobbyList, got {other:?}"),
+    }
+
+    send(&mut host, &ClientMessage::CloseLobby).await;
+    match recv(&mut members[0].0).await {
+        ServerMessage::Disconnected { reason } => assert_eq!(reason, "Host closed the lobby"),
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    match list_lobbies(&mut members[0].0).await {
+        ServerMessage::LobbyList { lobbies } => assert!(lobbies.is_empty()),
+        other => panic!("expected LobbyList, got {other:?}"),
+    }
+}
+
+/// What an older server does with a newer client's messages, from the other side: a frame it
+/// cannot decode is skipped, and the connection carries on.
+#[tokio::test]
+async fn an_unknown_client_variant_does_not_close_the_connection() {
+    let server = SignallingServer::start();
+    let (mut ws, _) = player(&server, "from the future").await;
+    // Variant 200, in postcard's varint: no build of this server has that many.
+    ws.send(Message::Binary(vec![0xC8, 0x01].into()))
+        .await
+        .expect("send to the server");
+    match list_lobbies(&mut ws).await {
+        ServerMessage::LobbyList { .. } => {}
+        other => panic!("expected LobbyList, got {other:?}"),
+    }
 }
