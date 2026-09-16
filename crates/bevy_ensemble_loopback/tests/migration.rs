@@ -80,6 +80,20 @@ fn collect(
     }
 }
 
+/// What a layer above does the moment its peer is verified: say something to it. The ticked
+/// bridge announces its registries this way.
+fn greet_on_verification(
+    verified: On<Add, HandshakeVerified>,
+    lobbies: Query<(), (With<Lobby>, Without<Host>)>,
+    mut commands: Commands,
+) {
+    if lobbies.contains(verified.entity) {
+        commands
+            .entity(verified.entity)
+            .trigger(|entity| LobbyMessage::new(entity, Note("verified".into())));
+    }
+}
+
 fn peer(uuid: u128) -> App {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins)
@@ -96,6 +110,7 @@ fn peer(uuid: u128) -> App {
         .init_resource::<Heard>()
         .init_resource::<Departures>()
         .init_resource::<Changes>()
+        .add_observer(greet_on_verification)
         .add_systems(Update, collect);
     app
 }
@@ -182,7 +197,15 @@ fn changes(net: &LoopbackNetwork, peer: PeerId) -> Vec<(u128, u128, bool)> {
     net.app(peer).world().resource::<Changes>().0.clone()
 }
 
+/// What `peer` heard, less the note every follower sends as it verifies a new host.
 fn heard(net: &LoopbackNetwork, peer: PeerId) -> Vec<(Option<u128>, String)> {
+    heard_all(net, peer)
+        .into_iter()
+        .filter(|(_, text)| text != "note:verified")
+        .collect()
+}
+
+fn heard_all(net: &LoopbackNetwork, peer: PeerId) -> Vec<(Option<u128>, String)> {
     net.app(peer).world().resource::<Heard>().0.clone()
 }
 
@@ -553,6 +576,21 @@ fn a_pending_joiner_named_a_new_host_joins_it_instead() {
 }
 
 // ── After the change ─────────────────────────────────────────────────────────
+
+/// Whatever a follower sends the moment its new host is verified is sent: the verification is
+/// the end of the switch, not the last moment of it.
+#[test]
+fn a_message_sent_as_the_new_host_is_verified_reaches_it() {
+    let (mut net, peers) = session(2, true);
+    let (a, b) = (peers[1], peers[2]);
+    net.migrate(a);
+    net.run(20);
+    let from_b: Vec<_> = heard_all(&net, a)
+        .into_iter()
+        .filter(|(sender, _)| *sender == Some(B))
+        .collect();
+    assert_eq!(from_b, [(Some(B), "note:verified".into())]);
+}
 
 #[test]
 fn messages_sent_while_switching_hosts_are_dropped_not_delivered_late() {
