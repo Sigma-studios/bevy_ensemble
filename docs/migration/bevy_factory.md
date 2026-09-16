@@ -15,3 +15,8 @@ A lockstep game over WebRTC with the in-process harness (`src/testing/harness.rs
 **Watch:** `bevy_ticked_lockstep_networking` (T12) now reads `PeerReliableRtt` for its first
 buffer estimate and `PeerState` for kicks; a game that reached into `PeerRtt` directly reads
 the reliable one.
+
+**Host changes (E5):** done in bevy_factory `f9928a4`. The session ends on `LobbyLeft` rather than
+when a client lobby goes away, a host can end the game for everyone with `CloseLobby`, and the
+status strip explains a held clock. The lockstep half (players spawned from `LockstepRoster`,
+the resume itself) is in `bevy_ticked/docs/migration/bevy_factory.md`.
