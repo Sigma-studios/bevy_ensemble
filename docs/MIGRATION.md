@@ -4,6 +4,53 @@ One section per phase of the netcode overhaul, in the order they landed. Each na
 what to change in a consumer, and why. Both peers of a session must be built from the same
 commit; the join handshake enforces it from phase E2 onward.
 
+## E5a — a host that leaves kicks nobody
+
+Nothing on the wire changed. Groundwork for host migration: every fix here is to something that
+already went wrong, and each would have ended a session that migration is meant to keep.
+
+### A WebRTC host that leaves no longer kicks its clients
+
+**Before** the WebRTC backend told a player it had been removed whenever its seat was removed,
+including when the seat went with the host's own lobby. A host that left sent every client a
+`RemoveLobbyParticipant` naming that client, and each ended its session as
+`LobbyLeft { Kicked }` rather than `HostGone` — when the notice arrived before the connection
+closed. The same happened when a host lost the signalling server. **After** the notice is sent
+only while the seat's lobby is still hosted: a kick, a timeout, a refused protocol.
+**What to change** Nothing. A game that treated `Kicked` from a host that was leaving as "the
+host left" can drop that guess.
+
+### Steam closes the sessions it opens, and leaves the lobby however the entity goes
+
+**Before** packets went out through `ISteamNetworkingMessages`, and sessions were closed with
+`close_p2p_session`, which belongs to the older `ISteamNetworking` and closed nothing. And a lobby
+the core tore down — a kick, a ping timeout, a protocol mismatch — left this peer a member of the
+Steam lobby. **After** sessions are closed through the messages interface, the backend leaves the
+Steam lobby whenever a lobby entity goes, and a host leaving no longer despawns its seats ahead of
+its lobby. **What to change** Nothing. The Steam example now leaves with `LeaveLobby`; a game that
+copied its old teardown should do the same.
+
+### An offer that arrives before its sender is known is held, not refused
+
+**Before** lobby events and peer signals reach a WebRTC peer on separate channels. A host's offer
+drained in the frame before `LobbyJoined` named its sender was refused, and an offer is sent once,
+so the join waited out its timeout. **After** such an offer is held for up to two seconds — with
+every later signal from that peer — and answered once its sender can be. **What to change**
+Nothing.
+
+### A socket reports nothing for a connection it has dropped
+
+**Before** every connection reported its state on channels the `EnsembleSocket` shared. A
+`Failed` still queued when a peer was disconnected was read as the first report of the next
+connection to it, and since nothing is reported after `Failed`, that connection never reported
+`Connected`. **After** each connection reports on its own channels, dropped with it.
+**What to change** Nothing; `update_peers` and `update_routes` have the same signatures.
+
+### CI runs the signalling tests
+
+`tests/signalling.rs` needs the `server` feature, which `cargo test --workspace` does not enable,
+so CI never ran it. It does now: `cargo test -p bevy_ensemble_webrtc --features server`.
+
 ## E4 — the first real join
 
 Nothing on the wire changed. The first session between two processes over a real data
