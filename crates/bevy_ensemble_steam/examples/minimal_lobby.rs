@@ -1,8 +1,9 @@
 use bevy::prelude::*;
 use bevy_ensemble::{
-    BroadcastLobbyMessage, EnsembleAppExt, EnsemblePlugin, Host, Lobby, LobbyBroadcastAppExt,
-    LobbyBroadcastPlugin, LobbyClient, LobbyMessage, LobbyParticipant, LobbyParticipantOf,
-    LocalMultiplayerPlayerId, PendingLobby, ReceivedEnsembleMessage, StartHosting,
+    BroadcastLobbyMessage, EnsembleAppExt, EnsemblePlugin, Host, LeaveLobby, Lobby,
+    LobbyBroadcastAppExt, LobbyBroadcastPlugin, LobbyClient, LobbyMessage, LobbyParticipant,
+    LobbyParticipantOf, LocalMultiplayerPlayerId, PendingLobby, ReceivedEnsembleMessage,
+    StartHosting,
 };
 use bevy_ensemble_steam::{BevyEnsembleSteamPlugin, LobbyClientSteamId, LobbySteamId};
 use bevy_immediate::{BevyImmediatePlugin, ImmCtx, ui::CapsUi};
@@ -242,39 +243,15 @@ fn receive_wave_actions(
 fn handle_escape_key(
     mut commands: Commands,
     keyboard_input: Res<ButtonInput<KeyCode>>,
-    steam_client: Res<SteamClient>,
-    host_lobbies: Query<(Entity, &LobbySteamId), (With<Lobby>, With<Host>)>,
-    client_lobbies: Query<(Entity, &LobbySteamId), (With<Lobby>, Without<Host>)>,
-    pending_lobbies: Query<Entity, With<PendingLobby>>,
-    lobby_clients: Query<(Entity, &LobbyClientSteamId), With<LobbyClient>>,
+    mut leave: MessageWriter<LeaveLobby>,
     mut chat_log: ResMut<ChatLog>,
 ) {
     if !keyboard_input.just_pressed(KeyCode::Escape) {
         return;
     }
 
-    for entity in pending_lobbies.iter() {
-        commands.entity(entity).try_despawn();
-    }
-
-    if let Some((host_entity, lobby_id)) = host_lobbies.iter().next() {
-        for (client_entity, client_steam_id) in lobby_clients.iter() {
-            steam_client
-                .networking()
-                .close_p2p_session(client_steam_id.0);
-            commands.entity(client_entity).try_despawn();
-        }
-        steam_client.matchmaking().leave_lobby(lobby_id.0);
-        commands.entity(host_entity).try_despawn();
-    }
-
-    if let Some((client_entity, lobby_id)) = client_lobbies.iter().next() {
-        let host = steam_client.matchmaking().lobby_owner(lobby_id.0);
-        steam_client.networking().close_p2p_session(host);
-        steam_client.matchmaking().leave_lobby(lobby_id.0);
-        commands.entity(client_entity).try_despawn();
-    }
-
+    // Closing the sessions and leaving the Steam lobby is the backend's to do, in its order.
+    leave.write(LeaveLobby);
     commands.remove_resource::<LocalMultiplayerPlayerId>();
     chat_log.0.clear();
 }
