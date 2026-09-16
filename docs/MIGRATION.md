@@ -4,6 +4,16 @@ One section per phase of the netcode overhaul, in the order they landed. Each na
 what to change in a consumer, and why. Both peers of a session must be built from the same
 commit; the join handshake enforces it from phase E2 onward.
 
+## Fix — a notice that arrives between sessions is not read in the next one
+
+A peer in no lobby used to hold what an unverified sender said, and replay it once a later session
+verified that sender. A player who pressed Leave, and whose seat the host then removed, received the
+removal notice after it had left; when it joined again, the notice was replayed into the new
+session, which ended as `Kicked`. A peer with no lobby now drops such packets, and removing a lobby
+forgets everything held for it (`HeldUntilVerified::clear`).
+
+**What to change** Nothing.
+
 ## E5e — a Steam lobby outlives its host
 
 The Steam backend turns E5c on. Every lobby it creates or enters is migratable, and Steam's lobby

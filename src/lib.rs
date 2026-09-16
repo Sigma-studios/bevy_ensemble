@@ -230,6 +230,7 @@ impl Plugin for EnsemblePlugin {
                 ),
             )
             .add_observer(observers::on_lobby_client_removed)
+            .add_observer(registry::forget_held_packets_with_the_lobby)
             .add_observer(handshake::replay_held_packets)
             // Everything encoded during the frame leaves as one packet per peer and channel.
             .add_systems(Last, outbound::flush_outbound)
