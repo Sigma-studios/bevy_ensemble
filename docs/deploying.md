@@ -144,6 +144,11 @@ Host migration is the first capability. Which lobbies get it:
 Deploy the server first. A new client against an old server loses nothing it had; an old client
 against a new server is never sent anything it cannot read.
 
+The WebRTC client declares it from E5d. A member of a migratable lobby waits up to the server's idle
+timeout plus 30 s for a new host, because a host that stops answering without closing its socket is
+only replaced once the server's idle timeout ends its connection. That is 60 s by default (90 s of
+waiting in all); a server run with a shorter `Limits::idle_timeout` shortens the wait.
+
 ## Checking it works
 
 Startup must log **two** lines, not one:

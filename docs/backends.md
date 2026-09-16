@@ -164,6 +164,15 @@ the re-verification; the backend reports what its platform says:
 Lobbies without `HostMigratable` behave exactly as before, so a backend that does none of this is
 unaffected.
 
+The WebRTC backend is a worked example. The signalling server is the platform. `LobbyMigratable`
+brings `HostMigratable`, sized from the server's idle timeout. A host's data channel closing brings
+`HostLost`. On `HostChanged`, the new host calls `connect_peer` for every member and spawns
+`PendingWebrtcLobbyClient` seats, and a follower rewrites `LobbyHostUuid` before the new host's
+offer is judged; both then trigger `NewHostNamed`. `PlayerLeft` with no seat to despawn brings
+`ParticipantDeparted`. When a platform notice and the core can both end a client's lobby on the same
+frame, check that the lobby still exists when the teardown is applied, so `LobbyLeft` is written
+once.
+
 ## Connection State and ICE Restart
 
 `bevy_ensemble_sockets` reports each peer through `EnsembleSocket::update_peers` as a
@@ -174,7 +183,7 @@ unaffected.
 | `Connecting` | A connection exists; offer/answer and gathering are under way. Reported once, first. | Logs it. |
 | `Connected` | The reliable data channel is open. | Logs it; the handshake takes it from here. |
 | `Reconnecting` | ICE lost the path (Wi-Fi to cellular, a NAT rebinding) and is restarting. The data channels are still open; sends are queued by SCTP and delivered once a new pair is nominated. | Logs it, keeps everything: the host keeps the `LobbyClient`, the client keeps its lobby. |
-| `Disconnected` | A connection that was open has ended. | Host: despawns the `LobbyClient`. Client: if it was the host, despawns the lobby (`LobbyLeft { HostGone }`). |
+| `Disconnected` | A connection that was open has ended. | Host: despawns the `LobbyClient`. Client: if it was the host, triggers `HostLost` on a joined migratable lobby, and otherwise despawns the lobby (`LobbyLeft { HostGone }`). |
 | `Failed` | Over for good: no pair ever worked, or a restart found none within `ICE_RESTART_TIMEOUT` (15 s) or `MAX_ICE_RESTARTS` (3). Nothing is reported after it. | Same teardown as `Disconnected`, plus `LobbyJoinFailed` with a reason. |
 
 Only the side that made the original offer restarts ICE — in this protocol, the host — because a

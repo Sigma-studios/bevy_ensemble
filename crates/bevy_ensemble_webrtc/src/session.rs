@@ -27,6 +27,22 @@ pub(crate) fn join_lobby(
     }
 }
 
+/// A host ending its lobby for everyone tells the server to close it, rather than to hand it over
+/// when the host leaves a frame later. The core tells the members over the data channel as well;
+/// whichever arrives first ends their session.
+pub(crate) fn close_lobby(
+    mut requests: MessageReader<bevy_ensemble::CloseLobby>,
+    hosted: Query<(), (With<Lobby>, With<bevy_ensemble::Host>)>,
+    lobby_conn: Res<crate::connection::LobbyConnection>,
+) {
+    if requests.read().next().is_none() || hosted.is_empty() {
+        return;
+    }
+    let _ = lobby_conn
+        .command_tx
+        .send(crate::protocol::ClientMessage::CloseLobby);
+}
+
 /// Despawning the lobby entity *is* the teardown here.
 ///
 /// `detect_lobby_leave` watches for `LobbyWebrtcId` going away, tells the signalling server, drops

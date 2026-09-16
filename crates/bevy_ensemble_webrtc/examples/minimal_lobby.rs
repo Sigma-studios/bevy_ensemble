@@ -2,10 +2,11 @@ use bevy::prelude::*;
 use bevy::window::{PresentMode, PrimaryWindow};
 use bevy::winit::WinitSettings;
 use bevy_ensemble::{
-    BroadcastLobbyMessage, EnsembleAppExt, EnsemblePlugin, Host, Lobby, LobbyBroadcastAppExt,
-    LobbyBroadcastPlugin, LobbyClient, LobbyClientPlayerUuid, LobbyMessage, LobbyParticipant,
-    LobbyParticipantOf, LocalMultiplayerPlayerId, PeerRtt, PendingLobby, PlayerData,
-    PlayerDataPlugin, PublicLobbies, ReceivedEnsembleMessage, SetPlayerData, StartHosting,
+    AwaitingHost, BroadcastLobbyMessage, CloseLobby, EnsembleAppExt, EnsemblePlugin, Host,
+    HostChanged, LeaveLobby, Lobby, LobbyBroadcastAppExt, LobbyBroadcastPlugin, LobbyClient,
+    LobbyClientPlayerUuid, LobbyMessage, LobbyParticipant, LobbyParticipantOf,
+    LocalMultiplayerPlayerId, PeerRtt, PendingLobby, PlayerData, PlayerDataPlugin, PublicLobbies,
+    ReceivedEnsembleMessage, SetPlayerData, StartHosting,
 };
 use bevy_ensemble_webrtc::{BevyEnsembleWebrtcPlugin, JoinWebrtcLobby, RefreshLobbyList};
 use bevy_immediate::{BevyImmediatePlugin, ImmCtx, ui::CapsUi};
@@ -98,6 +99,8 @@ impl Plugin for MinimalLobbyExamplePlugin {
                     receive_chat_messages,
                     receive_wave_actions,
                     handle_escape_key,
+                    handle_c_key,
+                    receive_host_changes,
                     handle_fast_loop_toggle,
                     update_fast_loop_hint,
                 ),
@@ -183,6 +186,7 @@ fn update_roster(
     )>,
     lobby_clients: Query<(&LobbyClientPlayerUuid, Option<&PeerRtt>), With<LobbyClient>>,
     lobby_rtt: Query<Option<&PeerRtt>, (With<Lobby>, Without<Host>)>,
+    awaiting: Query<&AwaitingHost>,
 ) {
     let Ok((roster_entity, mut vis)) = roster.single_mut() else {
         return;
@@ -213,6 +217,25 @@ fn update_roster(
     players.sort_by_key(|(uuid, _, _)| *uuid);
 
     commands.entity(roster_entity).with_children(|parent| {
+        // The host is gone and the lobby is waiting to hear who replaces it, or to reach them.
+        if let Ok(awaiting) = awaiting.get(lobby_entity) {
+            let status = match awaiting.successor {
+                None => format!(
+                    "Host left - waiting for a new host ({:.0}s)\n",
+                    awaiting.waited.as_secs_f64()
+                ),
+                Some(successor) => format!(
+                    "Host left - reaching the new host, Player {} ({:.0}s)\n",
+                    successor % 10000,
+                    awaiting.waited.as_secs_f64()
+                ),
+            };
+            parent.spawn((
+                RosterSpan,
+                TextSpan::new(status),
+                TextColor(Color::srgb(1.0, 0.8, 0.3)),
+            ));
+        }
         parent.spawn((RosterSpan, TextSpan::new("Players:\n")));
 
         let mut kick_index = 0usize;
@@ -249,6 +272,8 @@ fn update_roster(
             "\nPress H to send hello (broadcast)\nNumpad 1-9 to change name color\nPress Escape to leave lobby"
                 .to_string();
         if is_host {
+            controls.push_str(" (the next player hosts)");
+            controls.push_str("\nPress C to close the lobby for everyone");
             controls.push_str("\nPress T to wave (host-only action)\nPress 1-0 to kick a player");
         }
         parent.spawn((RosterSpan, TextSpan::new(controls)));
@@ -494,22 +519,50 @@ fn receive_wave_actions(
     }
 }
 
+/// Leaving as the host hands the lobby to the player who joined earliest; everybody else stays.
 fn handle_escape_key(
-    mut commands: Commands,
     keyboard_input: Res<ButtonInput<KeyCode>>,
-    lobbies: Query<Entity, Or<(With<Lobby>, With<PendingLobby>)>>,
+    mut leave: MessageWriter<LeaveLobby>,
     mut chat_log: ResMut<ChatLog>,
 ) {
     if !keyboard_input.just_pressed(KeyCode::Escape) {
         return;
     }
-
-    for entity in lobbies.iter() {
-        commands.entity(entity).try_despawn();
-    }
-
-    commands.remove_resource::<LocalMultiplayerPlayerId>();
+    leave.write(LeaveLobby);
     chat_log.0.clear();
+}
+
+/// Ends the lobby for everyone rather than handing it over. Ignored with a warning on a client.
+fn handle_c_key(
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    hosting: Query<(), (With<Lobby>, With<Host>)>,
+    mut close: MessageWriter<CloseLobby>,
+    mut chat_log: ResMut<ChatLog>,
+) {
+    if !keyboard_input.just_pressed(KeyCode::KeyC) || hosting.is_empty() {
+        return;
+    }
+    close.write(CloseLobby);
+    chat_log.0.clear();
+}
+
+/// The lobby is the same one, under a new host: the roster, names and colours carry over.
+fn receive_host_changes(mut changes: MessageReader<HostChanged>, mut chat_log: ResMut<ChatLog>) {
+    for change in changes.read() {
+        let text = if change.promoted {
+            format!(
+                "Player {} left; you host the lobby now",
+                change.previous % 10000
+            )
+        } else {
+            format!(
+                "Player {} left; Player {} hosts the lobby now",
+                change.previous % 10000,
+                change.new % 10000
+            )
+        };
+        push_chat_message(&mut chat_log, "lobby", &text);
+    }
 }
 
 /// Runtime state of the fast-loop toggle (see [`handle_fast_loop_toggle`]).

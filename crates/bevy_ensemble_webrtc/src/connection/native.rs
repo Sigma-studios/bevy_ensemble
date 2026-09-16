@@ -6,7 +6,7 @@ use bevy_ensemble_sockets::PeerSignal;
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
-use crate::protocol::{ClientMessage, ServerMessage, decode, encode};
+use crate::protocol::{CAPABILITY_HOST_MIGRATION, ClientMessage, ServerMessage, decode, encode};
 
 use super::{LobbyEvent, dispatch_server_message};
 
@@ -61,6 +61,13 @@ impl WsHandlerBuilder {
                 error!("Failed to send authentication message");
                 let _ = lobby_event_tx.send(LobbyEvent::SignallingClosed);
                 return;
+            }
+            // What this client understands. A server older than the declaration logs that it
+            // could not decode it and carries on, which is today's behaviour exactly.
+            if let Some(declaration) = encode(&ClientMessage::DeclareCapabilities {
+                capabilities: CAPABILITY_HOST_MIGRATION,
+            }) {
+                let _ = ws_sink.send(Message::Binary(declaration.into())).await;
             }
 
             // Whether the loop ended because the server went away, as opposed to the plugin
