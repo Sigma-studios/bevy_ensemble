@@ -164,6 +164,19 @@ impl IceServers {
     }
 }
 
+/// What one connection reports about itself, on channels that belong to that connection alone.
+///
+/// Every connection used to report on channels the socket shared, keyed by nothing but the peer
+/// id, so a dropped connection's reports outlived it. A `Failed` still queued when the connection
+/// was dropped was read as the first report of the next connection to the same peer — and since
+/// nothing is reported after `Failed`, that connection's `Connected` was never heard. The
+/// receivers are dropped with the connection, which is what makes
+/// [`disconnect_peer`](EnsembleSocket::disconnect_peer) final.
+struct PeerEvents {
+    states: mpsc::UnboundedReceiver<(u128, PeerState)>,
+    routes: mpsc::UnboundedReceiver<(u128, PeerRoute)>,
+}
+
 /// A cross-platform WebRTC socket that manages peer connections and data channels.
 ///
 /// Call [`EnsembleSocket::new`] to create one, then use:
@@ -175,16 +188,14 @@ impl IceServers {
 pub struct EnsembleSocket {
     signal_tx: mpsc::UnboundedSender<OutgoingSignal>,
     signal_rx: mpsc::UnboundedReceiver<OutgoingSignal>,
-    peer_state_tx: mpsc::UnboundedSender<(u128, PeerState)>,
-    peer_state_rx: mpsc::UnboundedReceiver<(u128, PeerState)>,
-    route_tx: mpsc::UnboundedSender<(u128, PeerRoute)>,
-    route_rx: mpsc::UnboundedReceiver<(u128, PeerRoute)>,
     message_tx: mpsc::UnboundedSender<(u128, Box<[u8]>, Instant)>,
     message_rx: mpsc::UnboundedReceiver<(u128, Box<[u8]>, Instant)>,
     #[cfg(not(target_arch = "wasm32"))]
     peers: HashMap<u128, native::NativePeerConnection>,
     #[cfg(target_arch = "wasm32")]
     peers: HashMap<u128, wasm::WasmPeerConnection>,
+    /// The report channels of the connection in `peers` under the same id, and of no other.
+    events: HashMap<u128, PeerEvents>,
     states: HashMap<u128, PeerState>,
     routes: HashMap<u128, PeerRoute>,
     /// When each peer currently `Reconnecting` was first reported so, for [`ICE_RESTART_TIMEOUT`].
@@ -205,19 +216,14 @@ impl EnsembleSocket {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new(runtime_handle: tokio::runtime::Handle) -> Self {
         let (signal_tx, signal_rx) = mpsc::unbounded_channel();
-        let (peer_state_tx, peer_state_rx) = mpsc::unbounded_channel();
-        let (route_tx, route_rx) = mpsc::unbounded_channel();
         let (message_tx, message_rx) = mpsc::unbounded_channel();
         Self {
             signal_tx,
             signal_rx,
-            peer_state_tx,
-            peer_state_rx,
-            route_tx,
-            route_rx,
             message_tx,
             message_rx,
             peers: HashMap::new(),
+            events: HashMap::new(),
             states: HashMap::new(),
             routes: HashMap::new(),
             reconnecting_since: HashMap::new(),
@@ -230,19 +236,14 @@ impl EnsembleSocket {
     #[cfg(target_arch = "wasm32")]
     pub fn new() -> Self {
         let (signal_tx, signal_rx) = mpsc::unbounded_channel();
-        let (peer_state_tx, peer_state_rx) = mpsc::unbounded_channel();
-        let (route_tx, route_rx) = mpsc::unbounded_channel();
         let (message_tx, message_rx) = mpsc::unbounded_channel();
         Self {
             signal_tx,
             signal_rx,
-            peer_state_tx,
-            peer_state_rx,
-            route_tx,
-            route_rx,
             message_tx,
             message_rx,
             peers: HashMap::new(),
+            events: HashMap::new(),
             states: HashMap::new(),
             routes: HashMap::new(),
             reconnecting_since: HashMap::new(),
@@ -260,6 +261,22 @@ impl EnsembleSocket {
         self
     }
 
+    /// Report channels for a connection about to be made to `peer`, replacing any an earlier
+    /// connection to it left behind.
+    #[allow(clippy::type_complexity)]
+    fn events_for(
+        &mut self,
+        peer: u128,
+    ) -> (
+        mpsc::UnboundedSender<(u128, PeerState)>,
+        mpsc::UnboundedSender<(u128, PeerRoute)>,
+    ) {
+        let (state_tx, states) = mpsc::unbounded_channel();
+        let (route_tx, routes) = mpsc::unbounded_channel();
+        self.events.insert(peer, PeerEvents { states, routes });
+        (state_tx, route_tx)
+    }
+
     /// Initiate a WebRTC connection to a peer (we create the offer).
     pub fn connect_peer(&mut self, peer_id: u128) {
         if self.peers.contains_key(&peer_id) {
@@ -267,6 +284,7 @@ impl EnsembleSocket {
             return;
         }
         log::info!("peer {peer_id:#x}: opening a connection, offering as the caller");
+        let (state_tx, route_tx) = self.events_for(peer_id);
 
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -274,8 +292,8 @@ impl EnsembleSocket {
                 peer_id,
                 recovery::Role::Offerer,
                 self.signal_tx.clone(),
-                self.peer_state_tx.clone(),
-                self.route_tx.clone(),
+                state_tx,
+                route_tx,
                 self.message_tx.clone(),
                 &self.ice_servers,
                 Arc::clone(&self.discarded_candidates),
@@ -291,8 +309,8 @@ impl EnsembleSocket {
                 peer_id,
                 recovery::Role::Offerer,
                 self.signal_tx.clone(),
-                self.peer_state_tx.clone(),
-                self.route_tx.clone(),
+                state_tx,
+                route_tx,
                 self.message_tx.clone(),
                 &self.ice_servers,
                 Arc::clone(&self.discarded_candidates),
@@ -378,6 +396,7 @@ impl EnsembleSocket {
                     return;
                 }
                 log::info!("peer {sender:#x}: applying its offer, answering as the callee");
+                let (state_tx, route_tx) = self.events_for(sender);
 
                 #[cfg(not(target_arch = "wasm32"))]
                 {
@@ -385,8 +404,8 @@ impl EnsembleSocket {
                         sender,
                         recovery::Role::Answerer,
                         self.signal_tx.clone(),
-                        self.peer_state_tx.clone(),
-                        self.route_tx.clone(),
+                        state_tx,
+                        route_tx,
                         self.message_tx.clone(),
                         &self.ice_servers,
                         Arc::clone(&self.discarded_candidates),
@@ -402,8 +421,8 @@ impl EnsembleSocket {
                         sender,
                         recovery::Role::Answerer,
                         self.signal_tx.clone(),
-                        self.peer_state_tx.clone(),
-                        self.route_tx.clone(),
+                        state_tx,
+                        route_tx,
                         self.message_tx.clone(),
                         &self.ice_servers,
                         Arc::clone(&self.discarded_candidates),
@@ -472,7 +491,13 @@ impl EnsembleSocket {
     /// that has already been torn down around it.
     pub fn update_peers(&mut self) -> Vec<(u128, PeerState)> {
         let mut changes = Vec::new();
-        while let Ok((peer, state)) = self.peer_state_rx.try_recv() {
+        // Order matters within one connection and means nothing across two.
+        let reported: Vec<(u128, PeerState)> = self
+            .events
+            .values_mut()
+            .flat_map(|events| std::iter::from_fn(|| events.states.try_recv().ok()))
+            .collect();
+        for (peer, state) in reported {
             let previous = self.states.get(&peer).copied();
             match state {
                 PeerState::Reconnecting => {
@@ -536,7 +561,12 @@ impl EnsembleSocket {
     /// [`update_peers`]: EnsembleSocket::update_peers
     pub fn update_routes(&mut self) -> Vec<(u128, PeerRoute)> {
         let mut changes = Vec::new();
-        while let Ok((peer, route)) = self.route_rx.try_recv() {
+        let reported: Vec<(u128, PeerRoute)> = self
+            .events
+            .values_mut()
+            .flat_map(|events| std::iter::from_fn(|| events.routes.try_recv().ok()))
+            .collect();
+        for (peer, route) in reported {
             if self.routes.get(&peer).copied() != Some(route) {
                 self.routes.insert(peer, route);
                 changes.push((peer, route));
@@ -612,7 +642,13 @@ impl EnsembleSocket {
     /// dropping the socket close their peers the same way.
     ///
     /// [`disconnect_all`]: EnsembleSocket::disconnect_all
+    ///
+    /// Final: nothing the dropped connection reports afterwards reaches
+    /// [`update_peers`](EnsembleSocket::update_peers), so a peer can be disconnected and connected
+    /// again in the same frame without the old connection's last words being read as the new
+    /// one's.
     pub fn disconnect_peer(&mut self, peer: u128) {
+        self.events.remove(&peer);
         if self.peers.remove(&peer).is_some() {
             self.states.remove(&peer);
             self.routes.remove(&peer);
@@ -623,8 +659,56 @@ impl EnsembleSocket {
     /// Disconnect all peers.
     pub fn disconnect_all(&mut self) {
         self.peers.clear();
+        self.events.clear();
         self.states.clear();
         self.routes.clear();
         self.reconnecting_since.clear();
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    const PEER: u128 = 7;
+
+    /// The case the shared channels got wrong: a connection that failed, whose `Failed` was still
+    /// queued when it was dropped and a new connection to the same peer was made in its place.
+    /// The stale report was read first, as the new connection's; and since nothing is reported
+    /// after `Failed`, the replacement's `Connected` was then swallowed for good.
+    #[test]
+    fn a_report_queued_by_a_dropped_connection_is_not_read_as_its_replacements() {
+        let runtime = tokio::runtime::Runtime::new().expect("a tokio runtime");
+        let mut socket = EnsembleSocket::new(runtime.handle().clone());
+
+        let (old, _) = socket.events_for(PEER);
+        old.send((PEER, PeerState::Failed)).unwrap();
+        socket.disconnect_peer(PEER);
+
+        let (new, _) = socket.events_for(PEER);
+        new.send((PEER, PeerState::Connecting)).unwrap();
+        new.send((PEER, PeerState::Connected)).unwrap();
+        // The old connection is still closing, and still has somewhere to report to.
+        let _ = old.send((PEER, PeerState::Disconnected));
+
+        assert_eq!(
+            socket.update_peers(),
+            [(PEER, PeerState::Connecting), (PEER, PeerState::Connected)]
+        );
+    }
+
+    /// A route the old connection settled on is not the new connection's route.
+    #[test]
+    fn a_route_reported_by_a_dropped_connection_is_forgotten_with_it() {
+        let runtime = tokio::runtime::Runtime::new().expect("a tokio runtime");
+        let mut socket = EnsembleSocket::new(runtime.handle().clone());
+
+        let (_, old) = socket.events_for(PEER);
+        old.send((PEER, PeerRoute::Relayed)).unwrap();
+        socket.disconnect_peer(PEER);
+        let _ = socket.events_for(PEER);
+
+        assert!(socket.update_routes().is_empty());
+        assert_eq!(socket.route(PEER), None);
     }
 }
