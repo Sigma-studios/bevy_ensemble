@@ -173,6 +173,13 @@ offer is judged; both then trigger `NewHostNamed`. `PlayerLeft` with no seat to 
 frame, check that the lobby still exists when the teardown is applied, so `LobbyLeft` is written
 once.
 
+The Steam backend is the other worked example. The arbiter is the lobby owner, read with
+`lobby_owner()` every frame rather than taken from callbacks, whose order Steam does not promise.
+The backend triggers `HostLost` only while the pinned host is still the owner. Once Steam names
+somebody else, the backend repins and triggers `NewHostNamed` in the same frame. A platform with no
+channel of its own to say "closed" can use shared state instead. Steam marks the lobby data, so a
+member that sees the host leave first does not take the lobby over.
+
 ## Connection State and ICE Restart
 
 `bevy_ensemble_sockets` reports each peer through `EnsembleSocket::update_peers` as a

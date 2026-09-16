@@ -119,6 +119,10 @@ fn end_game(mut writer: MessageWriter<CloseLobby>) {
 }
 ```
 
+Members are told over the data channel, and through the platform too: the WebRTC signalling server
+ends the lobby, and on Steam the lobby is marked closed in its data. A member that hears the host
+go before either message arrives still leaves, rather than taking the lobby over.
+
 ## When the Host Leaves
 
 In a migratable lobby, losing the host is a wait, not an ending:
