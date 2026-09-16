@@ -15,3 +15,28 @@ decoded indices off the wire.
 
 **Watch:** `docs/netcode.md` describes the pre-E1 relay, where the sender was whatever the
 envelope claimed. Rewrite its trust section from `docs/TRUST_MODEL.md`.
+
+## Host changes (E5)
+
+squiggles picks this up on its next `cargo update` (it tracks `master`, locked at `4880d0b`). Over
+WebRTC nothing migrates until the signalling server runs E5b. After that, a host that leaves or
+crashes no longer sends everyone to the menu: the lobby stays, and `track_lobby_loss`
+(`session/mod.rs:194`) never fires. The game's own session layer (`HostState`, `ClientState`,
+seats, `SessionControl`) still believes the old host exists, so step 8 is code in the game, not a
+deletion.
+
+| Where | Today | On a host change | Covered by |
+|---|---|---|---|
+| `session/mod.rs` (new system) | nothing reads `HostChanged` | on `HostChanged`: run `handle_leave`'s resets **without** writing `LeaveLobby` (despawn surfaces, reset `HostState`/`ClientState`/`Presences`), set `SessionInfo.is_host = promoted`, go to `AppState::Lobby` | `every_peer_is_told_who_the_host_became` |
+| `session/mod.rs:79` `SessionInfo.is_host` | set once when connecting (`:162`, `menu.rs`, `autostart.rs`) | rewrite it on `HostChanged`, or replace its readers with a live `With<Host>` query | `the_named_successor_becomes_the_host_and_everyone_else_follows` |
+| `session/mod.rs:213` `spawn_shared_surface_on_host` | fires on `Added<Lobby>` | also fire on `Added<Host>`: a promotion inserts `Host` on the lobby that already exists | `the_named_successor_becomes_the_host_and_everyone_else_follows` |
+| `net/host.rs:262` `host_seat_self`, `HostState.roster` | seats built as clients say hello | the promoted peer starts with an empty `HostState`; it seats itself at 0 and every follower's hello seats it again | `participant_entities_and_player_data_survive_a_host_change` |
+| `net/client.rs` hello | sent once per join | a follower sends it again once `AwaitingHost` is removed (that is when the new host verified it); anything sent before is dropped | `messages_sent_while_switching_hosts_are_dropped_not_delivered_late`, `a_message_sent_as_the_new_host_is_verified_reaches_it` |
+| `drawful/host.rs:45` `DrawfulHost` | prompts, lies, votes and the round timer exist only on the host | abandon the round: its secrets left with the old host (`drawful/mod.rs:7`). Leaving `AppState::Drawful` already runs `stop`/`exit` | — |
+| `session/lobby.rs:73`, `modes/infinite.rs:83`, `drawful/client.rs:213`, `:1038` | Start, mode, "Clear this area" and "End game"/"Leave" fixed from `is_host` on enter | rebuild the screen on `HostChanged`; returning to `AppState::Lobby` re-enters it | — |
+| `modes/infinite.rs:386` `sync_status` | "waiting for the host… (Ns)" from `PeerLastPong` | read `AwaitingHost { waited, successor }`: "the host left, waiting for a new one" or "reaching the new host" (`PeerLastPong` is removed during the change). `HostGone` now arrives only after about 90 s of waiting | `a_client_that_loses_its_host_keeps_its_lobby_and_waits` |
+| `drawful/client.rs:1085`, `modes/infinite.rs:143`, `session/lobby.rs:150` | a host's Leave writes `LeaveSession` → `LeaveLobby` | `LeaveLobby` by a host now hands the lobby to the earliest-joined player. Add "End game for everyone" writing `CloseLobby` where the host should end it for all | `a_closed_lobby_ends_for_everyone_and_does_not_migrate`, `a_closed_lobby_ends_for_everyone_and_nobody_takes_it_over` |
+| `testing/mod.rs:177` `rehost()`, `tests/session.rs:139` | models "host leaves, every lobby despawned" | keep it for the old path; add a test with `LoopbackNetwork::set_host_migration` and `migrate` that checks every survivor lands in `AppState::Lobby` with the same roster | `a_second_migration_works_like_the_first` |
+
+**Keep:** `track_lobby_loss`. It still ends the session when no new host is named, or the new host
+cannot be reached (`LobbyLeft { HostGone }`), and after `CloseLobby`.
