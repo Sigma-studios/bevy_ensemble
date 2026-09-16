@@ -1,9 +1,9 @@
 use bevy::prelude::*;
 use bevy_ensemble::{
-    BroadcastLobbyMessage, EnsembleAppExt, EnsemblePlugin, Host, LeaveLobby, Lobby,
-    LobbyBroadcastAppExt, LobbyBroadcastPlugin, LobbyClient, LobbyMessage, LobbyParticipant,
-    LobbyParticipantOf, LocalMultiplayerPlayerId, PendingLobby, ReceivedEnsembleMessage,
-    StartHosting,
+    AwaitingHost, BroadcastLobbyMessage, CloseLobby, EnsembleAppExt, EnsemblePlugin, Host,
+    HostChanged, LeaveLobby, Lobby, LobbyBroadcastAppExt, LobbyBroadcastPlugin, LobbyClient,
+    LobbyMessage, LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId, PendingLobby,
+    ReceivedEnsembleMessage, StartHosting,
 };
 use bevy_ensemble_steam::{BevyEnsembleSteamPlugin, LobbyClientSteamId, LobbySteamId};
 use bevy_immediate::{BevyImmediatePlugin, ImmCtx, ui::CapsUi};
@@ -39,6 +39,8 @@ impl Plugin for MinimalLobbyExamplePlugin {
                     receive_chat_messages,
                     receive_wave_actions,
                     handle_escape_key,
+                    handle_c_key,
+                    receive_host_changes,
                 ),
             );
     }
@@ -74,6 +76,7 @@ fn render_ui(
         With<LobbyClient>,
     >,
     client_lobby_ids: Query<&LobbySteamId, (With<Lobby>, Without<Host>)>,
+    awaiting: Query<&AwaitingHost>,
     chat_log: Res<ChatLog>,
 ) {
     let mut root = ctx.build_immediate_root("minimal_lobby");
@@ -127,11 +130,23 @@ fn render_ui(
         )
     };
 
+    // The host is gone and Steam has not named a new owner yet, or the new one is being reached.
+    let status = match awaiting.get(lobby_entity) {
+        Ok(awaiting) if awaiting.successor.is_none() => format!(
+            "Host left - waiting for Steam to name a new host ({:.0}s)\n\n",
+            awaiting.waited.as_secs_f64()
+        ),
+        Ok(awaiting) => format!(
+            "Host left - reaching the new host ({:.0}s)\n\n",
+            awaiting.waited.as_secs_f64()
+        ),
+        Err(_) => String::new(),
+    };
     let lobby_info_text = format!(
-        "Players:\n{}\n\nPress H to send hello (broadcast)\nPress Escape to exit the lobby\n{}",
+        "{status}Players:\n{}\n\nPress H to send hello (broadcast)\nPress Escape to exit the lobby\n{}",
         roster_text,
         if host_lobbies.get(lobby_entity).is_ok() {
-            "Press T to wave (host-only action)"
+            "Press T to wave (host-only action)\nPress C to close the lobby for everyone"
         } else {
             ""
         }
@@ -254,6 +269,50 @@ fn handle_escape_key(
     leave.write(LeaveLobby);
     commands.remove_resource::<LocalMultiplayerPlayerId>();
     chat_log.0.clear();
+}
+
+/// Ends the lobby for everyone rather than handing it to the next owner Steam picks.
+fn handle_c_key(
+    keyboard_input: Res<ButtonInput<KeyCode>>,
+    hosting: Query<(), (With<Lobby>, With<Host>)>,
+    mut close: MessageWriter<CloseLobby>,
+    mut chat_log: ResMut<ChatLog>,
+) {
+    if !keyboard_input.just_pressed(KeyCode::KeyC) || hosting.is_empty() {
+        return;
+    }
+    close.write(CloseLobby);
+    chat_log.0.clear();
+}
+
+/// The lobby is the same one under the owner Steam picked; the roster carries over.
+fn receive_host_changes(
+    steam_client: Res<SteamClient>,
+    mut changes: MessageReader<HostChanged>,
+    mut chat_log: ResMut<ChatLog>,
+) {
+    for change in changes.read() {
+        let name = |uuid: u128| {
+            u64::try_from(uuid)
+                .map(|raw| {
+                    steam_client
+                        .friends()
+                        .get_friend(SteamId::from_raw(raw))
+                        .name()
+                })
+                .unwrap_or_else(|_| uuid.to_string())
+        };
+        let text = if change.promoted {
+            format!("{} left; you host the lobby now", name(change.previous))
+        } else {
+            format!(
+                "{} left; {} hosts the lobby now",
+                name(change.previous),
+                name(change.new)
+            )
+        };
+        push_chat_message(&mut chat_log, "lobby", &text);
+    }
 }
 
 fn build_roster_text(

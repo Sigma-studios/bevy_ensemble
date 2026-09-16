@@ -8,8 +8,8 @@
 
 use bevy::prelude::*;
 use bevy_ensemble::{
-    Host, JoinLobby, LeaveLobby, Lobby, LobbyClient, LobbyLeft, LobbyLeftReason, PendingLobby,
-    PublicLobbies, PublicLobbyInfo, RefreshLobbies,
+    CloseLobby, Host, JoinLobby, LeaveLobby, Lobby, LobbyClient, LobbyLeft, LobbyLeftReason,
+    PendingLobby, PublicLobbies, PublicLobbyInfo, RefreshLobbies,
 };
 use bevy_steamworks::Client;
 
@@ -69,6 +69,24 @@ pub(crate) fn join_lobby(
 ) {
     for request in requests.read() {
         joins.write(JoinSteamLobby(crate::LobbyId::from_raw(request.0)));
+    }
+}
+
+/// A host closing its lobby marks it closed in the Steam lobby's data first, so a member that
+/// sees the host leave before the core's `LobbyClosed` arrives leaves too, rather than taking the
+/// lobby over. See [`CLOSED_LOBBY_KEY`](crate::CLOSED_LOBBY_KEY).
+pub(crate) fn close_lobby(
+    mut requests: MessageReader<CloseLobby>,
+    steam_client: Res<Client>,
+    hosted: Query<&LobbySteamId, (With<Lobby>, With<Host>)>,
+) {
+    if requests.read().next().is_none() {
+        return;
+    }
+    for lobby_id in hosted.iter() {
+        steam_client
+            .matchmaking()
+            .set_lobby_data(lobby_id.0, crate::CLOSED_LOBBY_KEY, "1");
     }
 }
 

@@ -1,9 +1,10 @@
 use bevy::prelude::*;
 use bevy_ensemble::{
-    EnsembleAppExt, EnsembleTransportAppExt, Host, HostUuid, Instant, Lobby, LobbyClient,
-    LobbyClientPlayerUuid, LobbyJoinFailed, LobbyLeft, LobbyLeftReason, LobbyParticipantOf,
-    LocalMultiplayerPlayerId, MessageAuthority, PendingLobby, RequestLobby, SerializedLobbyPacket,
-    decode_ensemble_packet, encode_ensemble_message,
+    AwaitingHost, EnsembleAppExt, EnsembleTransportAppExt, Host, HostLost, HostMigratable,
+    HostUuid, Instant, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyJoinFailed, LobbyLeft,
+    LobbyLeftReason, LobbyParticipantOf, LocalMultiplayerPlayerId, MessageAuthority, NewHostNamed,
+    ParticipantDeparted, PendingLobby, RequestLobby, SerializedLobbyPacket, decode_ensemble_packet,
+    encode_ensemble_message,
 };
 
 /// The `bevy-steamworks` this crate is built against.
@@ -43,15 +44,58 @@ pub struct LobbySteamId(pub LobbyId);
 #[derive(Component)]
 pub struct LobbyClientSteamId(pub SteamId);
 
-/// The owner of the Steam lobby at the moment this client joined it — the peer this client
-/// treats as its host for as long as the lobby entity lives.
+/// The peer this client treats as its host: the Steam lobby's owner when the client joined, and
+/// after that whoever Steam hands ownership to.
 ///
-/// Pinned rather than read back from `lobby_owner()` each time because Steam migrates lobby
-/// ownership when the owner leaves: after that, "the lobby owner" is some other member, and a
-/// client that kept trusting whoever Steam names would start taking host-only messages from a
-/// peer it never joined. If the pinned host goes, the lobby is torn down instead.
+/// Pinned rather than read back from `lobby_owner()` on every packet. Steam reassigns ownership
+/// when the owner leaves, and trust has to move in one step: [`follow_lobby_owner`] repins it and
+/// tells the core in the same frame, so the new host's packets are compared against the protocol
+/// before any of them is read, and the old host's are dropped from then on.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct LobbyHostSteamId(pub SteamId);
+
+/// How long a Steam lobby waits for a new owner, then for the new owner to be reached.
+///
+/// Steam hands ownership over as soon as an owner leaves the lobby. An owner that crashed or lost
+/// its connection is only dropped once Steam's servers notice, which takes tens of seconds, so the
+/// wait is a minute. Reaching the new owner opens a P2P session, as a join does.
+const STEAM_HOST_MIGRATION: HostMigratable = HostMigratable {
+    successor_within: std::time::Duration::from_secs(60),
+    reach_within: std::time::Duration::from_secs(20),
+};
+
+/// What a client should do about the lobby owner Steam names this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnerChange {
+    /// The owner is still the pinned host, or Steam names nobody.
+    None,
+    /// Steam made this peer the owner: it hosts now.
+    Promote,
+    /// Steam made another member the owner: follow it.
+    Follow(SteamId),
+}
+
+/// Compare the owner Steam names with the host this client pinned.
+///
+/// An owner of 0 means Steam's cache has no answer for the lobby right now (it is being left, or
+/// its data has not arrived), not that nobody owns it, so it changes nothing.
+fn owner_change(pinned: SteamId, owner: SteamId, local: SteamId) -> OwnerChange {
+    if owner.raw() == 0 || owner == pinned {
+        OwnerChange::None
+    } else if owner == local {
+        OwnerChange::Promote
+    } else {
+        OwnerChange::Follow(owner)
+    }
+}
+
+/// Whether a host was replaced: Steam names somebody else as the owner of the lobby it hosts.
+///
+/// It happens only when Steam dropped this peer's connection and handed the lobby to a member.
+/// The members follow the new owner, so this peer's session is over.
+fn replaced_as_host(owner: SteamId, local: SteamId) -> bool {
+    owner.raw() != 0 && owner != local
+}
 
 /// The Steam lobby this peer is in, readable from outside the ECS.
 ///
@@ -200,6 +244,11 @@ impl Plugin for BevyEnsembleSteamPlugin {
                 create_lobby,
                 join_requested_lobbies,
                 react_to_events,
+                follow_lobby_owner
+                    .after(react_to_events)
+                    // Leaving hands the Steam lobby to somebody else: read the owner before this
+                    // peer's own leave can look like it was replaced.
+                    .before(session::leave_lobby),
             ),
         )
         .add_systems(
@@ -228,6 +277,7 @@ impl Plugin for BevyEnsembleSteamPlugin {
                 session::publish_public_lobbies,
                 session::join_lobby,
                 session::leave_lobby,
+                session::close_lobby,
             ),
         )
         .add_observer(send_serialized_lobby_packet);
@@ -498,7 +548,6 @@ fn react_to_events(
     steam_client: Res<Client>,
     current_lobby: Res<CurrentSteamLobby>,
     mut events: MessageReader<SteamworksEvent>,
-    mut lobby_left: MessageWriter<LobbyLeft>,
     mut join_failed: MessageWriter<LobbyJoinFailed>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
     pending_host_lobbies: Query<Entity, (With<RequestLobby>, With<Host>)>,
@@ -517,6 +566,7 @@ fn react_to_events(
         Or<(With<LobbyClient>, With<PendingSteamLobbyClient>)>,
     >,
     mut pending_friend_lobbies: Option<ResMut<PendingSteamFriendLobbies>>,
+    migratable: Query<(), With<HostMigratable>>,
 ) {
     let local_steam_id = steam_client.user().steam_id();
 
@@ -545,7 +595,7 @@ fn react_to_events(
                         commands
                             .entity(entity)
                             .remove::<(PendingLobby, RequestLobby)>()
-                            .insert((Lobby, LobbySteamId(lobby.lobby)));
+                            .insert((Lobby, LobbySteamId(lobby.lobby), STEAM_HOST_MIGRATION));
                     }
                 }
                 CallbackResult::LobbyEnter(enter) => {
@@ -569,9 +619,11 @@ fn react_to_events(
                             )));
                             commands.insert_resource(HostUuid(u128::from(host.raw())));
                             current_lobby.set(Some(enter.lobby));
-                            commands
-                                .entity(entity)
-                                .insert((LobbySteamId(enter.lobby), LobbyHostSteamId(host)));
+                            commands.entity(entity).insert((
+                                LobbySteamId(enter.lobby),
+                                LobbyHostSteamId(host),
+                                STEAM_HOST_MIGRATION,
+                            ));
                         }
                         other => {
                             error!("Failed to enter lobby: {:?}", other);
@@ -629,34 +681,68 @@ fn react_to_events(
                                     tear_down_client_lobby(
                                         &mut commands,
                                         &steam_client,
-                                        &mut lobby_left,
-                                        &mut join_failed,
                                         lobby,
                                         reason,
                                     );
                                 }
-                            } else if host_lobby.is_some() {
-                                despawn_lobby_client_for_remote(
+                            } else if let Some(lobby) = host_lobby.as_deref().copied() {
+                                let connected = despawn_lobby_client_for_remote(
                                     &mut commands,
                                     &lobby_clients,
                                     update.user_changed,
                                 );
+                                // A connected seat's removal takes its participant with it. A
+                                // member this host inherited and never reached has no seat to
+                                // remove, but it may have a participant.
+                                if !connected {
+                                    let player_uuid = u128::from(update.user_changed.raw());
+                                    commands.entity(lobby).trigger(move |entity| {
+                                        ParticipantDeparted {
+                                            entity,
+                                            player_uuid,
+                                        }
+                                    });
+                                }
                             } else if let Some(lobby) =
                                 client_lobbies.iter().find(|(_, lobby_id, host, _)| {
                                     lobby_id.0 == update.lobby && host.0 == update.user_changed
                                 })
                             {
-                                // Steam will hand the lobby to another member; the session we
-                                // joined is over regardless, so leave rather than follow.
                                 info!("The host {:?} left the lobby", update.user_changed);
-                                tear_down_client_lobby(
-                                    &mut commands,
-                                    &steam_client,
-                                    &mut lobby_left,
-                                    &mut join_failed,
-                                    lobby,
-                                    LobbyLeftReason::HostGone,
-                                );
+                                let (entity, lobby_id, host, promoted) = lobby;
+                                if promoted
+                                    && migratable.contains(entity)
+                                    && !lobby_is_closed(&steam_client, lobby_id.0)
+                                {
+                                    // Steam is about to name a new owner, or already has, in which
+                                    // case `follow_lobby_owner` follows it this frame.
+                                    if steam_client.matchmaking().lobby_owner(lobby_id.0) == host.0
+                                    {
+                                        commands
+                                            .entity(entity)
+                                            .trigger(|entity| HostLost { entity });
+                                    }
+                                } else {
+                                    tear_down_client_lobby(
+                                        &mut commands,
+                                        &steam_client,
+                                        lobby,
+                                        LobbyLeftReason::HostGone,
+                                    );
+                                }
+                            } else if let Some((entity, _, _, _)) = client_lobbies
+                                .iter()
+                                .find(|(_, lobby_id, _, _)| lobby_id.0 == update.lobby)
+                            {
+                                // Another member. The core drops it from the roster only if no
+                                // host is there to do so.
+                                let player_uuid = u128::from(update.user_changed.raw());
+                                commands.entity(entity).trigger(move |entity| {
+                                    ParticipantDeparted {
+                                        entity,
+                                        player_uuid,
+                                    }
+                                });
                             }
                         }
                         ChatMemberStateChange::Entered => {
@@ -691,11 +777,25 @@ fn react_to_events(
                         // fails to open is retried by the handshake, not given up on.
                         .find(|(_, _, host, promoted)| *promoted && host.0 == remote)
                     {
+                        let (entity, lobby_id, _, _) = lobby;
+                        if migratable.contains(entity) {
+                            // The next send opens a new session. While the host is still in the
+                            // lobby it may answer on it, so the liveness check decides, and a
+                            // pong can still take it back. A host that left is lost.
+                            let still_member = steam_client
+                                .matchmaking()
+                                .lobby_members(lobby_id.0)
+                                .contains(&remote);
+                            if !still_member {
+                                commands
+                                    .entity(entity)
+                                    .trigger(|entity| HostLost { entity });
+                            }
+                            continue;
+                        }
                         tear_down_client_lobby(
                             &mut commands,
                             &steam_client,
-                            &mut lobby_left,
-                            &mut join_failed,
                             lobby,
                             LobbyLeftReason::HostGone,
                         );
@@ -708,6 +808,124 @@ fn react_to_events(
                 }
             },
         }
+    }
+}
+
+/// Follow Steam's choice of lobby owner.
+///
+/// Read from `lobby_owner()` every frame. It is a read of Steam's local cache, so it costs nothing,
+/// and it does not depend on the order in which Steam delivers the member-left and data-update
+/// callbacks. On a client whose pinned host is no longer the owner, this peer is promoted or
+/// follows the new owner. Either way the pin changes and `NewHostNamed` is triggered in the same
+/// frame, with Steam's member list. A host that Steam no longer names as owner was replaced, and
+/// its session ends.
+fn follow_lobby_owner(
+    mut commands: Commands,
+    steam_client: Res<Client>,
+    mut lobby_left: MessageWriter<LobbyLeft>,
+    client_lobbies: Query<
+        (
+            Entity,
+            &LobbySteamId,
+            &LobbyHostSteamId,
+            Option<&AwaitingHost>,
+            Has<Lobby>,
+        ),
+        (
+            Or<(With<Lobby>, With<PendingLobby>)>,
+            Without<Host>,
+            With<HostMigratable>,
+        ),
+    >,
+    host_lobbies: Query<(Entity, &LobbySteamId), (With<Lobby>, With<Host>, With<HostMigratable>)>,
+    lobby_clients: Query<
+        (
+            Entity,
+            &LobbyClientSteamId,
+            &LobbyClientPlayerUuid,
+            Option<&PendingSteamLobbyClient>,
+        ),
+        Or<(With<LobbyClient>, With<PendingSteamLobbyClient>)>,
+    >,
+) {
+    let local = steam_client.user().steam_id();
+    let matchmaking = steam_client.matchmaking();
+
+    for (entity, lobby_id, pinned, awaiting, promoted) in client_lobbies.iter() {
+        let owner = matchmaking.lobby_owner(lobby_id.0);
+        let change = owner_change(pinned.0, owner, local);
+        if change == OwnerChange::None {
+            continue;
+        }
+        if lobby_is_closed(&steam_client, lobby_id.0) {
+            info!("the host closed the lobby; leaving rather than following {owner:?}");
+            tear_down_client_lobby(
+                &mut commands,
+                &steam_client,
+                (entity, lobby_id, pinned, promoted),
+                LobbyLeftReason::HostGone,
+            );
+            continue;
+        }
+        let previous = pinned.0;
+        match awaiting {
+            Some(awaiting) => info!(
+                "Steam named {owner:?} owner in place of {previous:?}, {:.1}s after the host was \
+                 lost",
+                awaiting.waited.as_secs_f64()
+            ),
+            None => info!("Steam named {owner:?} owner in place of {previous:?}"),
+        }
+        let members: Vec<SteamId> = matchmaking
+            .lobby_members(lobby_id.0)
+            .into_iter()
+            .filter(|member| *member != previous)
+            .collect();
+        close_session(previous);
+        if change == OwnerChange::Promote {
+            // A host opens a seat for every member, as it does for each one that enters.
+            commands.entity(entity).remove::<LobbyHostSteamId>();
+            for member in members.iter().copied().filter(|member| *member != local) {
+                ensure_pending_lobby_client_for_remote(
+                    &mut commands,
+                    &lobby_clients,
+                    entity,
+                    member,
+                );
+            }
+        } else {
+            commands.entity(entity).insert(LobbyHostSteamId(owner));
+        }
+        let (previous, new_host) = (u128::from(previous.raw()), u128::from(owner.raw()));
+        let members: Vec<u128> = members
+            .iter()
+            .map(|member| u128::from(member.raw()))
+            .collect();
+        commands.entity(entity).trigger(move |entity| NewHostNamed {
+            entity,
+            previous,
+            new_host,
+            members: Some(members),
+        });
+    }
+
+    for (entity, lobby_id) in host_lobbies.iter() {
+        let owner = matchmaking.lobby_owner(lobby_id.0);
+        if !replaced_as_host(owner, local) {
+            continue;
+        }
+        warn!(
+            "Steam handed the lobby this peer hosts to {owner:?}: this peer's connection to Steam \
+             was lost, and the members follow the new owner; ending the session"
+        );
+        for (_, seat, _, _) in lobby_clients.iter() {
+            close_session(seat.0);
+        }
+        // The seats go with the lobby, after it, so none of them is told it was kicked.
+        commands.entity(entity).try_despawn();
+        lobby_left.write(LobbyLeft {
+            reason: LobbyLeftReason::SignallingLost,
+        });
     }
 }
 
@@ -808,12 +1026,20 @@ fn read_messages(world: &mut World, mut refused: Local<u64>) {
 // Retries every 500ms because the peer's `PendingLobby` / `PendingSteamLobbyClient`
 // entity may not exist yet when the first handshake arrives. Messages are sent
 // reliably so loss isn't the concern — only the entity-readiness race.
+//
+// Sent while joining, and again while following a new host: the new host seats this peer
+// when this handshake arrives, as it does for a joiner.
 fn send_client_handshakes(
     steam_client: Res<Client>,
     registry: Res<bevy_ensemble::EnsembleMessageRegistry>,
-    pending_client_lobbies: Query<
-        (&LobbySteamId, Option<&LobbyHostSteamId>),
-        (With<PendingLobby>, Without<Lobby>, Without<Host>),
+    client_lobbies: Query<
+        (
+            &LobbySteamId,
+            Option<&LobbyHostSteamId>,
+            Has<Lobby>,
+            Option<&AwaitingHost>,
+        ),
+        (Or<(With<PendingLobby>, With<Lobby>)>, Without<Host>),
     >,
     time: Res<Time>,
     mut cooldown: Local<f32>,
@@ -825,7 +1051,11 @@ fn send_client_handshakes(
     *cooldown = 0.5;
 
     let packet = encode_ensemble_message(&registry, &SteamReadyHandshake { from_host: false });
-    for (lobby_id, pinned_host) in pending_client_lobbies.iter() {
+    for (lobby_id, pinned_host, promoted, awaiting) in client_lobbies.iter() {
+        let reaching_new_host = awaiting.is_some_and(|awaiting| awaiting.successor.is_some());
+        if promoted && !reaching_new_host {
+            continue;
+        }
         let host = host_of(&steam_client, lobby_id.0, pinned_host);
         send_message(&steam_client, host, &packet, SendFlags::RELIABLE);
     }
@@ -1000,6 +1230,8 @@ fn ensure_pending_lobby_client_for_remote(
     ));
 }
 
+/// Despawn `remote`'s seat, and say whether it was a connected one: a `LobbyClient`, whose removal
+/// takes its participant with it, rather than a seat still waiting for its first handshake.
 fn despawn_lobby_client_for_remote(
     commands: &mut Commands,
     lobby_clients: &Query<
@@ -1012,13 +1244,15 @@ fn despawn_lobby_client_for_remote(
         Or<(With<LobbyClient>, With<PendingSteamLobbyClient>)>,
     >,
     remote: SteamId,
-) {
-    if let Some((client_entity, _, _, _)) = lobby_clients
+) -> bool {
+    let Some((client_entity, _, _, pending)) = lobby_clients
         .iter()
         .find(|(_, client_steam_id, _, _)| client_steam_id.0 == remote)
-    {
-        commands.entity(client_entity).try_despawn();
-    }
+    else {
+        return false;
+    };
+    commands.entity(client_entity).try_despawn();
+    pending.is_none()
 }
 
 /// Tear down a client-side lobby this peer did not choose to leave, and say why.
@@ -1026,30 +1260,52 @@ fn despawn_lobby_client_for_remote(
 /// Sessions first, then the Steam lobby, then the entity — the same order as
 /// [`session::leave_lobby`], for the same reason. A promoted lobby ends with a [`LobbyLeft`];
 /// one still pending never opened, so it ends with a [`LobbyJoinFailed`] instead.
+///
+/// The entity goes, and the reason is written, when the command is applied: the core can end the
+/// same session in the same frame (the host's `LobbyClosed` arriving with Steam's word that the
+/// host left), and only whichever is applied first says so.
 fn tear_down_client_lobby(
     commands: &mut Commands,
     steam_client: &Client,
-    lobby_left: &mut MessageWriter<LobbyLeft>,
-    join_failed: &mut MessageWriter<LobbyJoinFailed>,
     (entity, lobby_id, host, promoted): (Entity, &LobbySteamId, &LobbyHostSteamId, bool),
     reason: LobbyLeftReason,
 ) {
     close_session(host.0);
     steam_client.matchmaking().leave_lobby(lobby_id.0);
-    commands.entity(entity).try_despawn();
 
-    if promoted {
-        lobby_left.write(LobbyLeft { reason });
-    } else {
-        let reason = match reason {
-            LobbyLeftReason::Kicked => "the host removed this player before the session opened",
-            LobbyLeftReason::HostGone => "the host left before the session opened",
-            _ => "the lobby closed before the session opened",
+    commands.queue(move |world: &mut World| {
+        let Ok(lobby) = world.get_entity_mut(entity) else {
+            return;
         };
-        join_failed.write(LobbyJoinFailed {
-            reason: reason.to_owned(),
-        });
-    }
+        lobby.despawn();
+        if promoted {
+            world.write_message(LobbyLeft { reason });
+        } else {
+            let reason = match reason {
+                LobbyLeftReason::Kicked => "the host removed this player before the session opened",
+                LobbyLeftReason::HostGone => "the host left before the session opened",
+                _ => "the lobby closed before the session opened",
+            };
+            world.write_message(LobbyJoinFailed {
+                reason: reason.to_owned(),
+            });
+        }
+    });
+}
+
+/// Lobby data a host sets when it closes its lobby, so members know not to take it over.
+///
+/// The core tells members over P2P too, but the host closes its sessions and leaves the Steam lobby
+/// one frame later, which can drop the message; Steam then hands the lobby to a member. Lobby data
+/// goes through Steam's servers ahead of the host's departure, so a member that sees the host go
+/// can check it first.
+pub(crate) const CLOSED_LOBBY_KEY: &str = "bevy_ensemble_closed";
+
+fn lobby_is_closed(steam_client: &Client, lobby: LobbyId) -> bool {
+    steam_client
+        .matchmaking()
+        .lobby_data(lobby, CLOSED_LOBBY_KEY)
+        .is_some()
 }
 
 /// A lobby entity is going: whoever despawned it — this crate, the core's kick path, the game —
@@ -1066,9 +1322,14 @@ fn forget_lobby(
     mut commands: Commands,
     steam_client: Res<Client>,
     current_lobby: Res<CurrentSteamLobby>,
-    lobbies: Query<&LobbySteamId>,
+    lobbies: Query<(&LobbySteamId, Option<&LobbyHostSteamId>)>,
 ) {
-    if let Ok(lobby_id) = lobbies.get(trigger.event_target()) {
+    if let Ok((lobby_id, host)) = lobbies.get(trigger.event_target()) {
+        // The core's teardowns -- a host that never came back, a closed lobby -- leave the session
+        // with the host open otherwise, until Steam times it out.
+        if let Some(host) = host {
+            close_session(host.0);
+        }
         steam_client.matchmaking().leave_lobby(lobby_id.0);
         if current_lobby.get() == Some(lobby_id.0) {
             current_lobby.set(None);
@@ -1116,6 +1377,57 @@ mod tests {
             !accept_packet(PeerRole::Client, None, &members, id(1)),
             "a client that does not know its host yet trusts nobody"
         );
+    }
+
+    #[test]
+    fn an_unchanged_owner_is_not_a_migration() {
+        assert_eq!(owner_change(id(1), id(1), id(2)), OwnerChange::None);
+    }
+
+    #[test]
+    fn an_owner_of_zero_names_nobody() {
+        assert_eq!(owner_change(id(1), id(0), id(2)), OwnerChange::None);
+        assert!(
+            !replaced_as_host(id(0), id(2)),
+            "a host whose lobby Steam has no owner for is not replaced by nobody"
+        );
+    }
+
+    #[test]
+    fn this_peer_named_owner_promotes() {
+        assert_eq!(owner_change(id(1), id(2), id(2)), OwnerChange::Promote);
+    }
+
+    #[test]
+    fn another_member_named_owner_is_followed() {
+        assert_eq!(
+            owner_change(id(1), id(3), id(2)),
+            OwnerChange::Follow(id(3))
+        );
+    }
+
+    #[test]
+    fn after_repinning_only_the_new_owner_is_decoded() {
+        let members = [id(2), id(3)];
+        let OwnerChange::Follow(new_owner) = owner_change(id(1), id(3), id(2)) else {
+            panic!("another member named owner is followed");
+        };
+        assert!(accept_packet(
+            PeerRole::Client,
+            Some(new_owner),
+            &members,
+            id(3)
+        ));
+        assert!(
+            !accept_packet(PeerRole::Client, Some(new_owner), &members, id(1)),
+            "the old host's packets are dropped once the pin moves"
+        );
+    }
+
+    #[test]
+    fn a_host_steam_names_someone_else_owner_of_was_replaced() {
+        assert!(replaced_as_host(id(3), id(2)));
+        assert!(!replaced_as_host(id(2), id(2)));
     }
 
     #[test]

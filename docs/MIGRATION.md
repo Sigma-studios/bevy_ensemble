@@ -4,6 +4,44 @@ One section per phase of the netcode overhaul, in the order they landed. Each na
 what to change in a consumer, and why. Both peers of a session must be built from the same
 commit; the join handshake enforces it from phase E2 onward.
 
+## E5e — a Steam lobby outlives its host
+
+The Steam backend turns E5c on. Every lobby it creates or enters is migratable, and Steam's lobby
+owner is the arbiter. Nothing on the data channels changed.
+
+### What the backend does
+
+- Inserts `HostMigratable { successor_within: 60 s, reach_within: 20 s }` on `LobbyCreated` and
+  on a successful `LobbyEnter`. Steam hands ownership over at once when an owner leaves. An owner
+  that crashed is only dropped once Steam's servers notice, which takes tens of seconds.
+- `LobbyHostSteamId` is no longer pinned for life. A new system, `follow_lobby_owner`, reads
+  `lobby_owner()` every frame. When the owner is no longer the pinned host, this peer is promoted
+  (it opens a seat for every member) or it repins the new owner. Either way it closes the session
+  with the old host and triggers `NewHostNamed` with Steam's member list in the same frame.
+- The pinned host leaving the Steam lobby triggers `HostLost` instead of a teardown. A failed P2P
+  session with a host that is still in the lobby is left to the ping liveness check, which a pong
+  can still undo. A pending join still fails at once.
+- A host that Steam no longer names as owner was dropped from Steam and replaced. Its lobby ends
+  with `LobbyLeft { SignallingLost }`, and no seat is told it was kicked.
+- A member that leaves while there is no host to say so, or that a new host never reached, triggers
+  `ParticipantDeparted`.
+- A client restates its ready handshake while it reaches a new host, as it does while joining,
+  because that handshake is what makes the new host seat it.
+- `CloseLobby` also sets the `bevy_ensemble_closed` lobby data. A member that sees the host leave
+  before `LobbyClosed` arrives checks that marker and leaves too, instead of taking over.
+
+### Fixed: `LobbyLeft` once when a lobby ends two ways at once
+
+A client's Steam teardown now despawns the lobby, and writes `LobbyLeft` or `LobbyJoinFailed`,
+only if the lobby still exists when the command is applied. The core's `LobbyClosed` and Steam's
+notice that the host left can no longer both report it. A lobby the core ends also closes the
+session with its host.
+
+**What to change** Everything in E5c's list now applies to a game on Steam. Stop treating an empty
+`(Lobby, Without<Host>)` query as the end of the session. Read `HostChanged` and show
+`AwaitingHost`. Use `CloseLobby` to end a game for everyone: `LeaveLobby` by a host hands the lobby
+to whoever Steam picks. `examples/minimal_lobby.rs` shows all of these.
+
 ## E5d — a WebRTC lobby outlives its host
 
 The WebRTC backend turns E5c on. Against a server with E5b, every lobby it creates or joins is
