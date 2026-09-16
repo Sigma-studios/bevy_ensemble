@@ -582,7 +582,7 @@ fn a_pending_joiner_named_a_new_host_joins_it_instead() {
 #[test]
 fn a_message_sent_as_the_new_host_is_verified_reaches_it() {
     let (mut net, peers) = session(2, true);
-    let (a, b) = (peers[1], peers[2]);
+    let a = peers[1];
     net.migrate(a);
     net.run(20);
     let from_b: Vec<_> = heard_all(&net, a)
