@@ -240,13 +240,14 @@ pub(crate) fn verify_protocol(
                     }
                 }
             } else if let Some((lobby, awaiting)) = client_lobby.as_deref().copied() {
-                commands
-                    .entity(lobby)
-                    .try_insert((HandshakeVerified, VerifiedHost(sender)));
                 // Following a new host: this is the moment it is reached. It announced first,
                 // because it was the one that made a seat; it has not heard this peer's protocol,
                 // and at a join the client's own announcement went out when its lobby appeared,
                 // which this lobby did long ago. So it is answered here.
+                //
+                // Before the marker goes on, in command order: whatever reacts to the marker
+                // being added sends at once, and a lobby still waiting on its host drops what it
+                // sends.
                 if awaiting.is_some_and(|awaiting| awaiting.successor == Some(sender)) {
                     info!("reached the new host {sender:#x}; the session goes on");
                     let answer = ours.clone();
@@ -260,6 +261,9 @@ pub(crate) fn verify_protocol(
                             send_mode: SendMode::Reliable,
                         });
                 }
+                commands
+                    .entity(lobby)
+                    .try_insert((HandshakeVerified, VerifiedHost(sender)));
             } else {
                 matched.0.insert(sender);
             }
