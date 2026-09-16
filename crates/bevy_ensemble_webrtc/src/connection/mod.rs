@@ -124,5 +124,11 @@ pub(crate) fn dispatch_server_message(
         ServerMessage::Disconnected { reason } => {
             let _ = lobby_event_tx.send(LobbyEvent::Disconnected { reason });
         }
+        // Sent only to a client that declared `CAPABILITY_HOST_MIGRATION`, which this one does
+        // not yet: a server that sends one anyway is misbehaving, and the host leaving still ends
+        // the session through the data channel closing.
+        ServerMessage::LobbyMigratable { .. } | ServerMessage::HostChanged { .. } => {
+            warn!("ignoring a host-migration message this client never declared it understands");
+        }
     }
 }

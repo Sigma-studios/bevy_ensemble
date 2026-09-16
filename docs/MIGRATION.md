@@ -4,6 +4,35 @@ One section per phase of the netcode overhaul, in the order they landed. Each na
 what to change in a consumer, and why. Both peers of a session must be built from the same
 commit; the join handshake enforces it from phase E2 onward.
 
+## E5b — the signalling server can hand a lobby over
+
+Nothing changes for any client yet: no released client declares the capability this adds, and
+without it the server behaves exactly as before. Deploy the server before the clients that do.
+
+### Appended to the protocol
+
+`ClientMessage::DeclareCapabilities { capabilities }` (sent after `Authenticate`) and
+`ClientMessage::CloseLobby`; `ServerMessage::LobbyMigratable { lobby_id, idle_timeout_secs }` and
+`ServerMessage::HostChanged { lobby_id, previous_host, new_host, code, members }`;
+`CAPABILITY_HOST_MIGRATION`. All appended, so every existing variant keeps its bytes
+(`tests/protocol_compat.rs`).
+
+### What the server does with them
+
+A lobby whose host declared `CAPABILITY_HOST_MIGRATION` is migratable, and its creator and every
+declaring joiner are sent `LobbyMigratable` after `LobbyCreated` / `LobbyJoined`. When its host
+leaves — on request, or because the connection closed or went idle — the earliest-joined member
+that declared the capability becomes the host under the same id and code, the listing shows its
+name, and every remaining member is sent `HostChanged` with the members in join order. Members that
+did not declare it get `Disconnected`, as they always did. `CloseLobby` from the host ends the
+lobby for everyone without handing it over, migratable or not; from anyone else it is ignored.
+
+Every message about a lobby's membership is now queued while the lobby is held, so a joiner racing
+a host change always learns it joined, then that the lobby is migratable, then who the host became.
+
+**What to change** In a custom client, nothing until you declare the capability; after that, handle
+both new server messages. `LobbyJoined.existing_members` is now in join order.
+
 ## E5a — a host that leaves kicks nobody
 
 Nothing on the wire changed. Groundwork for host migration: every fix here is to something that
