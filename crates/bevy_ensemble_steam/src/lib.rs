@@ -139,6 +139,23 @@ fn request_lobby_data(lobby_id: LobbyId) -> bool {
     }
 }
 
+/// Close this peer's messaging session with `user`.
+///
+/// Every packet goes out through `ISteamNetworkingMessages`, which opens a session with its
+/// recipient on the first send. Sessions used to be closed with `close_p2p_session`, which is the
+/// older `ISteamNetworking` API and has no hold on those: nothing was ever closed, and Steam kept
+/// each session until its own idle timeout. The safe wrapper has no close for the messages
+/// interface, so this is raw FFI, like [`request_lobby_data`].
+pub(crate) fn close_session(user: SteamId) -> bool {
+    unsafe {
+        let mut identity: steamworks_sys::SteamNetworkingIdentity = std::mem::zeroed();
+        steamworks_sys::SteamAPI_SteamNetworkingIdentity_Clear(&mut identity);
+        steamworks_sys::SteamAPI_SteamNetworkingIdentity_SetSteamID64(&mut identity, user.raw());
+        let messages = steamworks_sys::SteamAPI_SteamNetworkingMessages_SteamAPI_v002();
+        steamworks_sys::SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser(messages, &identity)
+    }
+}
+
 #[derive(Message, Clone, Copy, Debug)]
 pub struct JoinSteamLobby(pub LobbyId);
 
@@ -1017,7 +1034,7 @@ fn tear_down_client_lobby(
     (entity, lobby_id, host, promoted): (Entity, &LobbySteamId, &LobbyHostSteamId, bool),
     reason: LobbyLeftReason,
 ) {
-    steam_client.networking().close_p2p_session(host.0);
+    close_session(host.0);
     steam_client.matchmaking().leave_lobby(lobby_id.0);
     commands.entity(entity).try_despawn();
 
@@ -1038,13 +1055,21 @@ fn tear_down_client_lobby(
 /// A lobby entity is going: whoever despawned it — this crate, the core's kick path, the game —
 /// the host it named is no longer this peer's host, and the session-request callback must stop
 /// admitting its members.
+///
+/// And this peer leaves the Steam lobby, whoever despawned it. The paths in this crate leave on
+/// their own, but the core's do not know Steam exists: a client the core removed — kicked, timed
+/// out on pings, refused on protocol — used to stay a member of the Steam lobby, still listed to
+/// everyone, still admitted by their session callbacks, and a member Steam could hand the lobby
+/// to. Leaving twice is harmless.
 fn forget_lobby(
     trigger: On<Remove, LobbySteamId>,
     mut commands: Commands,
+    steam_client: Res<Client>,
     current_lobby: Res<CurrentSteamLobby>,
     lobbies: Query<&LobbySteamId>,
 ) {
     if let Ok(lobby_id) = lobbies.get(trigger.event_target()) {
+        steam_client.matchmaking().leave_lobby(lobby_id.0);
         if current_lobby.get() == Some(lobby_id.0) {
             current_lobby.set(None);
         }

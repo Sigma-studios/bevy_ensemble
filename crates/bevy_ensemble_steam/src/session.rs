@@ -15,7 +15,7 @@ use bevy_steamworks::Client;
 
 use crate::{
     JoinSteamLobby, LobbyClientSteamId, LobbyHostSteamId, LobbySteamId, MAX_LOBBY_PLAYERS,
-    SteamFriendLobbies, host_of,
+    SteamFriendLobbies, close_session, host_of,
 };
 
 /// Discovery restarts by dropping the cached list: `populate_friend_lobbies` refills it the
@@ -88,7 +88,7 @@ pub(crate) fn leave_lobby(
         (With<Lobby>, Without<Host>),
     >,
     pending_lobbies: Query<(Entity, Option<&LobbySteamId>), With<PendingLobby>>,
-    lobby_clients: Query<(Entity, &LobbyClientSteamId), With<LobbyClient>>,
+    lobby_clients: Query<&LobbyClientSteamId, With<LobbyClient>>,
 ) {
     if requests.read().next().is_none() {
         return;
@@ -106,20 +106,20 @@ pub(crate) fn leave_lobby(
     let mut left = false;
 
     if let Some((host_entity, lobby_id)) = host_lobbies.iter().next() {
-        for (client_entity, client_steam_id) in lobby_clients.iter() {
-            steam_client
-                .networking()
-                .close_p2p_session(client_steam_id.0);
-            commands.entity(client_entity).try_despawn();
+        for client_steam_id in lobby_clients.iter() {
+            close_session(client_steam_id.0);
         }
         steam_client.matchmaking().leave_lobby(lobby_id.0);
+        // The seats are not despawned here: they go with the lobby, which despawns them after
+        // itself. A seat removed while its lobby still stands is a player removed from a session
+        // that goes on, and is told so; these players are not being removed, the host is leaving.
         commands.entity(host_entity).try_despawn();
         left = true;
     }
 
     if let Some((client_entity, lobby_id, pinned_host)) = client_lobbies.iter().next() {
         let host = host_of(&steam_client, lobby_id.0, pinned_host);
-        steam_client.networking().close_p2p_session(host);
+        close_session(host);
         steam_client.matchmaking().leave_lobby(lobby_id.0);
         commands.entity(client_entity).try_despawn();
         left = true;
