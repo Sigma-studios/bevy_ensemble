@@ -232,10 +232,8 @@ fn update_roster(
             }
 
             if is_host && !participant_is_host {
-                if let Some((_, rtt)) = lobby_clients.iter().find(|(id, _)| id.0 == *uuid) {
-                    if let Some(rtt) = rtt {
-                        line.push_str(&format!(" - {:.0}ms", rtt.0 * 1000.0));
-                    }
+                if let Some((_, Some(rtt))) = lobby_clients.iter().find(|(id, _)| id.0 == *uuid) {
+                    line.push_str(&format!(" - {:.0}ms", rtt.0 * 1000.0));
                 }
             } else if !is_host && *participant_is_host {
                 if let Ok(Some(rtt)) = lobby_rtt.get(lobby_entity) {
