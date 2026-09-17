@@ -992,6 +992,8 @@ dependencies = [
  "bevy",
  "postcard",
  "serde",
+ "serde_json",
+ "web-sys",
  "web-time",
 ]
 

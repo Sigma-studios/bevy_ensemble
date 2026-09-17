@@ -17,13 +17,25 @@ postcard = { version = "1", features = ["alloc"] }
 # `Instant` that works on wasm too, for stamping packets at the socket seam.
 web-time = "1"
 serde = { version = "1", features = ["derive"] }
+# JSON rather than postcard for `persistence`, so a stored value is readable in the browser's
+# storage inspector — which is where a bug report about a wrong name is actually answered.
+serde_json = { version = "1", optional = true }
+
+# The page's local storage, for `persistence`. Web only: off the web there is no page, and the
+# module's other half does nothing.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["Window", "Storage"] }
 
 # Both network features are on by default (release included) so the tooling is
 # always available at runtime. Nothing runs until the game opts in by adding the
 # relevant plugin — the compiled-in code is inert without it. Strip it entirely
 # with `default-features = false` (e.g. for a minimal shipping build).
 [features]
-default = ["netmetrics", "netdebug"]
+default = ["netmetrics", "netdebug", "persistence"]
+
+# Keep a resource across sessions — on the web, in the page's local storage. Inert until the game
+# adds `PersistedResourcePlugin`, like the two below.
+persistence = ["dep:serde_json"]
 
 # Lightweight network counters (bytes/packets in & out, sampled rates).
 # A handful of integer adds at the packet boundary once `NetMetricsPlugin` is added.

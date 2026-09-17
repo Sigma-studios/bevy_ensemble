@@ -69,6 +69,10 @@ pub use crate::{
     TransportBackend,
 };
 
+// Keeping a resource across sessions (feature `persistence`).
+#[cfg(feature = "persistence")]
+pub use crate::PersistedResourcePlugin;
+
 // Network metrics (feature `netmetrics`).
 #[cfg(feature = "netmetrics")]
 pub use crate::{NetMetrics, NetMetricsPlugin};
