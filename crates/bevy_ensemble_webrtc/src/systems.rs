@@ -751,30 +751,79 @@ fn liveness_entity(
 ///
 /// The entity mapping is the same in both: a host carries one `LobbyClient` per peer, a client
 /// carries the lobby itself.
+///
+/// # Why this reconciles rather than applies the report
+///
+/// [`EnsembleSocket::update_routes`] reports a route *once per change*, which is right for a fact
+/// that is settled when ICE nominates a pair and never normally changes again. It is also the
+/// whole difficulty: the report arrives when the data channel opens, and on a client that is
+/// strictly **before** the lobby it belongs on exists. A joiner is still holding a `PendingLobby`
+/// at that moment — promotion to `Lobby` rides the host handshake, which travels over the very
+/// channel whose opening produced the report. Applied straight, the one report this session will
+/// ever make is written to nothing, and the overlay says `route: pending` until the peer leaves.
+///
+/// So the drain is kept only for the line in the log, and the components are reconciled from the
+/// socket's own record of what it has settled on. That is idempotent, costs one comparison per
+/// peer per frame, and lands the moment there is an entity to land on — whenever that is.
+///
+/// [`EnsembleSocket::update_routes`]: bevy_ensemble_sockets::EnsembleSocket::update_routes
 pub(crate) fn poll_peer_routes(
     mut commands: Commands,
     mut socket: ResMut<crate::EnsembleSocketRes>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
-    client_lobbies: Query<Entity, (With<Lobby>, Without<Host>)>,
-    lobby_clients: Query<(Entity, &LobbyClientWebrtcUuid), With<LobbyClient>>,
+    client_lobbies: Query<
+        (Entity, Option<&PeerRoute>),
+        (Or<(With<Lobby>, With<PendingLobby>)>, Without<Host>),
+    >,
+    lobby_clients: Query<
+        (Entity, &LobbyClientWebrtcUuid, Option<&PeerRoute>),
+        Or<(With<LobbyClient>, With<PendingWebrtcLobbyClient>)>,
+    >,
 ) {
+    // Said once, when it changes: a relayed session is worth a line, and a line a frame is not.
     for (peer_id, route) in socket.update_routes() {
-        let route = match route {
-            bevy_ensemble_sockets::PeerRoute::Direct => PeerRoute::Direct,
-            bevy_ensemble_sockets::PeerRoute::Relayed => PeerRoute::Relayed,
-        };
-        if route == PeerRoute::Relayed {
+        if matches!(route, bevy_ensemble_sockets::PeerRoute::Relayed) {
             info!("peer {peer_id:#x} is connected through the relay, not directly");
         }
+    }
 
-        if host_lobby.is_some() {
-            if let Some((entity, _)) = lobby_clients.iter().find(|(_, uuid)| uuid.0 == peer_id) {
-                commands.entity(entity).try_insert(route);
+    // Collected first: `route` borrows the socket, and `update_routes` above needed it mutably.
+    let peers: Vec<u128> = socket.connected_peers().collect();
+    let routes: Vec<(u128, PeerRoute)> = peers
+        .iter()
+        .filter_map(|peer| {
+            socket.route(*peer).map(|route| {
+                let route = match route {
+                    bevy_ensemble_sockets::PeerRoute::Direct => PeerRoute::Direct,
+                    bevy_ensemble_sockets::PeerRoute::Relayed => PeerRoute::Relayed,
+                };
+                (*peer, route)
+            })
+        })
+        .collect();
+    if routes.is_empty() {
+        return;
+    }
+
+    if host_lobby.is_some() {
+        for (entity, uuid, current) in lobby_clients.iter() {
+            let Some((_, route)) = routes.iter().find(|(peer, _)| *peer == uuid.0) else {
+                continue;
+            };
+            if current != Some(route) {
+                commands.entity(entity).try_insert(*route);
             }
-            continue;
         }
-        for entity in client_lobbies.iter() {
-            commands.entity(entity).try_insert(route);
+        return;
+    }
+
+    // A client has one connection that matters, the one to its host.
+    let Some((_, route)) = routes.first() else {
+        return;
+    };
+    for (entity, current) in client_lobbies.iter() {
+        if current != Some(route) {
+            commands.entity(entity).try_insert(*route);
         }
     }
 }
