@@ -97,6 +97,8 @@ mod netmetrics;
 pub mod netsim;
 pub(crate) mod observers;
 pub mod outbound;
+#[cfg(feature = "persistence")]
+pub mod persistence;
 mod ping;
 mod player_data;
 pub mod prelude;
@@ -124,6 +126,8 @@ pub use netmetrics::{NetMetrics, NetMetricsPlugin};
 #[cfg(feature = "netdebug")]
 pub use netsim::{ChannelModel, NetPreset, NetSim, NetSimClock, NetSimConfig, NetSimPlugin};
 pub use outbound::{MAX_DATAGRAM_BYTES, OutboundBatches, UNRELIABLE_ADVISORY_BYTES};
+#[cfg(feature = "persistence")]
+pub use persistence::PersistedResourcePlugin;
 pub use ping::{
     EnsemblePing, EnsemblePong, LivenessGrace, PeerLastPong, PeerReliableRtt, PeerRtt,
     PeerRttJitter, PeerTimeout, PeerWireRtt,
