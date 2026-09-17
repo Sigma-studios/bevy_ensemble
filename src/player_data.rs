@@ -113,6 +113,89 @@ impl<T: EnsembleMessage> Default for PlayerDataPlugin<T> {
     }
 }
 
+impl<T: EnsembleMessage + Default> PlayerDataPlugin<T> {
+    /// Keep the local player's own copy across sessions, and publish it whenever a lobby appears.
+    ///
+    /// `key` is the storage key, shared with everything else on the origin, so prefix it with
+    /// something that belongs to the game (`"mygame.profile"`).
+    ///
+    /// The `Default` bound is why this is a separate constructor rather than a field: a game that
+    /// only wants the synchronised half should not have to invent a default for its data.
+    pub fn persisted(self, key: &'static str) -> PersistedPlayerDataPlugin<T> {
+        PersistedPlayerDataPlugin {
+            key,
+            marker: PhantomData,
+        }
+    }
+}
+
+/// The local player's own `T`, whether or not there is a lobby to put it in.
+///
+/// [`PlayerData<T>`] is the synchronised half: a component on a participant entity, owned by the
+/// host, and it exists only *inside* a lobby. That is no use to a menu, which has to show you your
+/// own name and colours **before** you host or join anything — at that moment there is no lobby,
+/// no participant and no component. So the local copy lives here, in a resource, and the lobby is
+/// something it is published *into* rather than the place it is kept.
+///
+/// Edit it directly. [`PersistedPlayerDataPlugin`] writes it out when it changes and publishes it
+/// with [`SetPlayerData`] whenever a lobby turns up, so a game never writes that wiring again.
+#[derive(Resource, Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LocalPlayerData<T>(pub T);
+
+/// [`PlayerDataPlugin`] plus the local copy: kept across sessions, published on every lobby.
+///
+/// Built with [`PlayerDataPlugin::persisted`].
+pub struct PersistedPlayerDataPlugin<T: EnsembleMessage> {
+    key: &'static str,
+    marker: PhantomData<T>,
+}
+
+impl<T: EnsembleMessage + Default> Plugin for PersistedPlayerDataPlugin<T> {
+    fn build(&self, app: &mut App) {
+        app.add_plugins(PlayerDataPlugin::<T>::default())
+            .add_systems(Update, publish_local_player_data::<T>);
+
+        #[cfg(feature = "persistence")]
+        app.add_plugins(crate::persistence::PersistedResourcePlugin::<
+            LocalPlayerData<T>,
+        >::new(self.key));
+        #[cfg(not(feature = "persistence"))]
+        {
+            let _ = self.key;
+            app.init_resource::<LocalPlayerData<T>>();
+        }
+    }
+}
+
+/// Put the local copy into whatever lobby this peer is in, and into the next one too.
+///
+/// Two things make it fire: the data changing, and the *lobby* changing. The second is the one
+/// worth spelling out — a value published into a lobby that has since gone is not published into
+/// the next one, so without it a player who left and joined again arrived wearing a default. It
+/// is deduplicated on which lobby was last written to rather than on the value, because
+/// [`EnsembleMessage`] does not require `PartialEq` and a per-frame clone-and-compare would be a
+/// worse trade than one entity comparison.
+fn publish_local_player_data<T: EnsembleMessage>(
+    mut commands: Commands,
+    data: Res<LocalPlayerData<T>>,
+    lobbies: Query<Entity, With<Lobby>>,
+    mut published_into: Local<Option<Entity>>,
+) {
+    let Ok(lobby) = lobbies.single() else {
+        // No lobby to be in. The next one is a new one, whatever it turns out to be.
+        *published_into = None;
+        return;
+    };
+    if *published_into == Some(lobby) && !data.is_changed() {
+        return;
+    }
+    *published_into = Some(lobby);
+    let value = data.0.clone();
+    commands
+        .entity(lobby)
+        .trigger(move |entity| SetPlayerData::new(entity, value));
+}
+
 impl<T: EnsembleMessage> Plugin for PlayerDataPlugin<T> {
     fn build(&self, app: &mut App) {
         app.init_resource::<PendingPlayerData<T>>()
