@@ -37,6 +37,8 @@ pub use crate::{
 
     // Identity
     LocalMultiplayerPlayerId,
+    // Player data
+    LocalPlayerData,
     // Ping
     PeerLastPong,
     PeerRoute,
@@ -46,7 +48,7 @@ pub use crate::{
 
     PendingLobby,
 
-    // Player data
+    PersistedPlayerDataPlugin,
     PlayerData,
     PlayerDataPlugin,
     // Ownership

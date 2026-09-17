@@ -132,7 +132,10 @@ pub use ping::{
     EnsemblePing, EnsemblePong, LivenessGrace, PeerLastPong, PeerReliableRtt, PeerRtt,
     PeerRttJitter, PeerTimeout, PeerWireRtt,
 };
-pub use player_data::{PlayerData, PlayerDataPlugin, SetPlayerData, SyncPlayerData};
+pub use player_data::{
+    LocalPlayerData, PersistedPlayerDataPlugin, PlayerData, PlayerDataPlugin, SetPlayerData,
+    SyncPlayerData,
+};
 pub use registry::{
     EnsembleMessageRegistry, HANDSHAKE_INDEX, HeldUntilVerified, PROTOCOL_VERSION, RefusedPackets,
     decode_ensemble_packet, encode_ensemble_message, frame_packets, packet_index, unframe_packet,
