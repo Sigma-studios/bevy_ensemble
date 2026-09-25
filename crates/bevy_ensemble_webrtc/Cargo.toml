@@ -83,6 +83,10 @@ required-features = ["server"]
 name = "host_migration"
 required-features = ["server"]
 
+[[test]]
+name = "lobby_listing"
+required-features = ["server"]
+
 [[example]]
 name = "relay_probe"
 path = "examples/relay_probe.rs"

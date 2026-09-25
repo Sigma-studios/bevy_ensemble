@@ -90,31 +90,33 @@ const KEEP_ALIVE_INTERVAL_SECS: f64 = 20.0;
 /// How long to wait between attempts to rebuild a lost signalling connection, in seconds.
 const RECONNECT_INTERVAL_SECS: f64 = 5.0;
 
-/// Send the display name to the signalling server whenever it changes.
+/// Keep the signalling server's idea of this peer's name equal to [`SignallingDisplayName`].
 ///
-/// On an edge rather than every frame, and skipping the first — the name the plugin was built with
-/// already went out in `Authenticate`, so re-sending it at startup would be a redundant frame for
-/// every peer that never touches its name.
+/// Compared against what *this connection* authenticated with, rather than against what this
+/// system last sent. Those differ exactly when the socket has been rebuilt underneath it — leaving
+/// a lobby, or recovering a dropped signalling socket — and the difference was a bug: a peer that
+/// had set its name, then left a lobby, was re-authenticated by the new socket and never corrected,
+/// because nothing this system could see had changed. It went back to being called whatever the
+/// plugin was built with, and stayed there.
+///
+/// Comparing against the connection also means a name set before the first frame is not missed,
+/// which the old first-frame skip did miss: a game that fills the resource in at startup, from a
+/// save or a page's storage, had it silently dropped.
 ///
 /// There is no retry, and the reason is the channel rather than optimism: this is the WebSocket to
 /// the signalling server, which is TCP. If it is up the message arrives; if it is not, this peer
 /// has no listing to be wrong in.
 pub(crate) fn publish_display_name(
     name: Res<SignallingDisplayName>,
-    lobby_conn: Res<LobbyConnection>,
-    mut sent: Local<Option<String>>,
+    mut lobby_conn: ResMut<LobbyConnection>,
 ) {
-    if sent.is_none() {
-        *sent = Some(name.0.clone());
-        return;
-    }
-    if sent.as_deref() == Some(name.0.as_str()) {
+    if lobby_conn.announced_name == name.0 {
         return;
     }
     let _ = lobby_conn.command_tx.send(ClientMessage::SetDisplayName {
         display_name: name.0.clone(),
     });
-    *sent = Some(name.0.clone());
+    lobby_conn.announced_name = name.0.clone();
 }
 
 pub(crate) fn flush_lobby_events(
@@ -1063,6 +1065,7 @@ pub(crate) fn detect_lobby_leave(
     lobby_conn: Res<LobbyConnection>,
     mut socket: ResMut<crate::EnsembleSocketRes>,
     webrtc_runtime: Res<crate::WebrtcRuntime>,
+    display_name: Res<SignallingDisplayName>,
     mut removed: RemovedComponents<LobbyWebrtcId>,
 ) {
     for _entity in removed.read() {
@@ -1079,9 +1082,10 @@ pub(crate) fn detect_lobby_leave(
         commands.remove_resource::<LocalMultiplayerPlayerId>();
         commands.remove_resource::<HostUuid>();
 
-        // Rebuild the WS connection from scratch.
+        // Rebuild the WS connection from scratch, under the name the player is going by now and
+        // not the one the plugin was built with.
         // The old WS task will naturally exit when its channels are dropped.
-        let (new_socket, lobby_connection) = webrtc_runtime.build_socket();
+        let (new_socket, lobby_connection) = webrtc_runtime.build_socket(&display_name.0);
         commands.insert_resource(new_socket);
         commands.insert_resource(lobby_connection);
     }
@@ -1250,6 +1254,7 @@ pub(crate) fn reconnect_signalling(
     mut commands: Commands,
     lobby_conn: Res<LobbyConnection>,
     webrtc_runtime: Res<crate::WebrtcRuntime>,
+    display_name: Res<SignallingDisplayName>,
     time: Res<Time>,
     mut next_attempt: Local<f64>,
     lobbies_with_id: Query<(), With<LobbyWebrtcId>>,
@@ -1264,7 +1269,7 @@ pub(crate) fn reconnect_signalling(
     *next_attempt = now + RECONNECT_INTERVAL_SECS;
 
     info!("reconnecting to the signalling server");
-    let (new_socket, lobby_connection) = webrtc_runtime.build_socket();
+    let (new_socket, lobby_connection) = webrtc_runtime.build_socket(&display_name.0);
     commands.insert_resource(new_socket);
     commands.insert_resource(lobby_connection);
 }

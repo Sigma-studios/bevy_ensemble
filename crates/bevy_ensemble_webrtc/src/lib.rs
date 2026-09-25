@@ -317,7 +317,6 @@ pub(crate) struct WebrtcRuntime {
     #[cfg(not(target_arch = "wasm32"))]
     runtime: tokio::runtime::Runtime,
     server_url: String,
-    display_name: String,
     pub(crate) max_players: u32,
     ice_servers: IceServers,
     pub(crate) join_timeout: Option<std::time::Duration>,
@@ -326,19 +325,40 @@ pub(crate) struct WebrtcRuntime {
 #[cfg(feature = "client")]
 impl WebrtcRuntime {
     /// Build a fresh EnsembleSocket + lobby connection and start the WS handler task.
-    /// Called at init and again each time the player leaves a lobby.
-    pub(crate) fn build_socket(&self) -> (EnsembleSocketRes, connection::LobbyConnection) {
+    ///
+    /// Called at init and again each time the player leaves a lobby or the signalling connection
+    /// is rebuilt, which is why `display_name` is a parameter rather than a field: every one of
+    /// those is a new connection that has to authenticate, and it has to authenticate as whoever
+    /// the player is *now*. Held as a field, the name the plugin was built with was re-sent every
+    /// time — and [`systems::publish_display_name`] would not correct it, because it fires on the
+    /// resource changing and the resource had not changed. A player who typed their name and then
+    /// left one lobby was listed under the builder's placeholder for every lobby after it.
+    pub(crate) fn build_socket(
+        &self,
+        display_name: &str,
+    ) -> (EnsembleSocketRes, connection::LobbyConnection) {
         use std::sync::{Arc, Mutex};
 
         use connection::WsHandlerBuilder;
+        use protocol::ClientMessage;
         use tokio::sync::mpsc;
 
         let (lobby_event_tx, lobby_event_rx) = mpsc::unbounded_channel();
         let (lobby_command_tx, lobby_command_rx) = mpsc::unbounded_channel();
         let (signal_tx, signal_rx) = mpsc::unbounded_channel();
 
+        // Ask for the listing as soon as the connection exists, so a server browser has something
+        // in it without the player pressing anything. Queued rather than sent: the handler task
+        // writes `Authenticate` and `DeclareCapabilities` straight to the socket before it ever
+        // reads this channel, so this lands third however quickly it is queued.
+        //
+        // Every fresh connection does it, and that is deliberate — the two rebuilds are leaving a
+        // lobby and recovering a dropped signalling socket, and in both the listing a game is
+        // holding is exactly as stale as the connection it came from.
+        let _ = lobby_command_tx.send(ClientMessage::ListLobbies);
+
         let ws_builder = WsHandlerBuilder {
-            display_name: self.display_name.clone(),
+            display_name: display_name.to_owned(),
             lobby_event_tx,
             lobby_command_rx: Arc::new(Mutex::new(Some(lobby_command_rx))),
             signal_tx,
@@ -362,6 +382,7 @@ impl WebrtcRuntime {
             signal_rx: std::sync::Mutex::new(signal_rx),
             local_player_uuid: None,
             signalling_lost: false,
+            announced_name: display_name.to_owned(),
         };
 
         (EnsembleSocketRes(socket), lobby_connection)
@@ -378,13 +399,12 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
                 .build()
                 .expect("Failed to create Tokio runtime"),
             server_url: self.server_url.clone(),
-            display_name: self.display_name.clone(),
             max_players: self.max_players,
             ice_servers: self.ice_servers.clone(),
             join_timeout: self.join_timeout,
         };
 
-        let (socket, lobby_connection) = webrtc_runtime.build_socket();
+        let (socket, lobby_connection) = webrtc_runtime.build_socket(&self.display_name);
 
         app.claim_transport("bevy_ensemble_webrtc")
             .insert_resource(webrtc_runtime)
