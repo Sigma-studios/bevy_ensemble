@@ -84,6 +84,15 @@ pub struct LobbyConnection {
     /// Set once [`LobbyEvent::SignallingClosed`] has been seen: this connection can carry nothing
     /// more, and a fresh one has to be built before hosting or joining again.
     pub signalling_lost: bool,
+    /// The name this connection authenticated with: what the server believes, on this socket, until
+    /// a `SetDisplayName` changes it.
+    ///
+    /// Here rather than in a `Local` beside the system that publishes it, because it is a property
+    /// of the connection and should die with it. A `Local` outlives the socket, and both of the
+    /// ways this connection gets rebuilt — leaving a lobby, recovering a dropped signalling socket
+    /// — then leave it describing a conversation that is over, so the name is never re-sent and
+    /// the server keeps whatever the fresh socket authenticated with.
+    pub announced_name: String,
 }
 
 /// Dispatch a decoded server message to the lobby event and/or signal channels.
