@@ -839,3 +839,60 @@ async fn an_unknown_client_variant_does_not_close_the_connection() {
         other => panic!("expected LobbyList, got {other:?}"),
     }
 }
+
+/// A fresh, authenticated connection that declares `game`, the way a client built with one does.
+async fn game_player(server: &SignallingServer, name: &str, game: &str) -> (Ws, u128) {
+    let (mut ws, uuid) = player(server, name).await;
+    send(&mut ws, &ClientMessage::DeclareGame { game: game.into() }).await;
+    (ws, uuid)
+}
+
+/// The codes of every lobby `ws` is shown.
+async fn listed_codes(ws: &mut Ws) -> Vec<String> {
+    match list_lobbies(ws).await {
+        ServerMessage::LobbyList { lobbies } => lobbies.into_iter().map(|l| l.code).collect(),
+        other => panic!("expected LobbyList, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_listing_holds_only_the_askers_own_games_lobbies() {
+    let server = SignallingServer::start();
+
+    let (mut volley, _) = game_player(&server, "volley host", "una_volley").await;
+    let (_, volley_code) = create_lobby(&mut volley, 8).await;
+    let (mut war, _) = game_player(&server, "war host", "run-2d").await;
+    let (_, war_code) = create_lobby(&mut war, 8).await;
+    // A build from before the declaration, which is every client in the field today.
+    let (mut legacy, _) = player(&server, "legacy host").await;
+    let (_, legacy_code) = create_lobby(&mut legacy, 8).await;
+
+    let (mut looking, _) = game_player(&server, "war browser", "run-2d").await;
+    assert_eq!(listed_codes(&mut looking).await, vec![war_code]);
+    let (mut looking, _) = game_player(&server, "volley browser", "una_volley").await;
+    assert_eq!(listed_codes(&mut looking).await, vec![volley_code]);
+    // And the old builds keep seeing each other, and only each other.
+    let (mut looking, _) = player(&server, "legacy browser").await;
+    assert_eq!(listed_codes(&mut looking).await, vec![legacy_code]);
+}
+
+#[tokio::test]
+async fn a_code_from_another_game_is_not_found() {
+    let server = SignallingServer::start();
+
+    let (mut volley, _) = game_player(&server, "volley host", "una_volley").await;
+    let (_, code) = create_lobby(&mut volley, 8).await;
+
+    let (mut war, _) = game_player(&server, "war player", "run-2d").await;
+    match join_by_code(&mut war, &code).await {
+        ServerMessage::LobbyError { reason } => assert_eq!(reason, "Lobby not found"),
+        other => panic!("joined another game's lobby: {other:?}"),
+    }
+
+    // The same code from the right game still works.
+    let (mut player, _) = game_player(&server, "volley player", "una_volley").await;
+    match join_by_code(&mut player, &code).await {
+        ServerMessage::LobbyJoined { .. } => {}
+        other => panic!("expected LobbyJoined, got {other:?}"),
+    }
+}

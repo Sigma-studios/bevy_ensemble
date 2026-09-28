@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::protocol::{ClientMessage, ServerMessage, decode, encode};
+use crate::protocol::{ClientMessage, MAX_GAME_LEN, ServerMessage, decode, encode};
 
 use super::lobby;
 use super::state::{ConnectionHandle, Limits, ServerState};
@@ -134,6 +134,8 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
     // Kept here as well as on the handle, so a declaration that arrives before `Authenticate`
     // still applies once there is a handle to put it on.
     let mut capabilities: u64 = 0;
+    // Kept here for the same reason, and read directly by `ListLobbies`.
+    let mut game = String::new();
     let mut limiter = RateLimiter::new(&state.limits, Instant::now());
     let idle_timeout = state.limits.idle_timeout;
 
@@ -194,6 +196,7 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                         lobby_id: None,
                         sender: tx.clone(),
                         capabilities,
+                        game: game.clone(),
                     },
                 );
 
@@ -290,6 +293,15 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                 }
             }
 
+            ClientMessage::DeclareGame { game: declared } => {
+                game = truncated(declared, MAX_GAME_LEN);
+                if let Some(uuid) = player_uuid {
+                    if let Some(mut conn) = state.connections.get_mut(&uuid) {
+                        conn.game = game.clone();
+                    }
+                }
+            }
+
             ClientMessage::ListLobbies => {
                 // Authenticated like everything else. The listing is cheap to serve and not a
                 // secret, but an unauthenticated socket that can ask for it is an unauthenticated
@@ -298,7 +310,7 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                     let _ = tx.send(not_authenticated());
                     continue;
                 }
-                let response = lobby::list_lobbies(&state);
+                let response = lobby::list_lobbies(&state, &game);
                 let _ = tx.send(response);
             }
 
@@ -351,6 +363,18 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
 /// the host — every member's one connection is to it — so a member has no reason to signal
 /// another member, and a relay that would do it anyway is a way for anyone who joined a lobby to
 /// push arbitrary data at everyone else in it.
+/// `text` cut to at most `max` bytes, on a character boundary.
+fn truncated(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        let end = (0..=max)
+            .rev()
+            .find(|&i| text.is_char_boundary(i))
+            .unwrap_or(0);
+        text.truncate(end);
+    }
+    text
+}
+
 fn relay_allowed(state: &ServerState, from: u128, to: u128) -> bool {
     if from == to {
         return false;

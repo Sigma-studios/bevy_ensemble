@@ -19,6 +19,11 @@ const SETTLE: Duration = Duration::from_secs(20);
 const FRAME: Duration = Duration::from_millis(4);
 
 fn app(server: &SignallingServer, name: &str) -> App {
+    game_app(server, name, "")
+}
+
+/// A peer of `game`: the same app, declaring which game it is.
+fn game_app(server: &SignallingServer, name: &str, game: &str) -> App {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins)
         .add_plugins(EnsemblePlugin)
@@ -26,6 +31,7 @@ fn app(server: &SignallingServer, name: &str) -> App {
             server_url: server.ws_url(),
             display_name: name.into(),
             ice_servers: IceServers::none(),
+            game: game.into(),
             ..default()
         });
     app
@@ -147,5 +153,32 @@ fn a_lobby_is_listed_under_its_hosts_name_after_the_host_has_left_another() {
         listed(&apps[1]),
         vec![(second, "ava".to_owned())],
         "the rebuilt connection re-authenticated as the plugin's placeholder"
+    );
+}
+
+#[test]
+fn the_listing_holds_this_games_lobbies_and_no_other_games() {
+    let server = SignallingServer::start();
+    let mut apps = vec![
+        game_app(&server, "ava", "run-2d"),
+        game_app(&server, "cy", "una_volley"),
+    ];
+    // Hosted on a rebuilt connection, the way every lobby after a player's first one is: leaving
+    // a lobby builds a new signalling socket, and it has to say which game it is all over again.
+    host(&mut apps, 0);
+    apps[0].world_mut().write_message(LeaveLobby);
+    assert!(
+        run_until(&mut apps, SETTLE, |apps| code(&mut apps[0]).is_none()),
+        "never left the first lobby"
+    );
+    let ours = host(&mut apps, 0);
+    host(&mut apps, 1);
+
+    apps.push(game_app(&server, "bo", "run-2d"));
+    assert!(run_until(&mut apps, SETTLE, |apps| !listed(&apps[2]).is_empty()));
+    assert_eq!(
+        listed(&apps[2]),
+        vec![(ours, "ava".to_owned())],
+        "another game's lobby is in the listing"
     );
 }

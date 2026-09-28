@@ -45,7 +45,22 @@ pub enum ClientMessage {
     /// Leaving a lobby that can migrate hands it to another member; this is the host deciding
     /// the session is over. Ignored from anyone but the host.
     CloseLobby,
+    /// Which game this client is, sent right after `Authenticate`.
+    ///
+    /// One signalling server carries several games, and a lobby is only any use to a client of
+    /// the game that hosts it: a lobby from another game is listed as joinable and then fails at
+    /// the handshake. The server stamps each lobby with its host's game, lists only the lobbies of
+    /// the asker's own, and answers a join into another game's lobby as `Lobby not found`.
+    ///
+    /// A client that never sends this is the empty game, which is every build older than the
+    /// variant: they keep seeing each other and nothing else. A server older than the variant
+    /// cannot decode it, logs it, and lists everything, as it always did. Longer than
+    /// [`MAX_GAME_LEN`] bytes is cut to it.
+    DeclareGame { game: String },
 }
+
+/// The longest game name the server keeps, in bytes. A name is an identifier, not prose.
+pub const MAX_GAME_LEN: usize = 64;
 
 /// A client that understands [`ServerMessage::LobbyMigratable`] and [`ServerMessage::HostChanged`]:
 /// a lobby it hosts outlives it, and a lobby it is in can hand it the host role.

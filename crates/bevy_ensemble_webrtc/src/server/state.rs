@@ -60,6 +60,11 @@ pub struct LobbyState {
     /// the member who has been in it longest takes over.
     pub members: Vec<u128>,
     pub max_players: u32,
+    /// The game its host declared, and so the only game it is listed to and joinable from. Empty
+    /// for a host that declared none. See [`ClientMessage::DeclareGame`].
+    ///
+    /// [`ClientMessage::DeclareGame`]: crate::protocol::ClientMessage::DeclareGame
+    pub game: String,
     /// Whether this lobby outlives its host. Fixed at creation, from what the host declared: a
     /// host that cannot be told [`HostChanged`](ServerMessage::HostChanged) is running a build
     /// whose members cannot be told it either.
@@ -73,6 +78,8 @@ pub struct ConnectionHandle {
     /// The `CAPABILITY_*` bits this connection declared; zero for a client older than the
     /// declaration.
     pub capabilities: u64,
+    /// The game this connection declared; empty for a client older than the declaration.
+    pub game: String,
 }
 
 impl ConnectionHandle {
