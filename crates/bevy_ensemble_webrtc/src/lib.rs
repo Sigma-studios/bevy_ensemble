@@ -63,6 +63,14 @@ pub struct BevyEnsembleWebrtcPlugin {
     /// patience. Both peers gathering, exchanging and pairing takes a second or two on a healthy
     /// network and a few more on a bad one; nothing legitimate takes fifteen.
     pub join_timeout: Option<std::time::Duration>,
+    /// Which game this is, so the lobby list holds this game's lobbies and no other's.
+    ///
+    /// Any string that is the same in every build of one game and different from every other
+    /// game on the same signalling server; the crate name is the obvious one. Empty declares
+    /// nothing, and sees only the lobbies of other clients that declared nothing — which is what
+    /// every build from before the declaration existed does. See
+    /// [`ClientMessage::DeclareGame`](protocol::ClientMessage::DeclareGame).
+    pub game: String,
 }
 
 #[cfg(feature = "client")]
@@ -74,6 +82,7 @@ impl Default for BevyEnsembleWebrtcPlugin {
             max_players: 8,
             ice_servers: IceServers::default(),
             join_timeout: Some(std::time::Duration::from_secs(15)),
+            game: String::new(),
         }
     }
 }
@@ -320,6 +329,7 @@ pub(crate) struct WebrtcRuntime {
     pub(crate) max_players: u32,
     ice_servers: IceServers,
     pub(crate) join_timeout: Option<std::time::Duration>,
+    game: String,
 }
 
 #[cfg(feature = "client")]
@@ -355,6 +365,15 @@ impl WebrtcRuntime {
         // Every fresh connection does it, and that is deliberate — the two rebuilds are leaving a
         // lobby and recovering a dropped signalling socket, and in both the listing a game is
         // holding is exactly as stale as the connection it came from.
+        //
+        // Which game this is goes first, so the server knows it before the listing is asked for
+        // and before any lobby is created. Every connection, because the server keeps it per
+        // connection.
+        if !self.game.is_empty() {
+            let _ = lobby_command_tx.send(ClientMessage::DeclareGame {
+                game: self.game.clone(),
+            });
+        }
         let _ = lobby_command_tx.send(ClientMessage::ListLobbies);
 
         let ws_builder = WsHandlerBuilder {
@@ -402,6 +421,7 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
             max_players: self.max_players,
             ice_servers: self.ice_servers.clone(),
             join_timeout: self.join_timeout,
+            game: self.game.clone(),
         };
 
         let (socket, lobby_connection) = webrtc_runtime.build_socket(&self.display_name);

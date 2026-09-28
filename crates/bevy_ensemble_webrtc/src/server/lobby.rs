@@ -72,7 +72,7 @@ pub fn create_lobby(
     host_uuid: u128,
     max_players: u32,
 ) -> Result<(), ServerMessage> {
-    let (host_name, host_migration) = {
+    let (host_name, host_migration, game) = {
         let conn = state
             .connections
             .get(&host_uuid)
@@ -83,6 +83,7 @@ pub fn create_lobby(
         (
             conn.display_name.clone(),
             conn.declares(CAPABILITY_HOST_MIGRATION),
+            conn.game.clone(),
         )
     };
 
@@ -102,6 +103,7 @@ pub fn create_lobby(
                 host_name,
                 members: vec![host_uuid],
                 max_players,
+                game,
                 host_migration,
             }),
             Entry::Occupied(_) => continue,
@@ -133,7 +135,7 @@ pub fn join_lobby(
     player_uuid: u128,
     lobby_id: u64,
 ) -> Result<(), ServerMessage> {
-    let joiner_migrates = {
+    let (joiner_migrates, game) = {
         let conn = state
             .connections
             .get(&player_uuid)
@@ -141,12 +143,15 @@ pub fn join_lobby(
         if conn.lobby_id.is_some() {
             return Err(refusal("Already in a lobby"));
         }
-        conn.declares(CAPABILITY_HOST_MIGRATION)
+        (conn.declares(CAPABILITY_HOST_MIGRATION), conn.game.clone())
     };
 
+    // Another game's lobby is not found rather than refused: it is not in this game's listing,
+    // and a code typed from one game that happens to name a lobby of another is a typo.
     let mut lobby = state
         .lobbies
         .get_mut(&lobby_id)
+        .filter(|lobby| lobby.game == game)
         .ok_or_else(|| refusal("Lobby not found"))?;
 
     if lobby.members.len() as u32 >= lobby.max_players {
@@ -345,10 +350,14 @@ fn disconnect(state: &ServerState, members: &[u128], reason: &str) {
     }
 }
 
-pub fn list_lobbies(state: &ServerState) -> ServerMessage {
+/// Every lobby of `game`, and no other game's. See [`ClientMessage::DeclareGame`].
+///
+/// [`ClientMessage::DeclareGame`]: crate::protocol::ClientMessage::DeclareGame
+pub fn list_lobbies(state: &ServerState, game: &str) -> ServerMessage {
     let lobbies = state
         .lobbies
         .iter()
+        .filter(|entry| entry.value().game == game)
         .map(|entry| {
             let lobby = entry.value();
             LobbyInfo {

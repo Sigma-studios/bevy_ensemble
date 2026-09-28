@@ -235,6 +235,9 @@ fn a_new_client_message_fails_to_decode_on_a_pre_e5_server_rather_than_misreadin
             capabilities: CAPABILITY_HOST_MIGRATION,
         },
         ClientMessage::CloseLobby,
+        ClientMessage::DeclareGame {
+            game: "a-game".into(),
+        },
     ] {
         assert!(
             !decodes_as::<pre_e5::ClientMessage>(&bytes(&message)),
