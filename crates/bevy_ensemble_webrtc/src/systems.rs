@@ -772,6 +772,7 @@ fn liveness_entity(
 pub(crate) fn poll_peer_routes(
     mut commands: Commands,
     mut socket: ResMut<crate::EnsembleSocketRes>,
+    mut relay_reports: MessageWriter<crate::RelayReport>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
     client_lobbies: Query<
         (Entity, Option<&PeerRoute>),
@@ -787,6 +788,12 @@ pub(crate) fn poll_peer_routes(
         if matches!(route, bevy_ensemble_sockets::PeerRoute::Relayed) {
             info!("peer {peer_id:#x} is connected through the relay, not directly");
         }
+    }
+    // A warning, not information: it is the one line a player can send in about a relayed
+    // session, and release builds commonly compile everything below `warn` out.
+    for (peer, report) in socket.take_relay_reports() {
+        warn!("{report}");
+        relay_reports.write(crate::RelayReport { peer, report });
     }
 
     // Collected first: `route` borrows the socket, and `update_routes` above needed it mutably.

@@ -1,3 +1,4 @@
+mod diagnosis;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 mod recovery;
@@ -174,8 +175,12 @@ impl IceServers {
 /// [`disconnect_peer`](EnsembleSocket::disconnect_peer) final.
 struct PeerEvents {
     states: mpsc::UnboundedReceiver<(u128, PeerState)>,
-    routes: mpsc::UnboundedReceiver<(u128, PeerRoute)>,
+    routes: mpsc::UnboundedReceiver<RouteReport>,
 }
+
+/// What a connection says once ICE has chosen: the route, and for a relayed one, the report from
+/// [`diagnosis::describe`] saying why.
+pub(crate) type RouteReport = (u128, PeerRoute, Option<String>);
 
 /// A cross-platform WebRTC socket that manages peer connections and data channels.
 ///
@@ -198,6 +203,8 @@ pub struct EnsembleSocket {
     events: HashMap<u128, PeerEvents>,
     states: HashMap<u128, PeerState>,
     routes: HashMap<u128, PeerRoute>,
+    /// Reports on relayed connections, waiting for [`take_relay_reports`](Self::take_relay_reports).
+    relay_reports: Vec<(u128, String)>,
     /// When each peer currently `Reconnecting` was first reported so, for [`ICE_RESTART_TIMEOUT`].
     ///
     /// Checked from [`update_peers`](EnsembleSocket::update_peers) rather than by a timer task,
@@ -226,6 +233,7 @@ impl EnsembleSocket {
             events: HashMap::new(),
             states: HashMap::new(),
             routes: HashMap::new(),
+            relay_reports: Vec::new(),
             reconnecting_since: HashMap::new(),
             discarded_candidates: Arc::new(AtomicU64::new(0)),
             ice_servers: IceServers::default(),
@@ -246,6 +254,7 @@ impl EnsembleSocket {
             events: HashMap::new(),
             states: HashMap::new(),
             routes: HashMap::new(),
+            relay_reports: Vec::new(),
             reconnecting_since: HashMap::new(),
             discarded_candidates: Arc::new(AtomicU64::new(0)),
             ice_servers: IceServers::default(),
@@ -269,7 +278,7 @@ impl EnsembleSocket {
         peer: u128,
     ) -> (
         mpsc::UnboundedSender<(u128, PeerState)>,
-        mpsc::UnboundedSender<(u128, PeerRoute)>,
+        mpsc::UnboundedSender<RouteReport>,
     ) {
         let (state_tx, states) = mpsc::unbounded_channel();
         let (route_tx, routes) = mpsc::unbounded_channel();
@@ -561,18 +570,28 @@ impl EnsembleSocket {
     /// [`update_peers`]: EnsembleSocket::update_peers
     pub fn update_routes(&mut self) -> Vec<(u128, PeerRoute)> {
         let mut changes = Vec::new();
-        let reported: Vec<(u128, PeerRoute)> = self
+        let reported: Vec<RouteReport> = self
             .events
             .values_mut()
             .flat_map(|events| std::iter::from_fn(|| events.routes.try_recv().ok()))
             .collect();
-        for (peer, route) in reported {
+        for (peer, route, report) in reported {
+            if let Some(report) = report {
+                self.relay_reports.push((peer, report));
+            }
             if self.routes.get(&peer).copied() != Some(route) {
                 self.routes.insert(peer, route);
                 changes.push((peer, route));
             }
         }
         changes
+    }
+
+    /// Take the reports written on connections that settled on the relay: every candidate both
+    /// sides offered, every pair ICE checked and what came of it, and a verdict on top. One per
+    /// relayed connection, text meant for a log or a file somebody sends in.
+    pub fn take_relay_reports(&mut self) -> Vec<(u128, String)> {
+        std::mem::take(&mut self.relay_reports)
     }
 
     /// How this peer is reached, if ICE has settled on a pair yet.
@@ -704,7 +723,7 @@ mod tests {
         let mut socket = EnsembleSocket::new(runtime.handle().clone());
 
         let (_, old) = socket.events_for(PEER);
-        old.send((PEER, PeerRoute::Relayed)).unwrap();
+        old.send((PEER, PeerRoute::Relayed, None)).unwrap();
         socket.disconnect_peer(PEER);
         let _ = socket.events_for(PEER);
 

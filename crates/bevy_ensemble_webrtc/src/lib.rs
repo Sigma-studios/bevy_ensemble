@@ -256,6 +256,18 @@ pub const QUIET_ICE_LOG_FILTER: &str = "webrtc_ice::agent::agent_gather=error,\
      webrtc_ice::agent::agent_internal=error,\
      webrtc_ice::mdns=error";
 
+/// A connection settled on the relay, and this is why: every candidate both sides offered, every
+/// pair ICE checked and how it went, with a verdict on top. Plain text, one per relayed
+/// connection, also logged as a warning. A game can keep it somewhere a player can find it and
+/// send it in; the host's copy covers every client's connection.
+#[cfg(feature = "client")]
+#[derive(Message, Clone, Debug)]
+pub struct RelayReport {
+    /// The peer the relayed connection is to.
+    pub peer: u128,
+    pub report: String,
+}
+
 /// The name this peer is advertised under in the lobby list, live.
 ///
 /// Insert or change it and the new name is sent to the signalling server, which updates the
@@ -435,6 +447,7 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
             .add_message::<JoinWebrtcLobby>()
             .add_message::<JoinWebrtcLobbyByCode>()
             .add_message::<RefreshLobbyList>()
+            .add_message::<RelayReport>()
             // A control message: never relayed through the broadcast path, and on a client
             // taken only from the host. `from_host: true` from anybody else is refused before it
             // is decoded, on top of the sender check in `promote_client_lobby_on_host_handshake`.

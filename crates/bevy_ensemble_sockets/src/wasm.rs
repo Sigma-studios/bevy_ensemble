@@ -224,13 +224,86 @@ async fn selected_route(conn: &RtcPeerConnection) -> Option<PeerRoute> {
     })
 }
 
+/// Read a relayed connection's stats into a [`describe`](crate::diagnosis::describe) report: the
+/// browser's `getStats`, walked once for candidates and pairs.
+async fn relay_report(conn: &RtcPeerConnection, peer_id: u128) -> Option<String> {
+    use crate::diagnosis::{Candidate, Checks, Pair, describe};
+
+    let report = wasm_bindgen_futures::JsFuture::from(conn.get_stats())
+        .await
+        .ok()?;
+    let report: js_sys::Map = report.unchecked_into();
+    let field =
+        |value: &JsValue, key: &str| js_sys::Reflect::get(value, &JsValue::from_str(key)).ok();
+    let text = |value: &JsValue, key: &str| {
+        field(value, key)
+            .and_then(|v| v.as_string())
+            .unwrap_or_default()
+    };
+    let number =
+        |value: &JsValue, key: &str| field(value, key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+    let (mut local, mut remote, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
+    let mut selected: Option<(String, String)> = None;
+    report.for_each(&mut |value, _key| match text(&value, "type").as_str() {
+        kind @ ("local-candidate" | "remote-candidate") => {
+            // `address` in current browsers, `ip` in older ones; absent for a hidden local one.
+            let mut address = text(&value, "address");
+            if address.is_empty() {
+                address = text(&value, "ip");
+            }
+            let candidate = Candidate {
+                id: text(&value, "id"),
+                kind: text(&value, "candidateType"),
+                address,
+                port: number(&value, "port") as u16,
+                protocol: text(&value, "protocol"),
+            };
+            if kind == "local-candidate" {
+                local.push(candidate);
+            } else {
+                remote.push(candidate);
+            }
+        }
+        "candidate-pair" => {
+            let nominated = field(&value, "nominated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let pair = Pair {
+                local_id: text(&value, "localCandidateId"),
+                remote_id: text(&value, "remoteCandidateId"),
+                state: text(&value, "state"),
+                nominated,
+                checks: Some(Checks {
+                    sent: number(&value, "requestsSent") as u64,
+                    answered: number(&value, "responsesReceived") as u64,
+                    received: number(&value, "requestsReceived") as u64,
+                    answered_back: number(&value, "responsesSent") as u64,
+                }),
+            };
+            if nominated && pair.state == "succeeded" && selected.is_none() {
+                selected = Some((pair.local_id.clone(), pair.remote_id.clone()));
+            }
+            pairs.push(pair);
+        }
+        _ => {}
+    });
+    Some(describe(
+        peer_id,
+        selected.as_ref().map(|(l, r)| (l.as_str(), r.as_str())),
+        &local,
+        &remote,
+        &pairs,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_peer_connection(
     peer_id: u128,
     role: Role,
     signal_tx: mpsc::UnboundedSender<OutgoingSignal>,
     peer_state_tx: mpsc::UnboundedSender<(u128, PeerState)>,
-    route_tx: mpsc::UnboundedSender<(u128, PeerRoute)>,
+    route_tx: mpsc::UnboundedSender<crate::RouteReport>,
     message_tx: mpsc::UnboundedSender<(u128, Box<[u8]>, Instant)>,
     ice_servers: &IceServers,
     discarded_candidates: Arc<AtomicU64>,
@@ -401,7 +474,12 @@ pub(crate) fn create_peer_connection(
             match selected_route(&conn).await {
                 Some(route) => {
                     log::info!("peer {peer_id:#x}: {} pair", route.label());
-                    let _ = route_tx.send((peer_id, route));
+                    let report = if route == PeerRoute::Relayed {
+                        relay_report(&conn, peer_id).await
+                    } else {
+                        None
+                    };
+                    let _ = route_tx.send((peer_id, route, report));
                 }
                 None => log::debug!("peer {peer_id:#x}: no candidate pair to report"),
             }
