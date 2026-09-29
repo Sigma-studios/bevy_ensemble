@@ -10,12 +10,17 @@ use bevy_ensemble::{
 use bevy_ensemble_sockets::{PeerSignal, PeerState};
 
 use crate::connection::{LobbyConnection, LobbyEvent};
-use crate::protocol::ClientMessage;
+use crate::protocol::{ClientMessage, SignallingError, normalize_lobby_code};
 
 use crate::{
-    JoinWebrtcLobby, JoinWebrtcLobbyByCode, LobbyClientWebrtcUuid, LobbyHostUuid, LobbyWebrtcCode,
-    LobbyWebrtcId, PendingWebrtcLobbyClient, RefreshLobbyList, SignallingDisplayName,
+    JoinWebrtcLobby, JoinWebrtcLobbyByCode, LobbyClientWebrtcUuid, LobbyHostUuid, LobbyRequest,
+    LobbyWebrtcCode, LobbyWebrtcId, PendingWebrtcLobbyClient, RefreshLobbyList,
+    SignallingDisplayName, SignallingRefused,
 };
+
+/// What a player is told when the signalling server cannot be asked for a lobby at all.
+const SERVER_OUTDATED: &str =
+    "The lobby server is older than this game and cannot open or join lobbies for it.";
 
 /// Which side of the session this peer is on, as far as trust decisions go.
 ///
@@ -137,10 +142,13 @@ pub(crate) fn apply_lobby_events(
     mut lobby_conn: ResMut<LobbyConnection>,
     mut socket: ResMut<crate::EnsembleSocketRes>,
     mut events: MessageReader<LobbyEvent>,
-    mut lobby_left: MessageWriter<LobbyLeft>,
-    mut join_failed: MessageWriter<LobbyJoinFailed>,
+    (mut lobby_left, mut join_failed, mut refused): (
+        MessageWriter<LobbyLeft>,
+        MessageWriter<LobbyJoinFailed>,
+        MessageWriter<SignallingRefused>,
+    ),
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
-    pending_host_lobbies: Query<Entity, (With<PendingLobby>, With<RequestLobby>, With<Host>)>,
+    requested_lobbies: Query<(Entity, &LobbyRequest, Has<Host>), With<PendingLobby>>,
     pending_client_lobbies: Query<Entity, (With<PendingLobby>, Without<Host>)>,
     active_client_lobbies: Query<Entity, (With<Lobby>, Without<Host>)>,
     all_lobbies: Query<(Entity, Has<PendingLobby>), Or<(With<Lobby>, With<PendingLobby>)>>,
@@ -167,7 +175,29 @@ pub(crate) fn apply_lobby_events(
                 commands.insert_resource(LocalMultiplayerPlayerId(*player_uuid));
             }
 
-            LobbyEvent::LobbyCreated { lobby_id, code } => {
+            LobbyEvent::LobbyCreated {
+                request,
+                lobby_id,
+                code,
+            } => {
+                lobby_conn.forget(*request);
+                let waiting = requested_lobbies
+                    .iter()
+                    .find(|(_, waiting, is_host)| waiting.0 == *request && *is_host);
+                let Some((entity, _, _)) = waiting else {
+                    // Given up on before the answer came back: cancelled, timed out. The server
+                    // has this connection hosting a lobby nobody here will ever use, and would
+                    // refuse the next attempt "Already in a lobby"; taking the request back ends
+                    // it. The despawn already did, unless it raced this answer, and a second
+                    // cancel is harmless — it only acts while the lobby is the one this request
+                    // made.
+                    info!(
+                        "lobby {lobby_id} was created for request {request}, which nothing is \
+                         waiting on any more; leaving it"
+                    );
+                    lobby_conn.cancel(*request);
+                    continue;
+                };
                 info!("Lobby created: {lobby_id} (code: {code})");
                 let Some(player_uuid) = lobby_conn.local_player_uuid else {
                     warn!(
@@ -179,31 +209,41 @@ pub(crate) fn apply_lobby_events(
                 commands.insert_resource(LocalMultiplayerPlayerId(player_uuid));
                 // A host is its own authority.
                 commands.insert_resource(HostUuid(player_uuid));
-
-                if let Some(entity) = pending_host_lobbies.iter().next() {
-                    commands
-                        .entity(entity)
-                        .remove::<(PendingLobby, RequestLobby)>()
-                        .insert((
-                            Lobby,
-                            LobbyWebrtcId(*lobby_id),
-                            LobbyWebrtcCode(code.clone()),
-                        ));
-                } else {
-                    warn!(
-                        "lobby {lobby_id} was created with no pending host lobby to promote. \
-                         The lobby exists on the server and this peer is not in it."
-                    );
-                }
+                // `try_`: a leave queued earlier this frame may despawn it first, and its request
+                // is then cancelled on the way out.
+                commands
+                    .entity(entity)
+                    .try_remove::<(PendingLobby, RequestLobby, LobbyRequest)>()
+                    .try_insert((
+                        Lobby,
+                        LobbyWebrtcId(*lobby_id),
+                        LobbyWebrtcCode(code.clone()),
+                    ));
             }
 
             LobbyEvent::LobbyJoined {
+                request,
                 lobby_id,
                 host_uuid,
                 existing_members,
+                code,
             } => {
+                lobby_conn.forget(*request);
+                let waiting = requested_lobbies
+                    .iter()
+                    .find(|(_, waiting, is_host)| waiting.0 == *request && !*is_host);
+                let Some((entity, _, _)) = waiting else {
+                    // As for a lobby created for nobody, above.
+                    info!(
+                        "joined lobby {lobby_id} for request {request}, which nothing is waiting \
+                         on any more; leaving it"
+                    );
+                    lobby_conn.cancel(*request);
+                    continue;
+                };
                 info!(
-                    "Joined lobby: {lobby_id}, hosted by {host_uuid:#x} with {} other member(s)",
+                    "Joined lobby: {lobby_id} (code: {code}), hosted by {host_uuid:#x} with {} \
+                     other member(s)",
                     existing_members.len()
                 );
                 let Some(player_uuid) = lobby_conn.local_player_uuid else {
@@ -217,29 +257,60 @@ pub(crate) fn apply_lobby_events(
                 // Set before the host's offer can be answered (`pump_socket_signals` runs after
                 // this system), so no data channel exists to a peer this side does not trust.
                 commands.insert_resource(HostUuid(*host_uuid));
-
-                if let Some(entity) = pending_client_lobbies.iter().next() {
-                    commands
-                        .entity(entity)
-                        .insert((LobbyWebrtcId(*lobby_id), LobbyHostUuid(*host_uuid)));
-                } else {
-                    warn!(
-                        "joined lobby {lobby_id} with no pending client lobby to attach it to. \
-                         The join succeeded on the server and nothing here is holding it."
-                    );
-                }
+                commands
+                    .entity(entity)
+                    .try_remove::<LobbyRequest>()
+                    .try_insert((
+                        LobbyWebrtcId(*lobby_id),
+                        LobbyHostUuid(*host_uuid),
+                        LobbyWebrtcCode(code.clone()),
+                    ));
             }
 
-            LobbyEvent::LobbyError { reason } => {
-                error!("Lobby error: {reason}");
-                commands.remove_resource::<LocalMultiplayerPlayerId>();
-                commands.remove_resource::<HostUuid>();
-                for entity in pending_host_lobbies.iter() {
-                    commands.entity(entity).try_despawn();
+            // A refusal is about the request it names, and nothing else. It used to end every
+            // pending lobby and take this peer's identity with it, whatever had been refused — a
+            // keep-alive over the rate limit included, which is how a host with a lobby full of
+            // players lost `HostUuid` in the middle of a session.
+            LobbyEvent::Refused { request, error } => {
+                refused.write(SignallingRefused { error: *error });
+                let Some(request) = *request else {
+                    warn!("the signalling server refused a message: {error:?}");
+                    continue;
+                };
+                if *error == SignallingError::RateLimited && lobby_conn.retry_later(request) {
+                    info!(
+                        "request {request} was over the signalling server's rate; sending it \
+                         again shortly"
+                    );
+                    continue;
                 }
-                for entity in pending_client_lobbies.iter() {
-                    commands.entity(entity).try_despawn();
-                }
+                lobby_conn.forget(request);
+                let Some((entity, _, is_host)) = requested_lobbies
+                    .iter()
+                    .find(|(_, waiting, _)| waiting.0 == request)
+                else {
+                    debug!("request {request} was refused ({error:?}); nothing is waiting on it");
+                    continue;
+                };
+                warn!(
+                    "the signalling server refused to {} a lobby: {error:?}",
+                    if is_host { "host" } else { "join" }
+                );
+                join_failed.write(LobbyJoinFailed {
+                    reason: error.to_string(),
+                });
+                commands.entity(entity).try_despawn();
+            }
+
+            // Every lobby request this connection could send is one the server drops unread.
+            // What is waiting on one is failed by `refuse_requests_to_an_outdated_server`.
+            LobbyEvent::ServerOutdated => {
+                error!(
+                    "the signalling server is older than this client: it does not understand \
+                     typed lobby requests (CAPABILITY_TYPED_REQUESTS), so this client cannot host \
+                     or join through it. Deploy the server from the same bevy_ensemble_webrtc."
+                );
+                lobby_conn.server_outdated = true;
             }
 
             LobbyEvent::PlayerJoined { player_uuid } => {
@@ -502,24 +573,70 @@ fn end_client_lobbies(world: &mut World, lobbies: &[Entity], reason: LobbyLeftRe
     world.write_message(LobbyLeft { reason });
 }
 
+/// Ask the server for a lobby for every host lobby that has just been requested, and mark it with
+/// the request so the answer can find it.
 pub(crate) fn create_lobby(
-    lobby_conn: Res<LobbyConnection>,
+    mut commands: Commands,
+    mut lobby_conn: ResMut<LobbyConnection>,
     webrtc_runtime: Res<crate::WebrtcRuntime>,
-    lobbies: Query<(Entity, Option<&Host>), Added<RequestLobby>>,
+    lobbies: Query<(Entity, Has<Host>), Added<RequestLobby>>,
 ) {
-    for (_entity, maybe_host) in lobbies.iter() {
-        if maybe_host.is_none() {
+    for (entity, is_host) in lobbies.iter() {
+        if !is_host {
             continue;
         }
-        let _ = lobby_conn.command_tx.send(ClientMessage::CreateLobby {
-            max_players: webrtc_runtime.max_players,
+        let max_players = webrtc_runtime.max_players;
+        let request = lobby_conn.send_request(|request| ClientMessage::CreateLobbyRequest {
+            request,
+            max_players,
         });
+        commands.entity(entity).try_insert(LobbyRequest(request));
     }
+}
+
+/// Fail every lobby waiting on a request to a server that cannot read it, and every one asked
+/// for afterwards, rather than at its timeout.
+///
+/// Every frame rather than once when the server is found out, because the two race: the answer
+/// that gives it away is to a `ListLobbies` queued when the connection was built, and on a fast
+/// network it is back on the very first frame — the same frame a join from the page's URL is
+/// sent, and before that join's pending lobby exists to be failed.
+pub(crate) fn refuse_requests_to_an_outdated_server(
+    mut commands: Commands,
+    lobby_conn: Res<LobbyConnection>,
+    mut join_failed: MessageWriter<LobbyJoinFailed>,
+    waiting: Query<Entity, (With<PendingLobby>, With<LobbyRequest>)>,
+) {
+    if !lobby_conn.server_outdated {
+        return;
+    }
+    for entity in waiting.iter() {
+        join_failed.write(LobbyJoinFailed {
+            reason: SERVER_OUTDATED.into(),
+        });
+        commands.entity(entity).try_despawn();
+    }
+}
+
+/// Spawn the pending lobby a join waits in, and send the request it waits on — unless a client
+/// lobby is already active or pending, which a second join would only confuse.
+fn start_join(
+    commands: &mut Commands,
+    lobby_conn: &mut LobbyConnection,
+    already_in_one: bool,
+    build: impl FnOnce(crate::protocol::RequestId) -> ClientMessage,
+) {
+    if already_in_one {
+        warn!("Ignoring join request while a client lobby is already active or pending");
+        return;
+    }
+    let request = lobby_conn.send_request(build);
+    commands.spawn((PendingLobby, LobbyRequest(request)));
 }
 
 pub(crate) fn join_requested_lobbies(
     mut commands: Commands,
-    lobby_conn: Res<LobbyConnection>,
+    mut lobby_conn: ResMut<LobbyConnection>,
     mut join_requests: MessageReader<JoinWebrtcLobby>,
     existing_client_lobbies: Query<(), (With<Lobby>, Without<Host>)>,
     pending_client_lobbies: Query<(), (With<PendingLobby>, Without<Host>)>,
@@ -527,21 +644,20 @@ pub(crate) fn join_requested_lobbies(
     let Some(join_request) = join_requests.read().last().copied() else {
         return;
     };
-    if !existing_client_lobbies.is_empty() || !pending_client_lobbies.is_empty() {
-        warn!("Ignoring join request while a client lobby is already active or pending");
-        return;
-    }
-
-    commands.spawn(PendingLobby);
-
-    let _ = lobby_conn.command_tx.send(ClientMessage::JoinLobby {
-        lobby_id: join_request.0,
-    });
+    start_join(
+        &mut commands,
+        &mut lobby_conn,
+        !existing_client_lobbies.is_empty() || !pending_client_lobbies.is_empty(),
+        |request| ClientMessage::JoinLobbyRequest {
+            request,
+            lobby_id: join_request.0,
+        },
+    );
 }
 
 pub(crate) fn join_requested_lobbies_by_code(
     mut commands: Commands,
-    lobby_conn: Res<LobbyConnection>,
+    mut lobby_conn: ResMut<LobbyConnection>,
     mut join_requests: MessageReader<JoinWebrtcLobbyByCode>,
     existing_client_lobbies: Query<(), (With<Lobby>, Without<Host>)>,
     pending_client_lobbies: Query<(), (With<PendingLobby>, Without<Host>)>,
@@ -549,16 +665,85 @@ pub(crate) fn join_requested_lobbies_by_code(
     let Some(join_request) = join_requests.read().last().cloned() else {
         return;
     };
-    if !existing_client_lobbies.is_empty() || !pending_client_lobbies.is_empty() {
-        warn!("Ignoring join request while a client lobby is already active or pending");
+    // Here rather than at each place a code comes from, so none of them can forget it.
+    let code = normalize_lobby_code(&join_request.0);
+    start_join(
+        &mut commands,
+        &mut lobby_conn,
+        !existing_client_lobbies.is_empty() || !pending_client_lobbies.is_empty(),
+        |request| ClientMessage::JoinLobbyByCodeRequest { request, code },
+    );
+}
+
+/// A pending lobby given up on before its answer arrived takes its request back.
+///
+/// Cancel, a timeout, a lost connection: any of them despawns the lobby while the server may
+/// already have acted on the request, or be about to. Without this the server kept this peer in a
+/// lobby nothing here knew of, and refused the next host or join "Already in a lobby" until the
+/// socket happened to be rebuilt. The answer, when it lands, is also cancelled (see
+/// `apply_lobby_events`); this is the half that does not have to wait for it.
+///
+/// On despawn rather than on removal: the component is removed on purpose when the answer is
+/// attached, and that is not a cancellation.
+pub(crate) fn cancel_abandoned_request(
+    trigger: On<Despawn, LobbyRequest>,
+    requests: Query<&LobbyRequest>,
+    lobby_conn: Option<ResMut<LobbyConnection>>,
+) {
+    let (Ok(request), Some(mut lobby_conn)) = (requests.get(trigger.event_target()), lobby_conn)
+    else {
         return;
-    }
+    };
+    let request = request.0;
+    debug!("a pending lobby was given up on; cancelling request {request}");
+    lobby_conn.cancel(request);
+}
 
-    commands.spawn(PendingLobby);
+/// How long a request refused for its rate waits before it is sent again. The lobby-operation
+/// budget refills one a second, and the signalling budget much faster.
+pub(crate) const RATE_LIMITED_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
-    let _ = lobby_conn.command_tx.send(ClientMessage::JoinLobbyByCode {
-        code: join_request.0,
+/// How many times one request is sent again after being refused for its rate before it counts as
+/// refused for good.
+pub(crate) const RATE_LIMITED_RETRIES: u8 = 3;
+
+/// How long a sent batch of signals is kept in case it is refused. A refusal comes back within a
+/// round trip; this is that with a wide margin, and what keeps the record of sent batches, which
+/// are never otherwise answered, from growing.
+const SIGNALS_KEPT_FOR: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Send again the requests the server refused for their rate, once their wait is over.
+///
+/// In the order they were first sent, so a peer's offer that was refused goes out before the
+/// candidates that were refused behind it.
+pub(crate) fn resend_rate_limited_requests(mut lobby_conn: ResMut<LobbyConnection>) {
+    let now = bevy_ensemble::Instant::now();
+    lobby_conn.unanswered.retain(|_, unanswered| {
+        // Lobby requests are kept until they are answered; signals and cancels never are, so they
+        // are kept only as long as a refusal could still be on its way.
+        unanswered.retry_at.is_some()
+            || !matches!(
+                unanswered.message,
+                ClientMessage::Signals { .. } | ClientMessage::CancelRequest { .. }
+            )
+            || now.duration_since(unanswered.sent_at) < SIGNALS_KEPT_FOR
     });
+    let mut due: Vec<crate::protocol::RequestId> = lobby_conn
+        .unanswered
+        .iter()
+        .filter(|(_, unanswered)| unanswered.retry_at.is_some_and(|at| at <= now))
+        .map(|(request, _)| *request)
+        .collect();
+    due.sort_unstable();
+    for request in due {
+        let Some(unanswered) = lobby_conn.unanswered.get_mut(&request) else {
+            continue;
+        };
+        unanswered.retry_at = None;
+        unanswered.sent_at = now;
+        let message = unanswered.message.clone();
+        let _ = lobby_conn.command_tx.send(message);
+    }
 }
 
 pub(crate) fn refresh_lobby_list(
@@ -1008,11 +1193,12 @@ impl DeferredSignals {
 
 /// Each frame, pump signals between the WS handler and the EnsembleSocket:
 /// 1. Drain incoming signals from LobbyConnection's signal_rx and feed them to socket.receive_signal()
-/// 2. Drain outbound signals from socket.drain_signals() and send them as ClientMessage::Signal
+/// 2. Drain outbound signals from socket.drain_signals() and send them, one
+///    [`ClientMessage::Signals`] per peer per frame
 pub(crate) fn pump_socket_signals(
     mut socket: ResMut<crate::EnsembleSocketRes>,
     mut deferred: ResMut<DeferredSignals>,
-    lobby_conn: Res<LobbyConnection>,
+    mut lobby_conn: ResMut<LobbyConnection>,
     host_lobbies: Query<(), (Or<(With<Lobby>, With<PendingLobby>)>, With<Host>)>,
     client_lobbies: Query<
         Option<&LobbyHostUuid>,
@@ -1050,18 +1236,41 @@ pub(crate) fn pump_socket_signals(
         }
     }
 
+    // One frame per peer per frame, however many signals it holds: see
+    // `ClientMessage::Signals`. In the order the socket produced them, which for one peer is the
+    // order they have to be applied in.
+    let mut batches: Vec<(u128, Vec<String>, Vec<&'static str>)> = Vec::new();
     for outgoing in socket.drain_signals() {
         let data = serde_json::to_string(&outgoing.signal).expect("Failed to serialize PeerSignal");
-        info!(
-            "-> {} to peer {:#x}",
-            signal_kind(&outgoing.signal),
-            outgoing.peer
-        );
-        let _ = lobby_conn.command_tx.send(ClientMessage::Signal {
-            receiver_uuid: outgoing.peer,
-            data,
-        });
+        let kind = signal_kind(&outgoing.signal);
+        match batches
+            .iter_mut()
+            .find(|(peer, _, _)| *peer == outgoing.peer)
+        {
+            Some((_, signals, kinds)) => {
+                signals.push(data);
+                kinds.push(kind);
+            }
+            None => batches.push((outgoing.peer, vec![data], vec![kind])),
+        }
     }
+    for (peer, signals, kinds) in batches {
+        info!("-> {} to peer {peer:#x}", describe_batch(&kinds));
+        lobby_conn.send_signals(peer, signals);
+    }
+}
+
+/// `offer, 3 candidates`: what one batch of signals holds, for a log line.
+fn describe_batch(kinds: &[&'static str]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for kind in ["offer", "answer", "candidate"] {
+        match kinds.iter().filter(|k| **k == kind).count() {
+            0 => {}
+            1 => parts.push(kind.to_owned()),
+            n => parts.push(format!("{n} {kind}s")),
+        }
+    }
+    parts.join(", ")
 }
 
 /// Detects when a lobby entity with a server-assigned ID is despawned.
@@ -1074,6 +1283,7 @@ pub(crate) fn detect_lobby_leave(
     webrtc_runtime: Res<crate::WebrtcRuntime>,
     display_name: Res<SignallingDisplayName>,
     mut removed: RemovedComponents<LobbyWebrtcId>,
+    mut per_socket: (ResMut<DeferredSignals>, ResMut<UntrustedPacketDrops>),
 ) {
     for _entity in removed.read() {
         info!("Lobby entity removed, sending LeaveLobby and rebuilding connection");
@@ -1095,7 +1305,17 @@ pub(crate) fn detect_lobby_leave(
         let (new_socket, lobby_connection) = webrtc_runtime.build_socket(&display_name.0);
         commands.insert_resource(new_socket);
         commands.insert_resource(lobby_connection);
+        forget_the_old_socket(&mut per_socket.0, &mut per_socket.1);
     }
+}
+
+/// What this side kept about peers on a socket that has just been replaced: offers held for an
+/// answer that can no longer be given, and counts of packets refused from peers it will never
+/// hear from again. Left in place, a peer from the last session would find its signals still
+/// waiting, and a peer reusing nothing would inherit nothing but noise.
+fn forget_the_old_socket(deferred: &mut DeferredSignals, drops: &mut UntrustedPacketDrops) {
+    deferred.0.clear();
+    drops.0.clear();
 }
 
 pub(crate) fn send_serialized_lobby_packet(
@@ -1234,19 +1454,18 @@ pub(crate) fn read_peer_messages(world: &mut World) {
 ///
 /// Only once `Welcome` has arrived -- before that there is no session to keep alive -- and never
 /// on a connection already known to be gone.
-pub(crate) fn send_keep_alives(
-    lobby_conn: Res<LobbyConnection>,
-    time: Res<Time>,
-    mut next_at: Local<f64>,
-) {
+///
+/// The schedule is the connection's own (`LobbyConnection::next_keep_alive_at`), so a rebuilt
+/// connection starts on its own clock rather than on whatever the last one had left.
+pub(crate) fn send_keep_alives(mut lobby_conn: ResMut<LobbyConnection>, time: Res<Time>) {
     if lobby_conn.local_player_uuid.is_none() || lobby_conn.signalling_lost {
         return;
     }
     let now = time.elapsed_secs_f64();
-    if now < *next_at {
+    if now < lobby_conn.next_keep_alive_at {
         return;
     }
-    *next_at = now + KEEP_ALIVE_INTERVAL_SECS;
+    lobby_conn.next_keep_alive_at = now + KEEP_ALIVE_INTERVAL_SECS;
     let _ = lobby_conn.command_tx.send(ClientMessage::KeepAlive);
 }
 
@@ -1265,6 +1484,7 @@ pub(crate) fn reconnect_signalling(
     time: Res<Time>,
     mut next_attempt: Local<f64>,
     lobbies_with_id: Query<(), With<LobbyWebrtcId>>,
+    mut per_socket: (ResMut<DeferredSignals>, ResMut<UntrustedPacketDrops>),
 ) {
     if !lobby_conn.signalling_lost || !lobbies_with_id.is_empty() {
         return;
@@ -1279,6 +1499,7 @@ pub(crate) fn reconnect_signalling(
     let (new_socket, lobby_connection) = webrtc_runtime.build_socket(&display_name.0);
     commands.insert_resource(new_socket);
     commands.insert_resource(lobby_connection);
+    forget_the_old_socket(&mut per_socket.0, &mut per_socket.1);
 }
 
 #[cfg(test)]

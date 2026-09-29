@@ -7,7 +7,8 @@
 //! the last commit before any variant was appended. They are never edited.
 
 use bevy_ensemble_webrtc::protocol::{
-    CAPABILITY_HOST_MIGRATION, ClientMessage, LobbyInfo, ServerMessage, decode, encode,
+    CAPABILITY_HOST_MIGRATION, ClientMessage, LobbyInfo, ServerMessage, SignallingError, decode,
+    encode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -238,6 +239,24 @@ fn a_new_client_message_fails_to_decode_on_a_pre_e5_server_rather_than_misreadin
         ClientMessage::DeclareGame {
             game: "a-game".into(),
         },
+        ClientMessage::CreateLobbyRequest {
+            request: 1,
+            max_players: 8,
+        },
+        ClientMessage::JoinLobbyRequest {
+            request: 1,
+            lobby_id: 5,
+        },
+        ClientMessage::JoinLobbyByCodeRequest {
+            request: 1,
+            code: "ABCD".into(),
+        },
+        ClientMessage::CancelRequest { request: 1 },
+        ClientMessage::Signals {
+            request: 1,
+            receiver_uuid: UUID,
+            signals: vec!["x".into()],
+        },
     ] {
         assert!(
             !decodes_as::<pre_e5::ClientMessage>(&bytes(&message)),
@@ -261,10 +280,52 @@ fn a_new_server_message_fails_to_decode_on_a_pre_e5_client_rather_than_misreadin
             code: "ABCD".into(),
             members: vec![1],
         },
+        ServerMessage::ServerHello {
+            capabilities: CAPABILITY_HOST_MIGRATION,
+        },
+        ServerMessage::Refused {
+            request: Some(1),
+            error: SignallingError::LobbyFull,
+        },
+        ServerMessage::LobbyCreatedFor {
+            request: 1,
+            lobby_id: 5,
+            code: "ABCD".into(),
+        },
+        ServerMessage::LobbyJoinedFor {
+            request: 1,
+            lobby_id: 5,
+            host_uuid: UUID,
+            existing_members: vec![1],
+            code: "ABCD".into(),
+        },
+        ServerMessage::Signals {
+            sender_uuid: UUID,
+            signals: vec!["x".into()],
+        },
     ] {
         assert!(
             !decodes_as::<pre_e5::ServerMessage>(&bytes(&message)),
             "{message:?} reads as a pre-E5 message"
         );
+    }
+}
+
+/// Every typed refusal is sent to a client from before the type as the text it has always been
+/// sent, which such a client may compare against.
+#[test]
+fn every_signalling_error_keeps_its_legacy_reason() {
+    for (error, reason) in [
+        (SignallingError::RateLimited, "rate limited"),
+        (SignallingError::NotAuthenticated, "Not authenticated"),
+        (
+            SignallingError::AlreadyAuthenticated,
+            "Already authenticated",
+        ),
+        (SignallingError::AlreadyInLobby, "Already in a lobby"),
+        (SignallingError::LobbyNotFound, "Lobby not found"),
+        (SignallingError::LobbyFull, "Lobby is full"),
+    ] {
+        assert_eq!(error.legacy_reason(), reason);
     }
 }

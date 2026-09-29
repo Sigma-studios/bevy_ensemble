@@ -6,7 +6,8 @@
 use std::time::Duration;
 
 use bevy_ensemble_webrtc::protocol::{
-    CAPABILITY_HOST_MIGRATION, ClientMessage, ServerMessage, decode, encode,
+    CAPABILITIES, CAPABILITY_HOST_MIGRATION, CAPABILITY_TYPED_REQUESTS, ClientMessage,
+    ServerMessage, SignallingError, decode, encode,
 };
 use bevy_ensemble_webrtc::server::test_support::SignallingServer;
 use bevy_ensemble_webrtc::server::{Limits, MAX_PLAYERS};
@@ -894,5 +895,269 @@ async fn a_code_from_another_game_is_not_found() {
     match join_by_code(&mut player, &code).await {
         ServerMessage::LobbyJoined { .. } => {}
         other => panic!("expected LobbyJoined, got {other:?}"),
+    }
+}
+
+// --- Typed requests ----------------------------------------------------------------------------
+
+/// A fresh, authenticated connection that declares everything this build can do, the way the
+/// plugin connects. The server greets it before anything else.
+async fn typed_player(server: &SignallingServer, name: &str) -> (Ws, u128) {
+    let (mut ws, uuid) = player(server, name).await;
+    send(
+        &mut ws,
+        &ClientMessage::DeclareCapabilities {
+            capabilities: CAPABILITIES,
+        },
+    )
+    .await;
+    match recv(&mut ws).await {
+        ServerMessage::ServerHello { capabilities } => {
+            assert_ne!(capabilities & CAPABILITY_TYPED_REQUESTS, 0)
+        }
+        other => panic!("expected ServerHello, got {other:?}"),
+    }
+    (ws, uuid)
+}
+
+/// Create a lobby by typed request, skipping the `LobbyMigratable` that follows.
+async fn typed_create(ws: &mut Ws, request: u32) -> (u64, String) {
+    send(
+        ws,
+        &ClientMessage::CreateLobbyRequest {
+            request,
+            max_players: 8,
+        },
+    )
+    .await;
+    let created = match recv(ws).await {
+        ServerMessage::LobbyCreatedFor {
+            request: answered,
+            lobby_id,
+            code,
+        } => {
+            assert_eq!(answered, request);
+            (lobby_id, code)
+        }
+        other => panic!("expected LobbyCreatedFor, got {other:?}"),
+    };
+    assert!(matches!(
+        recv(ws).await,
+        ServerMessage::LobbyMigratable { .. }
+    ));
+    created
+}
+
+/// Each answer names the request it answers, and each refusal is typed — including the one a
+/// client from before could only read as text.
+#[tokio::test]
+async fn a_typed_request_is_answered_and_refused_under_its_own_id() {
+    let server = SignallingServer::start();
+    let (mut ws, _) = typed_player(&server, "typed").await;
+
+    send(
+        &mut ws,
+        &ClientMessage::JoinLobbyByCodeRequest {
+            request: 7,
+            code: "ZZZZ".into(),
+        },
+    )
+    .await;
+    match recv(&mut ws).await {
+        ServerMessage::Refused { request, error } => {
+            assert_eq!((request, error), (Some(7), SignallingError::LobbyNotFound))
+        }
+        other => panic!("expected a typed refusal, got {other:?}"),
+    }
+
+    let (lobby_id, code) = typed_create(&mut ws, 8).await;
+
+    send(
+        &mut ws,
+        &ClientMessage::CreateLobbyRequest {
+            request: 9,
+            max_players: 8,
+        },
+    )
+    .await;
+    // The third lobby operation in a second: over that budget, and refused by id like the rest.
+    match recv(&mut ws).await {
+        ServerMessage::Refused { request, error } => {
+            assert_eq!((request, error), (Some(9), SignallingError::RateLimited))
+        }
+        other => panic!("expected a typed refusal, got {other:?}"),
+    }
+    // A join by id is not a lobby operation, so it gets as far as the real refusal.
+    send(
+        &mut ws,
+        &ClientMessage::JoinLobbyRequest {
+            request: 10,
+            lobby_id,
+        },
+    )
+    .await;
+    match recv(&mut ws).await {
+        ServerMessage::Refused { request, error } => {
+            assert_eq!(
+                (request, error),
+                (Some(10), SignallingError::AlreadyInLobby)
+            )
+        }
+        other => panic!("expected a typed refusal, got {other:?}"),
+    }
+
+    // A joiner is told the code, by id as well as by code, and is found whatever the case.
+    let (mut joiner, _) = typed_player(&server, "joiner").await;
+    send(
+        &mut joiner,
+        &ClientMessage::JoinLobbyByCodeRequest {
+            request: 1,
+            code: format!(" {}\n", code.to_lowercase()),
+        },
+    )
+    .await;
+    match recv(&mut joiner).await {
+        ServerMessage::LobbyJoinedFor {
+            request,
+            code: told,
+            ..
+        } => assert_eq!((request, told), (1, code)),
+        other => panic!("expected LobbyJoinedFor, got {other:?}"),
+    }
+}
+
+/// A cancel takes back the lobby its own request made, and nothing else: not a lobby a later
+/// request made, which is the one a stale cancel would otherwise take down.
+#[tokio::test]
+async fn a_cancel_takes_back_only_the_lobby_its_own_request_made() {
+    let server = SignallingServer::start();
+    let (mut ws, uuid) = typed_player(&server, "canceller").await;
+    let in_lobby = || {
+        server
+            .state()
+            .connections
+            .get(&uuid)
+            .and_then(|c| c.lobby_id)
+    };
+
+    let (first, _) = typed_create(&mut ws, 1).await;
+    send(&mut ws, &ClientMessage::CancelRequest { request: 1 }).await;
+    // The leaving player is told nothing about an empty lobby; a list round trip orders it.
+    assert!(matches!(
+        list_lobbies(&mut ws).await,
+        ServerMessage::LobbyList { .. }
+    ));
+    assert_eq!(in_lobby(), None, "the cancel left lobby {first}");
+
+    let (second, _) = typed_create(&mut ws, 2).await;
+    // Stale: the answer to request 1 arriving late, cancelled again.
+    send(&mut ws, &ClientMessage::CancelRequest { request: 1 }).await;
+    assert!(matches!(
+        list_lobbies(&mut ws).await,
+        ServerMessage::LobbyList { .. }
+    ));
+    assert_eq!(
+        in_lobby(),
+        Some(second),
+        "a stale cancel left the newer lobby"
+    );
+}
+
+/// Signalling is paid from its own budget, per signal: a host opening a full lobby's connections
+/// at once is inside it and leaves the general budget untouched, and past it a batch is refused
+/// under its own id so it can be sent again. A member that declared batching is relayed a batch
+/// as one frame; one that did not, as a frame per signal.
+#[tokio::test]
+async fn signalling_is_paid_from_its_own_budget() {
+    let server = SignallingServer::start();
+    let limits = Limits::default();
+    let (mut host, host_uuid) = typed_player(&server, "host").await;
+    let (_, code) = typed_create(&mut host, 1).await;
+
+    let (mut batched, batched_uuid) = typed_player(&server, "batched").await;
+    send(
+        &mut batched,
+        &ClientMessage::JoinLobbyByCodeRequest {
+            request: 1,
+            code: code.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv(&mut batched).await,
+        ServerMessage::LobbyJoinedFor { .. }
+    ));
+    let (mut single, single_uuid) = player(&server, "single").await;
+    assert!(matches!(
+        join_by_code(&mut single, &code).await,
+        ServerMessage::LobbyJoined { .. }
+    ));
+    drain(&mut host).await;
+    drain(&mut batched).await;
+
+    // Eight players' worth of offers and candidates, more than the general burst in frames.
+    let frames = limits.message_burst as usize + 10;
+    for request in 0..frames as u32 {
+        send(
+            &mut host,
+            &ClientMessage::Signals {
+                request,
+                receiver_uuid: batched_uuid,
+                signals: vec!["offer".into(), "candidate".into()],
+            },
+        )
+        .await;
+    }
+    send(
+        &mut host,
+        &ClientMessage::Signals {
+            request: 1000,
+            receiver_uuid: single_uuid,
+            signals: vec!["offer".into(), "candidate".into()],
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            list_lobbies(&mut host).await,
+            ServerMessage::LobbyList { .. }
+        ),
+        "signalling was charged to the general budget"
+    );
+    for _ in 0..frames {
+        match recv(&mut batched).await {
+            ServerMessage::Signals {
+                sender_uuid,
+                signals,
+            } => assert_eq!((sender_uuid, signals.len()), (host_uuid, 2)),
+            other => panic!("expected a batch, got {other:?}"),
+        }
+    }
+    for data in ["offer", "candidate"] {
+        match recv(&mut single).await {
+            ServerMessage::Signal {
+                sender_uuid,
+                data: got,
+            } => assert_eq!((sender_uuid, got.as_str()), (host_uuid, data)),
+            other => panic!("expected one signal per frame, got {other:?}"),
+        }
+    }
+
+    // Past the signalling budget, a batch is refused by id.
+    let too_many = limits.signal_burst as usize;
+    send(
+        &mut host,
+        &ClientMessage::Signals {
+            request: 2000,
+            receiver_uuid: batched_uuid,
+            signals: vec![String::new(); too_many],
+        },
+    )
+    .await;
+    match recv(&mut host).await {
+        ServerMessage::Refused { request, error } => {
+            assert_eq!((request, error), (Some(2000), SignallingError::RateLimited))
+        }
+        other => panic!("expected the over-budget batch refused, got {other:?}"),
     }
 }

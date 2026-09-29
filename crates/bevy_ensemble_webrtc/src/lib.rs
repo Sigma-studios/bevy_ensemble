@@ -18,6 +18,8 @@ mod connection;
 #[cfg(feature = "client")]
 mod handshake;
 #[cfg(feature = "client")]
+mod join_first;
+#[cfg(feature = "client")]
 mod session;
 #[cfg(feature = "client")]
 mod systems;
@@ -30,6 +32,8 @@ pub use bevy_ensemble::PeerRtt;
 use bevy_ensemble::{EnsembleAppExt, EnsembleTransportAppExt, MessageAuthority};
 #[cfg(feature = "client")]
 pub use bevy_ensemble_sockets::{IceServer, IceServers};
+#[cfg(feature = "client")]
+pub use join_first::JoinFirstLobby;
 
 /// Bevy plugin for WebRTC P2P networking via a signaling server.
 ///
@@ -316,14 +320,192 @@ pub struct RefreshLobbyList;
 pub struct JoinWebrtcLobby(pub u64);
 
 /// Write this message to join a lobby by its 4-letter code.
+///
+/// The code is normalised with [`normalize_lobby_code`](protocol::normalize_lobby_code) when this
+/// is handled — whitespace dropped, upper-cased — so a menu, a link and a test can all write what
+/// they were given.
 #[cfg(feature = "client")]
 #[derive(Message, Clone, Debug)]
 pub struct JoinWebrtcLobbyByCode(pub String);
 
-/// Stores the lobby's short join code, assigned by the signaling server.
+/// The lobby's short join code, as the signalling server assigned it.
+///
+/// On the lobby entity for the host and, from the moment the server confirms the join, for every
+/// joiner too — however they came in: by code, by id from the listing, or through a link. It
+/// follows the lobby through a host migration.
 #[cfg(feature = "client")]
 #[derive(Component)]
 pub struct LobbyWebrtcCode(pub String);
+
+/// The signalling server refused something this peer sent, and why.
+///
+/// Written for every refusal, which is more than the failures a player needs to hear about: a
+/// join or a host the server turned down also ends with [`LobbyJoinFailed`] — the reason in
+/// words, the pending lobby gone — while a request refused only for its rate is sent again on its
+/// own and ends nothing. This is for a game that wants to tell those apart, or count them.
+///
+/// [`LobbyJoinFailed`]: bevy_ensemble::LobbyJoinFailed
+#[cfg(feature = "client")]
+#[derive(Message, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignallingRefused {
+    pub error: protocol::SignallingError,
+}
+
+/// On a pending lobby, the request that is to become it, until the server's answer arrives.
+///
+/// What ties an answer to the lobby waiting for it, and what a pending lobby that is despawned
+/// before the answer takes back with it: see [`systems::cancel_abandoned_request`].
+#[cfg(feature = "client")]
+#[derive(Component, Clone, Copy, Debug)]
+pub(crate) struct LobbyRequest(pub protocol::RequestId);
+
+/// Join the lobby whose code is in the page's URL, once, at startup.
+///
+/// `https://…/index.html?room=ABCD` drops a player straight into a friend's lobby: "join my game"
+/// is a link, not a code read aloud. The value goes through [`JoinWebrtcLobbyByCode`], so it is
+/// normalised like any other code, and a missing or empty parameter does nothing.
+///
+/// On the web only. Off it there is no page, and this does nothing at all; a native build that
+/// wants the same from its command line or environment writes [`JoinWebrtcLobbyByCode`] itself.
+///
+/// ```rust,ignore
+/// app.add_plugins(JoinFromUrlPlugin::default()); // `?room=CODE`
+/// ```
+#[cfg(feature = "client")]
+pub struct JoinFromUrlPlugin {
+    /// The query parameter the code is read from. `room` by default.
+    pub param: &'static str,
+}
+
+#[cfg(feature = "client")]
+impl Default for JoinFromUrlPlugin {
+    fn default() -> Self {
+        Self { param: "room" }
+    }
+}
+
+#[cfg(feature = "client")]
+impl Plugin for JoinFromUrlPlugin {
+    fn build(&self, app: &mut App) {
+        let param = self.param;
+        app.add_systems(
+            Startup,
+            move |mut join: MessageWriter<JoinWebrtcLobbyByCode>| {
+                let Some(code) = page_query_param(param) else {
+                    return;
+                };
+                let code = protocol::normalize_lobby_code(&code);
+                if code.is_empty() {
+                    return;
+                }
+                info!("joining lobby {code} from the page URL");
+                join.write(JoinWebrtcLobbyByCode(code));
+            },
+        );
+    }
+}
+
+/// The value of the query parameter `name` in the page's URL, as written there. `None` when it is
+/// absent, and always off the web.
+///
+/// The fragment is ignored, `?a=1&room=ABCD#top` gives `ABCD` for `room`, and a parameter
+/// present with no `=` is `Some("")`. Nothing is percent-decoded: this is for short codes and
+/// flags, not for arbitrary text.
+#[cfg(feature = "client")]
+pub fn page_query_param(name: &str) -> Option<String> {
+    query_param_of(&page_url()?, name)
+}
+
+#[cfg(all(feature = "client", target_arch = "wasm32"))]
+fn page_url() -> Option<String> {
+    web_sys::window()?.location().href().ok()
+}
+
+#[cfg(all(feature = "client", not(target_arch = "wasm32")))]
+fn page_url() -> Option<String> {
+    None
+}
+
+#[cfg(feature = "client")]
+fn query_param_of(url: &str, name: &str) -> Option<String> {
+    let without_fragment = url.split('#').next().unwrap_or(url);
+    let (_, query) = without_fragment.split_once('?')?;
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        (key == name).then(|| value.to_owned())
+    })
+}
+
+#[cfg(all(test, feature = "client"))]
+mod query_param_tests {
+    use super::query_param_of;
+
+    #[test]
+    fn a_query_parameter_is_read_from_a_page_url() {
+        let url = "https://example.com/game/index.html?name=x&room=abcd#top";
+        assert_eq!(query_param_of(url, "room").as_deref(), Some("abcd"));
+        assert_eq!(query_param_of(url, "name").as_deref(), Some("x"));
+        assert_eq!(
+            query_param_of(url, "top"),
+            None,
+            "the fragment is not the query"
+        );
+        assert_eq!(
+            query_param_of("https://x/?room", "room").as_deref(),
+            Some("")
+        );
+        assert_eq!(query_param_of("https://x/#?room=ABCD", "room"), None);
+        assert_eq!(query_param_of("https://x/", "room"), None);
+    }
+}
+
+/// App extensions for the signalling side of this crate.
+#[cfg(feature = "client")]
+pub trait SignallingAppExt {
+    /// Keep [`SignallingDisplayName`] equal to a name the game already keeps somewhere else.
+    ///
+    /// A game has one name for its player — typed in a menu, saved in a profile — and the
+    /// signalling server's listing is a second place it has to reach. `name` reads it out of the
+    /// resource `R` whenever `R` changes, and the listing follows; a resource that does not
+    /// exist yet is waited for.
+    ///
+    /// ```rust,ignore
+    /// app.sync_listing_name_from(|profile: &LocalPlayerData<Profile>| profile.0.name.clone());
+    /// ```
+    ///
+    /// Requires [`BevyEnsembleWebrtcPlugin`].
+    fn sync_listing_name_from<R: Resource>(
+        &mut self,
+        name: impl Fn(&R) -> String + Send + Sync + 'static,
+    ) -> &mut Self;
+}
+
+#[cfg(feature = "client")]
+impl SignallingAppExt for App {
+    fn sync_listing_name_from<R: Resource>(
+        &mut self,
+        name: impl Fn(&R) -> String + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.add_systems(
+            Update,
+            (move |source: Option<Res<R>>, listing: Option<ResMut<SignallingDisplayName>>| {
+                let (Some(source), Some(mut listing)) = (source, listing) else {
+                    return;
+                };
+                // Compared before it is written, so an unchanged name is not a change the
+                // publisher would read as something to re-send.
+                if !source.is_changed() && !listing.is_added() {
+                    return;
+                }
+                let name = name(&source);
+                if listing.0 != name {
+                    listing.0 = name;
+                }
+            })
+            .before(systems::publish_display_name),
+        )
+    }
+}
 
 /// Newtype wrapper around [`bevy_ensemble_sockets::EnsembleSocket`] so it can be used as a Bevy Resource.
 #[cfg(feature = "client")]
@@ -414,6 +596,9 @@ impl WebrtcRuntime {
             local_player_uuid: None,
             signalling_lost: false,
             announced_name: display_name.to_owned(),
+            server_outdated: false,
+            unanswered: Default::default(),
+            next_keep_alive_at: 0.0,
         };
 
         (EnsembleSocketRes(socket), lobby_connection)
@@ -448,6 +633,7 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
             .add_message::<JoinWebrtcLobbyByCode>()
             .add_message::<RefreshLobbyList>()
             .add_message::<RelayReport>()
+            .add_message::<SignallingRefused>()
             // A control message: never relayed through the broadcast path, and on a client
             // taken only from the host. `from_host: true` from anybody else is refused before it
             // is decoded, on top of the sender check in `promote_client_lobby_on_host_handshake`.
@@ -469,10 +655,21 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
             .add_systems(
                 Update,
                 (
-                    systems::create_lobby,
-                    systems::join_requested_lobbies,
-                    systems::join_requested_lobbies_by_code,
+                    // After the lobby events, so a request goes out only once this frame's answers
+                    // have been read: an answer can then never arrive before the pending lobby
+                    // is marked with the request it answers, and be taken for one nobody wants.
+                    systems::create_lobby.after(systems::apply_lobby_events),
+                    systems::join_requested_lobbies.after(systems::apply_lobby_events),
+                    systems::join_requested_lobbies_by_code.after(systems::apply_lobby_events),
                     systems::refresh_lobby_list,
+                    // After the listing is applied and before the join and the refresh it asks
+                    // for are sent, so both go out the frame they are decided on, and the pending
+                    // lobby a join spawns exists before this runs again.
+                    join_first::join_first_lobby
+                        .run_if(resource_exists::<JoinFirstLobby>)
+                        .after(systems::apply_lobby_events)
+                        .before(systems::join_requested_lobbies)
+                        .before(systems::refresh_lobby_list),
                     systems::poll_socket_peers,
                     systems::poll_peer_routes,
                     // After the lobby events so that, on the frame a client's `LobbyJoined` and
@@ -480,6 +677,12 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
                     // The signalling server sends them in that order and the WebSocket task
                     // forwards them in that order; this keeps it so across the two channels.
                     systems::pump_socket_signals.after(systems::apply_lobby_events),
+                    systems::resend_rate_limited_requests.after(systems::apply_lobby_events),
+                    systems::refuse_requests_to_an_outdated_server
+                        .after(systems::apply_lobby_events)
+                        .after(systems::create_lobby)
+                        .after(systems::join_requested_lobbies)
+                        .after(systems::join_requested_lobbies_by_code),
                     systems::send_keep_alives,
                     handshake::send_client_handshakes,
                     handshake::send_host_handshakes,
@@ -510,6 +713,7 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
                 ),
             )
             .add_observer(systems::send_serialized_lobby_packet)
+            .add_observer(systems::cancel_abandoned_request)
             .add_observer(systems::disconnect_removed_lobby_client);
     }
 }

@@ -12,7 +12,10 @@
 use dashmap::Entry;
 use rand::Rng;
 
-use crate::protocol::{CAPABILITY_HOST_MIGRATION, LobbyInfo, ServerMessage};
+use crate::protocol::{
+    CAPABILITY_HOST_MIGRATION, LobbyInfo, RequestId, ServerMessage, SignallingError,
+    normalize_lobby_code,
+};
 
 use super::state::{LobbyState, ServerState};
 
@@ -46,12 +49,6 @@ fn generate_lobby_code(state: &ServerState) -> String {
     }
 }
 
-fn refusal(reason: &str) -> ServerMessage {
-    ServerMessage::LobbyError {
-        reason: reason.into(),
-    }
-}
-
 fn migratable(state: &ServerState, lobby_id: u64) -> ServerMessage {
     ServerMessage::LobbyMigratable {
         lobby_id,
@@ -66,19 +63,23 @@ fn migratable(state: &ServerState, lobby_id: u64) -> ServerMessage {
 
 /// Create a lobby hosted by `host_uuid`.
 ///
+/// `request` is the id of a typed request, answered with [`ServerMessage::LobbyCreatedFor`];
+/// `None` is the untyped `CreateLobby`, answered as it always was.
+///
 /// `Ok` once the host has been sent everything it is owed; `Err` is the refusal to send back.
 pub fn create_lobby(
     state: &ServerState,
     host_uuid: u128,
     max_players: u32,
-) -> Result<(), ServerMessage> {
+    request: Option<RequestId>,
+) -> Result<(), SignallingError> {
     let (host_name, host_migration, game) = {
         let conn = state
             .connections
             .get(&host_uuid)
-            .ok_or_else(|| refusal("Not authenticated"))?;
+            .ok_or(SignallingError::NotAuthenticated)?;
         if conn.lobby_id.is_some() {
-            return Err(refusal("Already in a lobby"));
+            return Err(SignallingError::AlreadyInLobby);
         }
         (
             conn.display_name.clone(),
@@ -111,12 +112,18 @@ pub fn create_lobby(
         state.lobby_codes.insert(code.clone(), lobby_id);
         if let Some(mut conn) = state.connections.get_mut(&host_uuid) {
             conn.lobby_id = Some(lobby_id);
+            conn.entered_by = request;
         }
+        let code = code.clone();
         state.send_to(
             host_uuid,
-            ServerMessage::LobbyCreated {
-                lobby_id,
-                code: code.clone(),
+            match request {
+                Some(request) => ServerMessage::LobbyCreatedFor {
+                    request,
+                    lobby_id,
+                    code,
+                },
+                None => ServerMessage::LobbyCreated { lobby_id, code },
             },
         );
         if lobby.host_migration {
@@ -128,20 +135,24 @@ pub fn create_lobby(
 
 /// Add `player_uuid` to the lobby `lobby_id`.
 ///
+/// `request` as for [`create_lobby`]: a typed request is answered with
+/// [`ServerMessage::LobbyJoinedFor`], which carries the code as well.
+///
 /// `Ok` once the joiner and the members have been sent everything they are owed; `Err` is the
 /// refusal to send back.
 pub fn join_lobby(
     state: &ServerState,
     player_uuid: u128,
     lobby_id: u64,
-) -> Result<(), ServerMessage> {
+    request: Option<RequestId>,
+) -> Result<(), SignallingError> {
     let (joiner_migrates, game) = {
         let conn = state
             .connections
             .get(&player_uuid)
-            .ok_or_else(|| refusal("Not authenticated"))?;
+            .ok_or(SignallingError::NotAuthenticated)?;
         if conn.lobby_id.is_some() {
-            return Err(refusal("Already in a lobby"));
+            return Err(SignallingError::AlreadyInLobby);
         }
         (conn.declares(CAPABILITY_HOST_MIGRATION), conn.game.clone())
     };
@@ -152,16 +163,17 @@ pub fn join_lobby(
         .lobbies
         .get_mut(&lobby_id)
         .filter(|lobby| lobby.game == game)
-        .ok_or_else(|| refusal("Lobby not found"))?;
+        .ok_or(SignallingError::LobbyNotFound)?;
 
     if lobby.members.len() as u32 >= lobby.max_players {
-        return Err(refusal("Lobby is full"));
+        return Err(SignallingError::LobbyFull);
     }
 
     let existing_members = lobby.members.clone();
     lobby.members.push(player_uuid);
     if let Some(mut conn) = state.connections.get_mut(&player_uuid) {
         conn.lobby_id = Some(lobby_id);
+        conn.entered_by = request;
     }
 
     state.send_to_all_except(
@@ -169,12 +181,22 @@ pub fn join_lobby(
         player_uuid,
         ServerMessage::PlayerJoined { player_uuid },
     );
+    let host_uuid = lobby.host_uuid;
     state.send_to(
         player_uuid,
-        ServerMessage::LobbyJoined {
-            lobby_id,
-            host_uuid: lobby.host_uuid,
-            existing_members,
+        match request {
+            Some(request) => ServerMessage::LobbyJoinedFor {
+                request,
+                lobby_id,
+                host_uuid,
+                existing_members,
+                code: lobby.code.clone(),
+            },
+            None => ServerMessage::LobbyJoined {
+                lobby_id,
+                host_uuid,
+                existing_members,
+            },
         },
     );
     // A joiner that did not declare the capability could not decode this, and has nothing to do
@@ -189,12 +211,26 @@ pub fn join_lobby_by_code(
     state: &ServerState,
     player_uuid: u128,
     code: &str,
-) -> Result<(), ServerMessage> {
-    let code = code.to_uppercase();
+    request: Option<RequestId>,
+) -> Result<(), SignallingError> {
+    let code = normalize_lobby_code(code);
     let Some(lobby_id) = state.lobby_codes.get(&code).map(|r| *r) else {
-        return Err(refusal("Lobby not found"));
+        return Err(SignallingError::LobbyNotFound);
     };
-    join_lobby(state, player_uuid, lobby_id)
+    join_lobby(state, player_uuid, lobby_id, request)
+}
+
+/// Take back `request`: leave the lobby it put `player_uuid` in, if that is where it still is.
+/// See [`ClientMessage::CancelRequest`](crate::protocol::ClientMessage::CancelRequest).
+pub fn cancel_request(state: &ServerState, player_uuid: u128, request: RequestId) {
+    let entered_by_it = state
+        .connections
+        .get(&player_uuid)
+        .is_some_and(|conn| conn.lobby_id.is_some() && conn.entered_by == Some(request));
+    if entered_by_it {
+        tracing::info!("{player_uuid} cancelled request {request}; leaving the lobby it made");
+        leave_lobby(state, player_uuid);
+    }
 }
 
 /// `player_uuid` leaves its lobby: on request, or because its connection ended.
@@ -232,6 +268,7 @@ fn depart(state: &ServerState, player_uuid: u128, departure: Departure) {
         // being refused "Already in a lobby" for good.
         if let Some(mut conn) = state.connections.get_mut(&player_uuid) {
             conn.lobby_id = None;
+            conn.entered_by = None;
         }
         return;
     };
@@ -242,6 +279,7 @@ fn depart(state: &ServerState, player_uuid: u128, departure: Departure) {
     }
     if let Some(mut conn) = state.connections.get_mut(&player_uuid) {
         conn.lobby_id = None;
+        conn.entered_by = None;
     }
 
     // Collect the peers the leaving player was connected to,
@@ -346,6 +384,7 @@ fn disconnect(state: &ServerState, members: &[u128], reason: &str) {
         );
         if let Some(mut conn) = state.connections.get_mut(&uuid) {
             conn.lobby_id = None;
+            conn.entered_by = None;
         }
     }
 }

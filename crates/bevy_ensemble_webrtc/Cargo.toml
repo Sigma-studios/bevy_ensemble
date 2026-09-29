@@ -39,6 +39,8 @@ async-tungstenite = { version = "0.32", features = ["tokio-runtime", "tokio-rust
 tokio = { version = "1", features = ["sync"] }
 ws_stream_wasm = { version = "0.7", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
+# The page's URL, for `page_query_param` and `JoinFromUrlPlugin`.
+web-sys = { version = "0.3", features = ["Window", "Location"], optional = true }
 getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [features]
@@ -51,6 +53,7 @@ client = [
     "dep:async-tungstenite",
     "dep:ws_stream_wasm",
     "dep:wasm-bindgen-futures",
+    "dep:web-sys",
 ]
 server = [
     "dep:axum",
@@ -85,6 +88,18 @@ required-features = ["server"]
 
 [[test]]
 name = "lobby_listing"
+required-features = ["server"]
+
+[[test]]
+name = "lobby_requests"
+required-features = ["server"]
+
+[[test]]
+name = "signalling_burst"
+required-features = ["server"]
+
+[[test]]
+name = "join_first_lobby"
 required-features = ["server"]
 
 [[example]]
