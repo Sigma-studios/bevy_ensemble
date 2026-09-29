@@ -87,6 +87,7 @@ use bevy::prelude::*;
 mod broadcast;
 mod components;
 pub mod handshake;
+mod link_report;
 mod messages;
 mod migration;
 #[cfg(feature = "netdebug")]
@@ -114,6 +115,7 @@ pub use broadcast::{
 };
 pub use components::*;
 pub use handshake::{HandshakeVerified, ProtocolHandshake};
+pub use link_report::{LinkEntry, ParticipantLink, ParticipantLinks};
 pub use messages::*;
 pub use migration::{
     AwaitingHost, AwaitingSeat, HostChanged, HostLossCause, HostLost, HostMigratable,
@@ -217,6 +219,11 @@ impl Plugin for EnsemblePlugin {
                 "bevy_ensemble/Pong",
                 MessageAuthority::Any,
             )
+            // Who is connected how is the host's to say: it is the only peer that can see.
+            .register_control_message_type::<link_report::ParticipantLinks>(
+                "bevy_ensemble/ParticipantLinks",
+                MessageAuthority::HostOnly,
+            )
             // Only a host may close its lobby for everyone.
             .register_control_message_type::<migration::LobbyClosed>(
                 "bevy_ensemble/LobbyClosed",
@@ -266,6 +273,13 @@ impl Plugin for EnsemblePlugin {
                     ping::receive_pongs,
                     ping::tick_last_pong,
                     ping::detect_dead_peers.after(ping::tick_last_pong),
+                ),
+            )
+            .add_systems(
+                Update,
+                (
+                    link_report::send_link_reports,
+                    link_report::receive_link_reports,
                 ),
             );
 
