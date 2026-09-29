@@ -232,11 +232,13 @@ fn encode<T: bevy_ensemble::EnsembleMessage>(
     encode_ensemble_message(registry, message)
 }
 
-fn held_from(net: &LoopbackNetwork, peer: PeerId, sender: u128) -> usize {
-    net.app(peer)
-        .world()
-        .get_resource::<HeldUntilVerified>()
-        .map_or(0, |held| held.held_for(sender))
+fn held_from(net: &mut LoopbackNetwork, peer: PeerId, sender: u128) -> usize {
+    let world = net.app_mut(peer).world_mut();
+    world
+        .query::<&HeldUntilVerified>()
+        .iter(world)
+        .map(|held| held.held_for(sender))
+        .sum()
 }
 
 // ── Losing the host ──────────────────────────────────────────────────────────
@@ -439,7 +441,7 @@ fn the_old_hosts_word_counts_for_nothing_after_the_change() {
     );
     assert!(departures(&net, b).is_empty());
     assert!(
-        held_from(&net, b, HOST) > 0,
+        held_from(&mut net, b, HOST) > 0,
         "it is held unread: the old host is no longer a peer b has verified"
     );
 }

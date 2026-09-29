@@ -126,11 +126,13 @@ fn refused(net: &LoopbackNetwork, peer: PeerId) -> u64 {
 
 /// Packets `peer` is holding from `sender`, unread, because `sender` never verified a protocol
 /// with it.
-fn held_from(net: &LoopbackNetwork, peer: PeerId, sender: u128) -> usize {
-    net.app(peer)
-        .world()
-        .resource::<bevy_ensemble::HeldUntilVerified>()
-        .held_for(sender)
+fn held_from(net: &mut LoopbackNetwork, peer: PeerId, sender: u128) -> usize {
+    let world = net.app_mut(peer).world_mut();
+    world
+        .query::<&bevy_ensemble::HeldUntilVerified>()
+        .iter(world)
+        .map(|held| held.held_for(sender))
+        .sum()
 }
 
 fn participants(net: &mut LoopbackNetwork, peer: PeerId) -> Vec<(u128, bool)> {
@@ -283,7 +285,7 @@ fn a_backends_ready_handshake_is_read_before_the_protocol_is_verified() {
         "the ready handshake was read from the unverified sender"
     );
     assert_eq!(
-        held_from(&net, a, 3),
+        held_from(&mut net, a, 3),
         1,
         "and the other control message waits"
     );
@@ -347,7 +349,7 @@ fn a_roster_sync_from_a_non_host_is_ignored() {
         "no phantom host appeared"
     );
     // B never verified a protocol with A — B is not A's host — so A holds B's bytes unread.
-    assert_eq!(held_from(&net, a, 3), 1);
+    assert_eq!(held_from(&mut net, a, 3), 1);
 }
 
 #[test]
@@ -360,7 +362,7 @@ fn a_removal_from_a_non_host_does_not_remove_anyone() {
         has_lobby(&mut net, a),
         "A was told to leave by somebody who may not say so"
     );
-    assert_eq!(held_from(&net, a, 3), 1, "and never read what B said");
+    assert_eq!(held_from(&mut net, a, 3), 1, "and never read what B said");
 }
 
 #[test]
@@ -404,7 +406,7 @@ fn player_data_on_a_client_is_taken_only_from_the_host() {
     net.deliver_raw(a, 3, bytes);
     net.run(4);
     assert_eq!(name_of(&mut net, a, 3), None);
-    assert_eq!(held_from(&net, a, 3), 1);
+    assert_eq!(held_from(&mut net, a, 3), 1);
 }
 
 #[test]

@@ -202,6 +202,8 @@ pub(crate) fn send_pings(
     mut cooldown: Local<f32>,
 ) {
     if lobbies.is_empty() {
+        // The next session starts its own clock rather than inheriting what was left of this one.
+        *cooldown = 0.0;
         return;
     }
     *cooldown -= time.delta_secs();
@@ -446,8 +448,10 @@ pub(crate) fn receive_pongs(
         }
         accepted_this_run.push((sender, pong.seq, pong.reliable));
 
+        // `try_`: a seat can be despawned in the same frame its pong is read — a liveness
+        // timeout, a disconnect — and an insert on an entity that is gone is an error.
         if pong.reliable {
-            commands.entity(entity).insert((
+            commands.entity(entity).try_insert((
                 PeerReliableRtt(smooth(prev_reliable.map(|p| p.0), sample.e2e)),
                 PeerLastPong(0.0),
             ));
@@ -455,7 +459,7 @@ pub(crate) fn receive_pongs(
         }
 
         let previous_mean = prev_rtt.map(|p| p.0);
-        commands.entity(entity).insert((
+        commands.entity(entity).try_insert((
             PeerRtt(smooth(previous_mean, sample.e2e)),
             PeerWireRtt(smooth(prev_wire.map(|p| p.0), sample.wire)),
             // Folded from the raw `e2e` against the mean as it stood *before* this sample.
@@ -481,7 +485,7 @@ pub(crate) fn arm_peer_liveness(
     new_client_lobbies: Query<Entity, (Added<Lobby>, Without<Host>, Without<PeerLastPong>)>,
 ) {
     for entity in new_clients.iter().chain(new_client_lobbies.iter()) {
-        commands.entity(entity).insert(PeerLastPong(0.0));
+        commands.entity(entity).try_insert(PeerLastPong(0.0));
     }
 }
 

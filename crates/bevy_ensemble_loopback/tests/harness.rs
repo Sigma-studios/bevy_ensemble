@@ -301,13 +301,15 @@ fn a_pending_client_is_not_in_the_roster_until_promoted() {
     send(&mut net, client, host, Ping(1), SendMode::Reliable);
     net.run(3);
     assert!(values(&net, host).is_empty(), "held, not read");
-    assert_eq!(
-        net.app(host)
-            .world()
-            .resource::<bevy_ensemble::HeldUntilVerified>()
-            .held_for(2),
-        1
-    );
+    let held = {
+        let world = net.app_mut(host).world_mut();
+        world
+            .query::<&bevy_ensemble::HeldUntilVerified>()
+            .iter(world)
+            .map(|held| held.held_for(2))
+            .sum::<usize>()
+    };
+    assert_eq!(held, 1);
 
     net.promote(client);
     assert!(net.is_connected(client));

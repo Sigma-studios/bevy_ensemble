@@ -197,9 +197,8 @@ impl Plugin for EnsemblePlugin {
             .init_resource::<ping::PeerTimeout>()
             .init_resource::<ping::OutstandingPings>()
             .init_resource::<outbound::OutboundBatches>()
-            .init_resource::<registry::HeldUntilVerified>()
-            .init_resource::<handshake::ProtocolMatched>()
             .add_message::<StartHosting>()
+            .add_message::<systems::LobbyStateUpdate>()
             // Roster changes are the host's to make: a client accepts them only from its host.
             .register_control_message_type::<SyncLobbyParticipant>(
                 "bevy_ensemble/SyncLobbyParticipant",
@@ -229,8 +228,16 @@ impl Plugin for EnsemblePlugin {
                 "bevy_ensemble/LobbyClosed",
                 MessageAuthority::HostOnly,
             )
-            .add_message::<migration::HostChanged>()
-            .add_observer(migration::on_host_lost)
+            .add_message::<migration::HostChanged>();
+        // Everything the host says about the lobby itself is applied in the order it was said;
+        // see `LobbyStateUpdate`.
+        {
+            let mut registry = app.world_mut().resource_mut::<EnsembleMessageRegistry>();
+            registry.route_as_lobby_state::<SyncLobbyParticipant>();
+            registry.route_as_lobby_state::<RemoveLobbyParticipant>();
+            registry.route_as_lobby_state::<migration::LobbyClosed>();
+        }
+        app.add_observer(migration::on_host_lost)
             .add_observer(migration::on_new_host_named)
             .add_observer(migration::on_participant_departed)
             .add_systems(First, migration::finish_closing_lobbies)
@@ -240,11 +247,9 @@ impl Plugin for EnsemblePlugin {
                     migration::run_host_migration_clocks,
                     migration::take_back_a_silent_host,
                     migration::close_lobbies,
-                    migration::apply_lobby_closed,
                 ),
             )
             .add_observer(observers::on_lobby_client_removed)
-            .add_observer(registry::forget_held_packets_with_the_lobby)
             .add_observer(handshake::replay_held_packets)
             // Everything encoded during the frame leaves as one packet per peer and channel.
             .add_systems(Last, outbound::flush_outbound)
@@ -263,8 +268,7 @@ impl Plugin for EnsemblePlugin {
                         .after(systems::add_remote_lobby_participants),
                     systems::broadcast_changed_lobby_participants
                         .after(systems::add_remote_lobby_participants),
-                    systems::apply_received_lobby_participants,
-                    systems::apply_removed_lobby_participants,
+                    systems::apply_lobby_state,
                     ping::arm_peer_liveness,
                     ping::send_pings,
                     // Packets are drained in PreUpdate (see `EnsembleSet::ReceivePackets`),
@@ -279,7 +283,9 @@ impl Plugin for EnsemblePlugin {
                 Update,
                 (
                     link_report::send_link_reports,
-                    link_report::receive_link_reports,
+                    // After the roster, so a report names participants this frame's roster
+                    // changes have already added or removed.
+                    link_report::receive_link_reports.after(systems::apply_lobby_state),
                 ),
             );
 
