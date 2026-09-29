@@ -362,10 +362,14 @@ fn new_host_named(world: &mut World, named: NewHostNamed) {
             continue;
         }
         let is_host = uuid == new_host;
-        world.entity_mut(participant).insert(LobbyParticipant {
-            player_uuid: uuid,
-            is_host,
-        });
+        // Measured by the old host, of links to the old host.
+        world
+            .entity_mut(participant)
+            .insert(LobbyParticipant {
+                player_uuid: uuid,
+                is_host,
+            })
+            .remove::<crate::ParticipantLink>();
         if new_host == local && !is_host {
             world.entity_mut(participant).insert(AwaitingSeat {
                 waited: Duration::ZERO,

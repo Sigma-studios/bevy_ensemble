@@ -40,6 +40,7 @@ pub use crate::{
     // Player data
     LocalPlayerData,
     // Ping
+    ParticipantLink,
     PeerLastPong,
     PeerRoute,
     PeerRtt,

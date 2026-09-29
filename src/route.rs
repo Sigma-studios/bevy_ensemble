@@ -17,7 +17,7 @@ use bevy::prelude::*;
 /// player reporting that the game feels sluggish has no answer.
 ///
 /// Absent means ICE has not settled yet, or the transport does not report it.
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PeerRoute {
     /// A direct pair — host or server-reflexive at both ends. Nothing in the middle.
     Direct,
