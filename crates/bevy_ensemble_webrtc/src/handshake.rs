@@ -40,7 +40,11 @@ pub(crate) fn send_client_handshakes(
     // exactly the window in which the data channel is up but the lobby is not yet
     // promoted -- so every "am I in a session yet" test written against `With<Lobby>`
     // is false while game traffic is already flowing.
+    //
+    // And reset while there is none, for the same reason one session later: a cooldown left
+    // mid-cycle by the last session would hold back the next one's first handshake.
     if client_lobbies.is_empty() {
+        *cooldown = 0.0;
         return;
     }
     *cooldown -= time.delta_secs();
@@ -71,7 +75,11 @@ pub(crate) fn send_host_handshakes(
     // exactly the window in which the data channel is up but the lobby is not yet
     // promoted -- so every "am I in a session yet" test written against `With<Lobby>`
     // is false while game traffic is already flowing.
+    //
+    // And reset while there is none, for the same reason one session later: a cooldown left
+    // mid-cycle by the last session would hold back the next one's first handshake.
     if host_lobbies.is_empty() {
+        *cooldown = 0.0;
         return;
     }
     *cooldown -= time.delta_secs();

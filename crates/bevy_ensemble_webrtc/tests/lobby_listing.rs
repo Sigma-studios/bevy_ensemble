@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use bevy_ensemble::{EnsemblePlugin, LeaveLobby, Lobby, PublicLobbies, StartHosting};
 use bevy_ensemble_webrtc::server::test_support::SignallingServer;
 use bevy_ensemble_webrtc::{
-    BevyEnsembleWebrtcPlugin, IceServers, LobbyWebrtcCode, SignallingDisplayName,
+    BevyEnsembleWebrtcPlugin, IceServers, LobbyWebrtcCode, SignallingAppExt, SignallingDisplayName,
 };
 
 const SETTLE: Duration = Duration::from_secs(20);
@@ -180,5 +180,41 @@ fn the_listing_holds_this_games_lobbies_and_no_other_games() {
         listed(&apps[2]),
         vec![(ours, "ava".to_owned())],
         "another game's lobby is in the listing"
+    );
+}
+
+/// Where a game keeps its player's name: a profile, a menu's text field.
+#[derive(Resource)]
+struct Profile {
+    name: String,
+}
+
+/// The listing follows the game's own name for its player, bridged once rather than copied into
+/// [`SignallingDisplayName`] by every game: the name it has at startup, and the name it changes to
+/// while hosting.
+#[test]
+fn the_listing_follows_the_name_a_game_keeps_for_its_player() {
+    let server = SignallingServer::start();
+    let mut apps = vec![app(&server, "Player")];
+    apps[0]
+        .insert_resource(Profile { name: "ava".into() })
+        .sync_listing_name_from(|profile: &Profile| profile.name.clone());
+
+    let hosted = host(&mut apps, 0);
+    apps.push(app(&server, "bo"));
+    assert!(run_until(&mut apps, SETTLE, |apps| !listed(&apps[1]).is_empty()));
+    assert_eq!(listed(&apps[1]), vec![(hosted.clone(), "ava".to_owned())]);
+
+    apps[0].world_mut().resource_mut::<Profile>().name = "ava the second".into();
+    let renamed = vec![(hosted, "ava the second".to_owned())];
+    assert!(
+        run_until(&mut apps, SETTLE, |apps| {
+            apps[1]
+                .world_mut()
+                .write_message(bevy_ensemble_webrtc::RefreshLobbyList);
+            listed(&apps[1]) == renamed
+        }),
+        "the listing kept {:?}",
+        listed(&apps[1])
     );
 }

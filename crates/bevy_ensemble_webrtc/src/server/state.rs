@@ -3,7 +3,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 
-use crate::protocol::ServerMessage;
+use crate::protocol::{RequestId, ServerMessage};
 
 /// What one connection is allowed to do, and how long it may stay silent.
 ///
@@ -28,6 +28,26 @@ pub struct Limits {
     /// Burst for the lobby-operation limit. Two, so that a mistyped code retried straight away
     /// still gets a real answer.
     pub lobby_ops_burst: f64,
+    /// Sustained WebRTC signals relayed per second, counted per signal rather than per frame, and
+    /// instead of the general message limit rather than on top of it.
+    ///
+    /// Signalling has its own budget because its shape is nothing like the rest of the traffic.
+    /// Everything else a client sends is a person pressing something, or a timer; signalling is
+    /// the host's peer connections gathering ICE candidates, all of them at once, whenever a
+    /// batch of connections opens together — seven players following a posted code, or the
+    /// successor of a host migration opening a connection to every member in one frame. Charged
+    /// to the general budget it was the host's own candidates that got refused, in exactly the
+    /// moments that most needed them.
+    ///
+    /// A connection is a star around its host and each needs one offer, one answer and around
+    /// ten candidates with public STUN (more with a relay, fewer on a LAN): some eighty for an
+    /// eight-player lobby opening at once. The burst is several times that, and the sustained
+    /// rate refills a whole lobby's worth in a couple of seconds, so an ICE restart straight after
+    /// is covered too. What it still bounds is the only abuse the relay allows — a lobby member
+    /// pushing data at its host, or a host at its members — to a rate nobody notices.
+    pub signals_per_second: f64,
+    /// Burst for the signalling limit, in signals. Also the most one frame may carry.
+    pub signal_burst: f64,
 }
 
 impl Default for Limits {
@@ -38,6 +58,8 @@ impl Default for Limits {
             message_burst: 40.0,
             lobby_ops_per_second: 1.0,
             lobby_ops_burst: 2.0,
+            signals_per_second: 64.0,
+            signal_burst: 320.0,
         }
     }
 }
@@ -80,6 +102,12 @@ pub struct ConnectionHandle {
     pub capabilities: u64,
     /// The game this connection declared; empty for a client older than the declaration.
     pub game: String,
+    /// The request that put this connection in `lobby_id`, when it came in as a typed request.
+    /// What [`ClientMessage::CancelRequest`] is checked against, so a cancel only ever takes back
+    /// the lobby its own request made.
+    ///
+    /// [`ClientMessage::CancelRequest`]: crate::protocol::ClientMessage::CancelRequest
+    pub entered_by: Option<RequestId>,
 }
 
 impl ConnectionHandle {

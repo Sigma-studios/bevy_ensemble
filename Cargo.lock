@@ -1061,6 +1061,7 @@ dependencies = [
  "turn",
  "uuid",
  "wasm-bindgen-futures",
+ "web-sys",
  "webrtc-util",
  "ws_stream_wasm",
 ]

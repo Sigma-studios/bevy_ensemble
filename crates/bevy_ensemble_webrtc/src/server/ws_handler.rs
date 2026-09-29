@@ -7,15 +7,18 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::protocol::{ClientMessage, MAX_GAME_LEN, ServerMessage, decode, encode};
+use crate::protocol::{
+    CAPABILITIES, CAPABILITY_TYPED_REQUESTS, ClientMessage, MAX_GAME_LEN, RequestId, ServerMessage,
+    SignallingError, decode, encode,
+};
 
 use super::lobby;
 use super::state::{ConnectionHandle, Limits, ServerState};
 
 /// How far past the message limit a connection gets before it is closed rather than told.
 ///
-/// Up to this multiple, an over-limit message is answered with `LobbyError { "rate limited" }`
-/// and dropped — a client with a bug gets to notice. Beyond it the sender is not listening to
+/// Up to this multiple, an over-limit message is refused ([`SignallingError::RateLimited`]) and
+/// dropped — a client with a bug gets to notice. Beyond it the sender is not listening to
 /// answers, and every message it costs the server is one it should not be paying for.
 const CLOSE_AT_MULTIPLE: f64 = 10.0;
 
@@ -40,13 +43,13 @@ impl TokenBucket {
         }
     }
 
-    /// Spend one token if there is one.
-    fn try_take(&mut self, now: Instant) -> bool {
+    /// Spend `cost` tokens if there are that many.
+    fn try_take(&mut self, now: Instant, cost: f64) -> bool {
         let elapsed = now.saturating_duration_since(self.refilled).as_secs_f64();
         self.tokens = (self.tokens + elapsed * self.per_second).min(self.capacity);
         self.refilled = now;
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
+        if self.tokens >= cost {
+            self.tokens -= cost;
             true
         } else {
             false
@@ -63,12 +66,22 @@ enum Verdict {
     Close,
 }
 
+/// Which budget a frame is paid from.
+enum Charge {
+    /// Everything but signalling: one message.
+    General,
+    /// WebRTC signals, this many of them. See [`Limits::signals_per_second`].
+    Signals(usize),
+}
+
 /// The per-connection limiter: one bucket at the limit, one at the multiple past which the
-/// connection is closed, and a slower one for the operations that are worth guessing at.
+/// connection is closed, a slower one for the operations that are worth guessing at, and one for
+/// signalling.
 struct RateLimiter {
     soft: TokenBucket,
     hard: TokenBucket,
     lobby_ops: TokenBucket,
+    signals: TokenBucket,
 }
 
 impl RateLimiter {
@@ -81,15 +94,21 @@ impl RateLimiter {
                 now,
             ),
             lobby_ops: TokenBucket::new(limits.lobby_ops_burst, limits.lobby_ops_per_second, now),
+            signals: TokenBucket::new(limits.signal_burst, limits.signals_per_second, now),
         }
     }
 
-    /// Charge one frame, of any kind, against the connection.
-    fn frame(&mut self, now: Instant) -> Verdict {
-        // Both buckets drain on every frame, so the hard one measures the same flood the soft one
-        // does — just with ten times the room before it acts.
-        let hard = self.hard.try_take(now);
-        let soft = self.soft.try_take(now);
+    /// Charge one frame against the connection.
+    ///
+    /// Every frame drains the hard bucket, whatever it carries, so a flood of anything is closed
+    /// the same way. What it is refused against depends on what it is: signalling against its own
+    /// budget, everything else against the general one.
+    fn frame(&mut self, now: Instant, charge: Charge) -> Verdict {
+        let hard = self.hard.try_take(now, 1.0);
+        let soft = match charge {
+            Charge::General => self.soft.try_take(now, 1.0),
+            Charge::Signals(count) => self.signals.try_take(now, count.max(1) as f64),
+        };
         match (hard, soft) {
             (false, _) => Verdict::Close,
             (true, false) => Verdict::Refuse,
@@ -99,7 +118,31 @@ impl RateLimiter {
 
     /// Charge one `CreateLobby` or `JoinLobbyByCode`, on top of the frame it arrived in.
     fn lobby_op(&mut self, now: Instant) -> bool {
-        self.lobby_ops.try_take(now)
+        self.lobby_ops.try_take(now, 1.0)
+    }
+}
+
+/// The request id a message carries, if it is one of the typed requests.
+fn request_of(message: &ClientMessage) -> Option<RequestId> {
+    match message {
+        ClientMessage::CreateLobbyRequest { request, .. }
+        | ClientMessage::JoinLobbyRequest { request, .. }
+        | ClientMessage::JoinLobbyByCodeRequest { request, .. }
+        | ClientMessage::CancelRequest { request }
+        | ClientMessage::Signals { request, .. } => Some(*request),
+        _ => None,
+    }
+}
+
+/// How `error` is said to this connection: typed to a client that declared it can read that, or
+/// that asked with a typed request; as the old free text to anybody else.
+fn refusal(typed: bool, request: Option<RequestId>, error: SignallingError) -> ServerMessage {
+    if typed || request.is_some() {
+        ServerMessage::Refused { request, error }
+    } else {
+        ServerMessage::LobbyError {
+            reason: error.legacy_reason().into(),
+        }
     }
 }
 
@@ -122,13 +165,6 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
         // than letting it find out from a reset.
         let _ = ws_sink.close().await;
     });
-
-    let rate_limited = || ServerMessage::LobbyError {
-        reason: "rate limited".into(),
-    };
-    let not_authenticated = || ServerMessage::LobbyError {
-        reason: "Not authenticated".into(),
-    };
 
     let mut player_uuid: Option<u128> = None;
     // Kept here as well as on the handle, so a declaration that arrives before `Authenticate`
@@ -153,11 +189,34 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
             }
         };
 
+        let bytes = match msg {
+            Message::Binary(b) => Some(b),
+            Message::Close(_) => break,
+            _ => None,
+        };
+        let client_msg = bytes
+            .as_ref()
+            .and_then(|bytes| decode::<ClientMessage>(bytes).ok());
+        let typed = capabilities & CAPABILITY_TYPED_REQUESTS != 0;
+        let refuse = |request: Option<RequestId>, error: SignallingError| {
+            let _ = tx.send(refusal(typed, request, error));
+        };
+
         // Every frame is charged, decodable or not: the cost of reading it has been paid already.
-        match limiter.frame(Instant::now()) {
+        // Decoded first only so the charge can go to the right budget and a refusal can name the
+        // request it refuses.
+        let charge = match &client_msg {
+            Some(ClientMessage::Signal { .. }) => Charge::Signals(1),
+            Some(ClientMessage::Signals { signals, .. }) => Charge::Signals(signals.len()),
+            _ => Charge::General,
+        };
+        match limiter.frame(Instant::now(), charge) {
             Verdict::Allow => {}
             Verdict::Refuse => {
-                let _ = tx.send(rate_limited());
+                refuse(
+                    client_msg.as_ref().and_then(request_of),
+                    SignallingError::RateLimited,
+                );
                 continue;
             }
             Verdict::Close => {
@@ -166,23 +225,17 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
             }
         }
 
-        let bytes = match msg {
-            Message::Binary(b) => b,
-            Message::Close(_) => break,
-            _ => continue,
-        };
-
-        let Ok(client_msg) = decode::<ClientMessage>(&bytes) else {
-            error!("Failed to decode client message");
+        let Some(client_msg) = client_msg else {
+            if bytes.is_some() {
+                error!("Failed to decode client message");
+            }
             continue;
         };
 
         match client_msg {
             ClientMessage::Authenticate { display_name } => {
                 if player_uuid.is_some() {
-                    let _ = tx.send(ServerMessage::LobbyError {
-                        reason: "Already authenticated".into(),
-                    });
+                    refuse(None, SignallingError::AlreadyAuthenticated);
                     continue;
                 }
 
@@ -197,6 +250,7 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                         sender: tx.clone(),
                         capabilities,
                         game: game.clone(),
+                        entered_by: None,
                     },
                 );
 
@@ -206,7 +260,7 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
 
             ClientMessage::SetDisplayName { display_name } => {
                 let Some(uuid) = player_uuid else {
-                    let _ = tx.send(not_authenticated());
+                    refuse(None, SignallingError::NotAuthenticated);
                     continue;
                 };
 
@@ -230,43 +284,65 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
             }
 
             ClientMessage::CreateLobby { max_players } => {
-                let Some(uuid) = player_uuid else {
-                    let _ = tx.send(not_authenticated());
-                    continue;
-                };
-                if !limiter.lobby_op(Instant::now()) {
-                    let _ = tx.send(rate_limited());
-                    continue;
-                }
-
-                if let Err(refusal) = lobby::create_lobby(&state, uuid, max_players) {
-                    let _ = tx.send(refusal);
+                if let Err(error) = lobby_op(&mut limiter, player_uuid, |uuid| {
+                    lobby::create_lobby(&state, uuid, max_players, None)
+                }) {
+                    refuse(None, error);
                 }
             }
 
+            ClientMessage::CreateLobbyRequest {
+                request,
+                max_players,
+            } => {
+                if let Err(error) = lobby_op(&mut limiter, player_uuid, |uuid| {
+                    lobby::create_lobby(&state, uuid, max_players, Some(request))
+                }) {
+                    refuse(Some(request), error);
+                }
+            }
+
+            // A join by id is not charged as a lobby operation: an id is a random u64, so there
+            // is nothing to guess at, and it only ever comes from a listing.
             ClientMessage::JoinLobby { lobby_id } => {
                 let Some(uuid) = player_uuid else {
-                    let _ = tx.send(not_authenticated());
+                    refuse(None, SignallingError::NotAuthenticated);
                     continue;
                 };
+                if let Err(error) = lobby::join_lobby(&state, uuid, lobby_id, None) {
+                    refuse(None, error);
+                }
+            }
 
-                if let Err(refusal) = lobby::join_lobby(&state, uuid, lobby_id) {
-                    let _ = tx.send(refusal);
+            ClientMessage::JoinLobbyRequest { request, lobby_id } => {
+                let Some(uuid) = player_uuid else {
+                    refuse(Some(request), SignallingError::NotAuthenticated);
+                    continue;
+                };
+                if let Err(error) = lobby::join_lobby(&state, uuid, lobby_id, Some(request)) {
+                    refuse(Some(request), error);
                 }
             }
 
             ClientMessage::JoinLobbyByCode { code } => {
-                let Some(uuid) = player_uuid else {
-                    let _ = tx.send(not_authenticated());
-                    continue;
-                };
-                if !limiter.lobby_op(Instant::now()) {
-                    let _ = tx.send(rate_limited());
-                    continue;
+                if let Err(error) = lobby_op(&mut limiter, player_uuid, |uuid| {
+                    lobby::join_lobby_by_code(&state, uuid, &code, None)
+                }) {
+                    refuse(None, error);
                 }
+            }
 
-                if let Err(refusal) = lobby::join_lobby_by_code(&state, uuid, &code) {
-                    let _ = tx.send(refusal);
+            ClientMessage::JoinLobbyByCodeRequest { request, code } => {
+                if let Err(error) = lobby_op(&mut limiter, player_uuid, |uuid| {
+                    lobby::join_lobby_by_code(&state, uuid, &code, Some(request))
+                }) {
+                    refuse(Some(request), error);
+                }
+            }
+
+            ClientMessage::CancelRequest { request } => {
+                if let Some(uuid) = player_uuid {
+                    lobby::cancel_request(&state, uuid, request);
                 }
             }
 
@@ -286,6 +362,13 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                 capabilities: declared,
             } => {
                 capabilities = declared;
+                // Only to a client that can decode it; see `CAPABILITY_TYPED_REQUESTS` for what a
+                // client makes of its absence.
+                if declared & CAPABILITY_TYPED_REQUESTS != 0 {
+                    let _ = tx.send(ServerMessage::ServerHello {
+                        capabilities: CAPABILITIES,
+                    });
+                }
                 if let Some(uuid) = player_uuid {
                     if let Some(mut conn) = state.connections.get_mut(&uuid) {
                         conn.capabilities = declared;
@@ -307,7 +390,7 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                 // secret, but an unauthenticated socket that can ask for it is an unauthenticated
                 // socket that can ask for it in a loop.
                 if player_uuid.is_none() {
-                    let _ = tx.send(not_authenticated());
+                    refuse(None, SignallingError::NotAuthenticated);
                     continue;
                 }
                 let response = lobby::list_lobbies(&state, &game);
@@ -318,23 +401,18 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
                 receiver_uuid,
                 data,
             } => {
-                let Some(from_uuid) = player_uuid else {
-                    continue;
-                };
+                if let Some(from_uuid) = player_uuid {
+                    relay(&state, from_uuid, receiver_uuid, vec![data]);
+                }
+            }
 
-                if relay_allowed(&state, from_uuid, receiver_uuid) {
-                    info!("Relaying signal from {from_uuid} to {receiver_uuid}");
-                    state.send_to(
-                        receiver_uuid,
-                        ServerMessage::Signal {
-                            sender_uuid: from_uuid,
-                            data,
-                        },
-                    );
-                } else {
-                    warn!(
-                        "Rejecting signal relay from {from_uuid} to {receiver_uuid}: not host and member of one lobby"
-                    );
+            ClientMessage::Signals {
+                receiver_uuid,
+                signals,
+                ..
+            } => {
+                if let Some(from_uuid) = player_uuid {
+                    relay(&state, from_uuid, receiver_uuid, signals);
                 }
             }
 
@@ -357,12 +435,6 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<ServerState>) {
     }
 }
 
-/// Whether a signal from `from` to `to` is one this server carries.
-///
-/// Both must be in the same lobby, and one of them must be its host. Sessions are a star around
-/// the host — every member's one connection is to it — so a member has no reason to signal
-/// another member, and a relay that would do it anyway is a way for anyone who joined a lobby to
-/// push arbitrary data at everyone else in it.
 /// `text` cut to at most `max` bytes, on a character boundary.
 fn truncated(mut text: String, max: usize) -> String {
     if text.len() > max {
@@ -375,6 +447,55 @@ fn truncated(mut text: String, max: usize) -> String {
     text
 }
 
+/// A lobby operation: authenticated, within the lobby-operation budget, and refused with the
+/// reason `op` gives if it fails.
+fn lobby_op(
+    limiter: &mut RateLimiter,
+    player_uuid: Option<u128>,
+    op: impl FnOnce(u128) -> Result<(), SignallingError>,
+) -> Result<(), SignallingError> {
+    let uuid = player_uuid.ok_or(SignallingError::NotAuthenticated)?;
+    if !limiter.lobby_op(Instant::now()) {
+        return Err(SignallingError::RateLimited);
+    }
+    op(uuid)
+}
+
+/// Carry `signals` from `from` to `to`, if this server carries signals between them at all: as one
+/// frame to a client that reads batches, one frame each to a client that does not.
+fn relay(state: &ServerState, from: u128, to: u128, signals: Vec<String>) {
+    if !relay_allowed(state, from, to) {
+        warn!("Rejecting signal relay from {from} to {to}: not host and member of one lobby");
+        return;
+    }
+    info!("Relaying {} signal(s) from {from} to {to}", signals.len());
+    if state.declares(to, CAPABILITY_TYPED_REQUESTS) {
+        state.send_to(
+            to,
+            ServerMessage::Signals {
+                sender_uuid: from,
+                signals,
+            },
+        );
+    } else {
+        for data in signals {
+            state.send_to(
+                to,
+                ServerMessage::Signal {
+                    sender_uuid: from,
+                    data,
+                },
+            );
+        }
+    }
+}
+
+/// Whether a signal from `from` to `to` is one this server carries.
+///
+/// Both must be in the same lobby, and one of them must be its host. Sessions are a star around
+/// the host — every member's one connection is to it — so a member has no reason to signal
+/// another member, and a relay that would do it anyway is a way for anyone who joined a lobby to
+/// push arbitrary data at everyone else in it.
 fn relay_allowed(state: &ServerState, from: u128, to: u128) -> bool {
     if from == to {
         return false;
