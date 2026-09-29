@@ -317,7 +317,7 @@ pub(crate) fn create_peer_connection(
     role: Role,
     signal_tx: mpsc::UnboundedSender<OutgoingSignal>,
     peer_state_tx: mpsc::UnboundedSender<(u128, PeerState)>,
-    route_tx: mpsc::UnboundedSender<(u128, PeerRoute)>,
+    route_tx: mpsc::UnboundedSender<crate::RouteReport>,
     message_tx: mpsc::UnboundedSender<(u128, Box<[u8]>, Instant)>,
     ice_servers: &IceServers,
     discarded_candidates: Arc<AtomicU64>,
@@ -528,7 +528,16 @@ pub(crate) fn create_peer_connection(
                     PeerRoute::Direct
                 };
                 log::info!("peer {peer_id:#x}: {} pair, {pair}", route.label());
-                let _ = route_tx.send((peer_id, route));
+                let report = if relayed {
+                    let selected = (
+                        (pair.local.address.clone(), pair.local.port),
+                        (pair.remote.address.clone(), pair.remote.port),
+                    );
+                    Some(relay_report(&pc, peer_id, selected).await)
+                } else {
+                    None
+                };
+                let _ = route_tx.send((peer_id, route, report));
             });
             Box::pin(async {})
         }));
@@ -732,4 +741,67 @@ pub(crate) fn send_message(pc: &NativePeerConnection, data: Box<[u8]>, reliable:
     // The only way this fails is a writer that has already ended, which only happens when the
     // connection is being dropped — and a packet to a peer being dropped has nowhere to go.
     let _ = pc.outbound.send((bytes, reliable));
+}
+
+/// Read a relayed connection's stats into a [`describe`](crate::diagnosis::describe) report.
+/// `selected` is the chosen pair's two ends, as `(address, port)`, matched against the stats'
+/// candidates to name them.
+async fn relay_report(
+    pc: &RTCPeerConnection,
+    peer_id: u128,
+    selected: ((String, u16), (String, u16)),
+) -> String {
+    use crate::diagnosis::{Candidate, Pair, describe};
+    use webrtc::stats::StatsReportType;
+
+    let stats = pc.get_stats().await;
+    let (mut local, mut remote, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
+    for report in stats.reports.values() {
+        match report {
+            StatsReportType::LocalCandidate(c) | StatsReportType::RemoteCandidate(c) => {
+                let candidate = Candidate {
+                    id: c.id.clone(),
+                    kind: c.candidate_type.to_string(),
+                    address: c.ip.clone(),
+                    port: c.port,
+                    protocol: c.network_type.to_string(),
+                };
+                if matches!(report, StatsReportType::LocalCandidate(_)) {
+                    local.push(candidate);
+                } else {
+                    remote.push(candidate);
+                }
+            }
+            StatsReportType::CandidatePair(p) => pairs.push(Pair {
+                local_id: p.local_candidate_id.clone(),
+                remote_id: p.remote_candidate_id.clone(),
+                state: p.state.to_string(),
+                nominated: p.nominated,
+                // webrtc-rs leaves the counters at zero; see `Pair::checks`.
+                checks: None,
+            }),
+            _ => {}
+        }
+    }
+    // Stable order, so two reports of the same situation read the same.
+    for candidates in [&mut local, &mut remote] {
+        candidates
+            .sort_by(|a, b| (&a.kind, &a.address, a.port).cmp(&(&b.kind, &b.address, b.port)));
+    }
+    pairs.sort_by(|a, b| (&a.local_id, &a.remote_id).cmp(&(&b.local_id, &b.remote_id)));
+
+    let id_of = |candidates: &[Candidate], (address, port): &(String, u16)| {
+        candidates
+            .iter()
+            .find(|c| c.address == *address && c.port == *port)
+            .map(|c| c.id.clone())
+    };
+    let selected_ids = id_of(&local, &selected.0).zip(id_of(&remote, &selected.1));
+    describe(
+        peer_id,
+        selected_ids.as_ref().map(|(l, r)| (l.as_str(), r.as_str())),
+        &local,
+        &remote,
+        &pairs,
+    )
 }
