@@ -88,10 +88,11 @@ fn apply(
             .map(|entry| entry.link());
         match (wanted, current) {
             (Some(wanted), current) if current != Some(&wanted) => {
-                commands.entity(entity).insert(wanted);
+                // `try_`: a participant this frame's roster removed is still in the query.
+                commands.entity(entity).try_insert(wanted);
             }
             (None, Some(_)) => {
-                commands.entity(entity).remove::<ParticipantLink>();
+                commands.entity(entity).try_remove::<ParticipantLink>();
             }
             _ => {}
         }
@@ -116,6 +117,9 @@ pub(crate) fn send_link_reports(
     participants: Participants,
 ) {
     let Some(host) = host else {
+        // Not hosting: the next lobby this peer hosts reports on its first frame, rather than
+        // whenever the last one's clock would have come round.
+        *cooldown = 0.0;
         return;
     };
     let lobby = *host;

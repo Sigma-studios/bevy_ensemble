@@ -27,7 +27,16 @@ pub struct LocalMultiplayerPlayerId(pub PlayerUUID);
 /// // The lobby I've joined as a client
 /// fn client_system(lobby: Query<Entity, (With<Lobby>, Without<Host>)>) { .. }
 /// ```
+///
+/// # Session state lives here
+///
+/// What only means something inside one session — packets held for a peer whose protocol has
+/// not been compared, handshakes that matched before there was a seat to mark — is kept in
+/// components on this entity (required by both `Lobby` and [`PendingLobby`], so it is there from
+/// the first moment of a join). Despawning the lobby is then the whole reset: however a session
+/// ends, nothing it collected can leak into the next one.
 #[derive(Component)]
+#[require(crate::registry::HeldUntilVerified, crate::handshake::ProtocolMatched)]
 pub struct Lobby;
 
 /// Marks a lobby entity that is waiting for the platform backend to finish setup.
@@ -37,7 +46,11 @@ pub struct Lobby;
 /// for clients it happens after the handshake with the host completes.
 ///
 /// Automatically removed when [`Lobby`] is added.
+///
+/// Carries the same session state as [`Lobby`] does (see there): a join that dies while still
+/// pending takes it with it.
 #[derive(Component)]
+#[require(crate::registry::HeldUntilVerified, crate::handshake::ProtocolMatched)]
 pub struct PendingLobby;
 
 /// Marks a lobby entity that has been requested for creation by the local player.

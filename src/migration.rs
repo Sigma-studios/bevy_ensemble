@@ -179,6 +179,37 @@ pub struct LobbyClosed;
 #[derive(Component, Clone, Copy, Debug)]
 pub(crate) struct ClosingLobby;
 
+/// Everything on a client's lobby entity that describes its link to one particular host, and so
+/// goes when the host changes: whether that host's protocol was verified and which host it was,
+/// the round trip and its spread, the liveness clock, the route the transport took to reach it.
+///
+/// Named once, here, so that a component added to the link is added to what a change of host
+/// strips — as a tuple written out at the one place that strips it, it was a list somebody had
+/// to remember to extend. A participant's [`ParticipantLink`](crate::ParticipantLink) is the same
+/// kind of thing, measured by the host, and is stripped alongside.
+///
+/// # Why not a child entity
+///
+/// The cleaner shape would be the host's own link entity under the lobby, despawned on a change
+/// of host, as a host's links are its `LobbyClient` seats. It is not that because these are the
+/// components games, the lockstep bridge and every backend read *on the lobby entity* — a ping
+/// display, an adaptive input buffer, a relay badge, the WebRTC backend's ICE-restart grace — and
+/// because the lobby entity is what a client's outgoing packets are addressed to. Moving them is
+/// a change to every one of those readers and to the transport seam, for a reset that this one
+/// named bundle already makes complete.
+pub(crate) type HostLinkState = (
+    HandshakeVerified,
+    VerifiedHost,
+    PeerRtt,
+    PeerWireRtt,
+    PeerReliableRtt,
+    PeerRttJitter,
+    PeerLastPong,
+    PeerLastPongSeq,
+    LivenessGrace,
+    PeerRoute,
+);
+
 /// What a lobby still gets when neither the backend nor the game said.
 const DEFAULT_REACH_WITHIN: Duration = Duration::from_secs(20);
 
@@ -323,27 +354,16 @@ fn new_host_named(world: &mut World, named: NewHostNamed) {
     .filter(|uuid| *uuid != new_host)
     .collect();
     for uuid in &stale {
-        if let Some(mut held) = world.get_resource_mut::<HeldUntilVerified>() {
+        if let Some(mut held) = world.get_mut::<HeldUntilVerified>(lobby) {
             held.discard(*uuid);
         }
-        if let Some(mut matched) = world.get_resource_mut::<ProtocolMatched>() {
+        if let Some(mut matched) = world.get_mut::<ProtocolMatched>(lobby) {
             matched.0.remove(uuid);
         }
     }
 
     // Everything on the lobby entity that described the old host.
-    world.entity_mut(lobby).remove::<(
-        HandshakeVerified,
-        VerifiedHost,
-        PeerRtt,
-        PeerWireRtt,
-        PeerReliableRtt,
-        PeerRttJitter,
-        PeerLastPong,
-        PeerLastPongSeq,
-        LivenessGrace,
-        PeerRoute,
-    )>();
+    world.entity_mut(lobby).remove::<HostLinkState>();
 
     // The roster. Entities that stay are kept, with whatever the game put on them.
     let participants: Vec<(Entity, PlayerUUID)> = world
@@ -472,8 +492,8 @@ pub(crate) fn take_back_a_silent_host(
                 // un-waiting with the old silence still on its clock.
                 commands
                     .entity(lobby)
-                    .remove::<AwaitingHost>()
-                    .insert(PeerLastPong(0.0));
+                    .try_remove::<AwaitingHost>()
+                    .try_insert(PeerLastPong(0.0));
             }
         }
     }
@@ -525,7 +545,7 @@ pub(crate) fn run_host_migration_clocks(
             "dropping {uuid:#x} from the lobby: it did not reach this peer, its new host, in {:.0}s",
             seat.limit.as_secs_f64()
         );
-        commands.entity(participant).despawn();
+        commands.entity(participant).try_despawn();
         commands.entity(lobby).trigger(move |entity| LobbyMessage {
             entity,
             message: RemoveLobbyParticipant { player_uuid: uuid },
@@ -550,7 +570,7 @@ pub(crate) fn close_lobbies(
     for lobby in hosted.iter() {
         commands
             .entity(lobby)
-            .insert(ClosingLobby)
+            .try_insert(ClosingLobby)
             .trigger(|entity| LobbyMessage::new_no_delay(entity, LobbyClosed));
     }
 }
@@ -562,23 +582,5 @@ pub(crate) fn finish_closing_lobbies(
 ) {
     if !closing.is_empty() {
         leave.write(LeaveLobby);
-    }
-}
-
-/// A client told its host closed the lobby ends its session now, rather than waiting for a host
-/// nobody is going to name.
-pub(crate) fn apply_lobby_closed(
-    mut commands: Commands,
-    mut closed: MessageReader<ReceivedEnsembleMessage<LobbyClosed>>,
-    lobbies: Query<Entity, (Or<(With<Lobby>, With<PendingLobby>)>, Without<Host>)>,
-) {
-    if closed.read().next().is_none() {
-        return;
-    }
-    for lobby in lobbies.iter() {
-        info!("the host closed the lobby");
-        commands.queue(move |world: &mut World| {
-            end_client_session(world, lobby, LobbyLeftReason::HostGone)
-        });
     }
 }

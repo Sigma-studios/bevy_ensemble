@@ -63,10 +63,13 @@ pub struct EnsembleMessageRegistry {
     frozen: OnceLock<Frozen>,
 }
 
+/// Decode a payload and hand it to whatever reads its type.
+type Dispatch = fn(&mut World, Option<PlayerUUID>, &[u8], Instant) -> bool;
+
 struct RegisteredEnsembleMessage {
     wire_name: &'static str,
     type_name: &'static str,
-    dispatch: fn(&mut World, Option<PlayerUUID>, &[u8], Instant) -> bool,
+    dispatch: Dispatch,
     authority: MessageAuthority,
     /// Whether the broadcast relay may carry this type. Control messages may not: a client that
     /// could wrap a roster change in an envelope would have the host announce it to everyone.
@@ -113,7 +116,17 @@ impl RefusedPackets {
 /// thing this caught. So everything but the handshake waits here, per sender, and is replayed
 /// through the decoder the moment [`HandshakeVerified`] lands, or discarded if it never does.
 /// Bounded per sender, so an unverified peer cannot fill memory.
-#[derive(Resource, Default, Debug)]
+///
+/// # A component on the lobby, not a resource
+///
+/// What is held is held *for a session*: the packets are waiting on a handshake that only that
+/// session can complete. As a resource it outlived the session, and it was only cleared when a
+/// [`Lobby`] went — so a join that died while still [`PendingLobby`] (cancelled, timed out,
+/// refused) left its packets behind, and the next join to the same host replayed them as if that
+/// host had just said them. Kept on the lobby entity (pending or promoted, it is required by
+/// both), despawning the lobby is the reset, whichever way the lobby ends. A packet that arrives
+/// while this peer has no lobby at all has nothing to be held for, and is dropped.
+#[derive(Component, Default, Debug)]
 pub struct HeldUntilVerified {
     by_sender: HashMap<PlayerUUID, Vec<(Vec<u8>, Instant)>>,
 }
@@ -201,6 +214,25 @@ impl EnsembleMessageRegistry {
     pub fn is_pre_verification(&self, index: u16) -> bool {
         self.entry(index)
             .is_some_and(|entry| entry.pre_verification)
+    }
+
+    /// Deliver `T` into the one ordered stream of lobby-state changes as well as as its own
+    /// [`ReceivedEnsembleMessage<T>`]. See [`LobbyStateUpdate`](crate::systems::LobbyStateUpdate)
+    /// for why the order across types matters. `T` must already be registered.
+    pub(crate) fn route_as_lobby_state<T>(&mut self)
+    where
+        T: EnsembleMessage + Into<crate::systems::LobbyStateChange>,
+    {
+        let entry = *self
+            .entry_of_type
+            .get(&TypeId::of::<T>())
+            .unwrap_or_else(|| {
+                panic!(
+                    "`{}` is routed as lobby state before it is registered",
+                    type_name::<T>()
+                )
+            });
+        self.entries[entry].dispatch = dispatch_lobby_state::<T>;
     }
 
     fn register_inner<T: EnsembleMessage>(
@@ -532,13 +564,19 @@ pub(crate) fn decode_ensemble_packet_now(
         return decode_verified_packet(world, None, packet, received_at);
     };
     let verified = peer_is_verified(world, sender);
-    // Nothing to hold for. Held packets are replayed once the sender is verified, and a peer with
-    // no lobby has no session that could verify anyone: whatever arrives now is the tail of one
-    // that is over -- the host's notice that a player who had already left was removed, most
-    // often -- and holding it read it into the *next* session, which it then ended.
-    let in_a_lobby = verified || {
-        let mut lobbies = world.query_filtered::<(), Or<(With<Lobby>, With<PendingLobby>)>>();
-        lobbies.iter(world).next().is_some()
+    // Where an unverified sender's packets wait: this peer's lobby, pending or promoted. With no
+    // lobby there is nothing to hold for. Held packets are replayed once the sender is verified,
+    // and a peer with no lobby has no session that could verify anyone: whatever arrives now is
+    // the tail of one that is over -- the host's notice that a player who had already left was
+    // removed, most often -- and holding it read it into the *next* session, which it then ended.
+    let holding_lobby = if verified {
+        None
+    } else {
+        let mut lobbies = world.query_filtered::<Entity, (
+            With<HeldUntilVerified>,
+            Or<(With<Lobby>, With<PendingLobby>)>,
+        )>();
+        lobbies.iter(world).next()
     };
     let mut all = true;
     let messages = unframe_packet(packet).unwrap_or_else(|| vec![packet]);
@@ -564,12 +602,12 @@ pub(crate) fn decode_ensemble_packet_now(
         );
         if handshake || verified {
             all &= decode_one(world, Some(sender), message, received_at);
-        } else if !in_a_lobby {
-            debug!("dropping a packet from {sender:#x}: this peer is in no lobby to hold it for");
+        } else if let Some(mut held) =
+            holding_lobby.and_then(|lobby| world.get_mut::<HeldUntilVerified>(lobby))
+        {
+            held.hold(sender, message, received_at);
         } else {
-            world
-                .get_resource_or_insert_with(HeldUntilVerified::default)
-                .hold(sender, message, received_at);
+            debug!("dropping a packet from {sender:#x}: this peer is in no lobby to hold it for");
         }
     }
     all
@@ -753,14 +791,32 @@ fn dispatch_message<T: EnsembleMessage>(
     true
 }
 
-/// A lobby that goes takes what was held for it: those packets were waiting on a session that is
-/// over, and replaying them into the next one with the same host is how a notice meant for the
-/// last session ends the new one.
-pub(crate) fn forget_held_packets_with_the_lobby(
-    _removed: On<Remove, Lobby>,
-    mut held: ResMut<HeldUntilVerified>,
-) {
-    held.clear();
+/// [`dispatch_message`], and the same message again into the ordered lobby-state stream.
+///
+/// The per-type message is still written, so a reader of `ReceivedEnsembleMessage<T>` keeps
+/// working; the core itself reads only the ordered stream.
+fn dispatch_lobby_state<T>(
+    world: &mut World,
+    sender: Option<PlayerUUID>,
+    payload: &[u8],
+    received_at: Instant,
+) -> bool
+where
+    T: EnsembleMessage + Into<crate::systems::LobbyStateChange>,
+{
+    let Ok(message) = postcard::from_bytes::<T>(payload) else {
+        return dispatch_message::<T>(world, sender, payload, received_at);
+    };
+    world.write_message(crate::systems::LobbyStateUpdate {
+        change: message.clone().into(),
+    });
+    world
+        .write_message(ReceivedEnsembleMessage::<T> {
+            sender,
+            message,
+            received_at,
+        })
+        .is_some()
 }
 
 #[cfg(test)]

@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     EnsembleMessageRegistry, Host, HostUuid, Lobby, LobbyClient, LobbyClientPlayerUuid,
-    LobbyJoinFailed, LobbyLeft, LobbyLeftReason, LocalMultiplayerPlayerId, PeerLastPong,
-    ReceivedEnsembleMessage, SendMode,
+    LobbyJoinFailed, LobbyLeft, LobbyLeftReason, LobbyParticipantOf, LocalMultiplayerPlayerId,
+    PeerLastPong, PendingLobby, ReceivedEnsembleMessage, SendMode,
     messages::{LobbyClientMessage, LobbyMessage},
     migration::{AwaitingHost, MigratedSeat, VerifiedHost},
     registry::{HeldUntilVerified, PROTOCOL_VERSION, decode_verified_packet},
@@ -90,7 +90,12 @@ pub struct HandshakeVerified;
 /// Without it a join could fail on timing alone. The handshake is sent once, on promotion;
 /// the two promotions happen in whichever order the two ready handshakes land, and a
 /// handshake that found no seat was dropped and never resent.
-#[derive(Resource, Debug, Default)]
+///
+/// On the lobby entity, pending or promoted, like [`HeldUntilVerified`] and for the same reason:
+/// a match belongs to the session it was made in. As a resource, a match recorded by a join that
+/// then died stayed behind and verified the same host in the next join without a handshake ever
+/// being compared there.
+#[derive(Component, Debug, Default)]
 pub(crate) struct ProtocolMatched(pub(crate) std::collections::HashSet<u128>);
 
 /// How often a new host states its protocol again to a member it inherited that has not answered.
@@ -157,22 +162,25 @@ pub(crate) fn announce_protocol(
 /// An observer on the marker rather than part of `verify_protocol`, because the marker is
 /// inserted through commands and the decoder checks for it on the entity: replaying before the
 /// insert has applied would hold every packet again.
+///
+/// What was held is on the lobby: for a seat, the lobby the seat belongs to; for a client, the
+/// verified entity is its lobby.
 pub(crate) fn replay_held_packets(
     verified: On<Add, HandshakeVerified>,
-    clients: Query<&LobbyClientPlayerUuid, With<LobbyClient>>,
+    clients: Query<(&LobbyClientPlayerUuid, &LobbyParticipantOf), With<LobbyClient>>,
     host: Option<Res<HostUuid>>,
     mut commands: Commands,
 ) {
-    let sender = match clients.get(verified.entity) {
-        Ok(uuid) => uuid.0,
+    let (sender, lobby) = match clients.get(verified.entity) {
+        Ok((uuid, seat_of)) => (uuid.0, seat_of.0),
         Err(_) => match host {
-            Some(host) => host.0,
+            Some(host) => (host.0, verified.entity),
             None => return,
         },
     };
     commands.queue(move |world: &mut World| {
         let held = world
-            .get_resource_mut::<HeldUntilVerified>()
+            .get_mut::<HeldUntilVerified>(lobby)
             .map(|mut held| held.take(sender))
             .unwrap_or_default();
         for (packet, received_at) in held {
@@ -184,22 +192,26 @@ pub(crate) fn replay_held_packets(
 /// A seat that appears after its peer's handshake already matched is verified now.
 pub(crate) fn verify_promoted_peers(
     mut commands: Commands,
-    mut matched: ResMut<ProtocolMatched>,
-    promoted_clients: Query<(Entity, &LobbyClientPlayerUuid), Added<LobbyClient>>,
+    mut matched: Query<&mut ProtocolMatched>,
+    promoted_clients: Query<
+        (Entity, &LobbyClientPlayerUuid, &LobbyParticipantOf),
+        Added<LobbyClient>,
+    >,
     promoted_lobbies: Query<Entity, (Added<Lobby>, Without<Host>)>,
     host: Option<Res<HostUuid>>,
 ) {
-    if matched.0.is_empty() {
-        return;
-    }
-    for (client, uuid) in promoted_clients.iter() {
-        if matched.0.remove(&uuid.0) {
+    for (client, uuid, seat_of) in promoted_clients.iter() {
+        if let Ok(mut matched) = matched.get_mut(seat_of.0)
+            && matched.0.remove(&uuid.0)
+        {
             commands.entity(client).try_insert(HandshakeVerified);
         }
     }
     if let Some(host) = host {
         for lobby in promoted_lobbies.iter() {
-            if matched.0.remove(&host.0) {
+            if let Ok(mut matched) = matched.get_mut(lobby)
+                && matched.0.remove(&host.0)
+            {
                 commands
                     .entity(lobby)
                     .try_insert((HandshakeVerified, VerifiedHost(host.0)));
@@ -213,14 +225,15 @@ pub(crate) fn verify_protocol(
     mut commands: Commands,
     registry: Res<EnsembleMessageRegistry>,
     mut messages: MessageReader<ReceivedEnsembleMessage<ProtocolHandshake>>,
-    mut held: ResMut<HeldUntilVerified>,
-    mut matched: ResMut<ProtocolMatched>,
+    mut held: Query<&mut HeldUntilVerified>,
+    mut matched: Query<&mut ProtocolMatched, Or<(With<Lobby>, With<PendingLobby>)>>,
     host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
     client_lobby: Option<Single<(Entity, Option<&AwaitingHost>), (With<Lobby>, Without<Host>)>>,
     lobby_clients: Query<(Entity, &LobbyClientPlayerUuid), With<LobbyClient>>,
     mut join_failed: MessageWriter<LobbyJoinFailed>,
     mut left: MessageWriter<LobbyLeft>,
 ) {
+    let host_lobby = host_lobby.map(|lobby| *lobby);
     let mut ours = None;
     for message in messages.read() {
         let Some(sender) = message.sender else {
@@ -230,13 +243,15 @@ pub(crate) fn verify_protocol(
         let theirs = &message.message;
 
         if theirs.version == ours.version && theirs.hash == ours.hash {
-            if host_lobby.is_some() {
+            if let Some(host_lobby) = host_lobby {
                 match lobby_clients.iter().find(|(_, uuid)| uuid.0 == sender) {
                     Some((client, _)) => {
                         commands.entity(client).try_insert(HandshakeVerified);
                     }
                     None => {
-                        matched.0.insert(sender);
+                        if let Ok(mut matched) = matched.get_mut(host_lobby) {
+                            matched.0.insert(sender);
+                        }
                     }
                 }
             } else if let Some((lobby, awaiting)) = client_lobby.as_deref().copied() {
@@ -264,14 +279,19 @@ pub(crate) fn verify_protocol(
                 commands
                     .entity(lobby)
                     .try_insert((HandshakeVerified, VerifiedHost(sender)));
-            } else {
+            } else if let Some(mut matched) = matched.iter_mut().next() {
+                // A lobby still pending — a client's before it is promoted, a host's before the
+                // platform confirmed it. With no lobby at all there is no session to remember
+                // the match for, and it is dropped with the rest of what arrives then.
                 matched.0.insert(sender);
             }
             continue;
         }
 
         let difference = ours.difference(theirs);
-        held.discard(sender);
+        for mut held in held.iter_mut() {
+            held.discard(sender);
+        }
         if host_lobby.is_some() {
             error!(
                 "refusing client {sender:#x}: its protocol does not match ({difference}). Build \

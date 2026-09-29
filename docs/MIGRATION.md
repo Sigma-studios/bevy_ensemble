@@ -4,13 +4,41 @@ One section per phase of the netcode overhaul, in the order they landed. Each na
 what to change in a consumer, and why. Both peers of a session must be built from the same
 commit; the join handshake enforces it from phase E2 onward.
 
+## Fix — the lobby entity is the session: ordered roster, lobby-scoped state
+
+A client read `SyncLobbyParticipant` and `RemoveLobbyParticipant` in two unordered systems, so the
+two arriving in one frame (a join then a drop, read after a hitch) were applied removal-first and
+left a participant nothing would ever remove. A host could make the same ghost when a seat went in
+the frame it was promoted. And state that belongs to one session was kept in resources that
+outlived it: packets held by a join that died while still pending were replayed into the next join
+to the same host.
+
+- Roster changes and `LobbyClosed` are applied by one system, in the order they came off the wire.
+  `ReceivedEnsembleMessage<SyncLobbyParticipant>` and friends are still written for anyone who
+  reads them. A host only seats a participant if its seat still exists when the command runs.
+- `HeldUntilVerified` is a **component** on the lobby entity (pending or promoted — `Lobby` and
+  `PendingLobby` both require it), not a resource. So is the (internal) `ProtocolMatched`, and so
+  is `PlayerDataPlugin`'s buffer of data waiting for its participant, which now also gives up after
+  ten seconds. A packet or player data that arrives while the peer is in no lobby is dropped.
+  Despawning the lobby is the reset, however the lobby ends.
+- The components describing a client's link to its host are stripped on a change of host from one
+  named list (`HostLinkState`, crate-internal), rather than a tuple written out at the one place.
+- A peer's last `SetPlayerData<T>` is kept on its lobby and said again after a change of host: on
+  promotion at once, otherwise once the new host is reached. An edit made while switching hosts
+  was dropped and never re-sent.
+- Inserts and removals on participants and seats that a same-frame removal may despawn use
+  `try_insert` / `try_remove`, rather than panicking under Bevy's default error handler.
+
+**What to change** Code that read `Res<HeldUntilVerified>` (tests, mostly) queries the component
+instead: `Query<&HeldUntilVerified>`, one per lobby.
+
 ## Fix — a notice that arrives between sessions is not read in the next one
 
 A peer in no lobby used to hold what an unverified sender said, and replay it once a later session
 verified that sender. A player who pressed Leave, and whose seat the host then removed, received the
 removal notice after it had left; when it joined again, the notice was replayed into the new
 session, which ended as `Kicked`. A peer with no lobby now drops such packets, and removing a lobby
-forgets everything held for it (`HeldUntilVerified::clear`).
+forgets everything held for it (see the section above: the held packets are on the lobby).
 
 **What to change** Nothing.
 

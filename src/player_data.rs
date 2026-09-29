@@ -4,8 +4,8 @@ use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Host, Lobby, LobbyClient, LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId,
-    PendingLobby, PlayerUUID, SendMode,
+    AwaitingHost, Host, Lobby, LobbyClient, LobbyParticipant, LobbyParticipantOf,
+    LocalMultiplayerPlayerId, PendingLobby, PlayerUUID, SendMode,
     messages::MessageAuthority,
     messages::{
         EnsembleAppExt, EnsembleMessage, LobbyClientMessage, LobbyMessage, ReceivedEnsembleMessage,
@@ -80,10 +80,18 @@ pub struct SyncPlayerData<T> {
     pub data: T,
 }
 
-/// Buffer for player data messages that arrived before their participant entity existed.
-#[derive(Resource)]
+/// Player data that arrived before its participant entity existed, waiting for it: `(sender,
+/// data, when it was first buffered)`.
+///
+/// On the lobby entity it is waiting in, so it goes with that lobby. As a resource it outlived
+/// every session, and an entry for a player who never appeared — one who left in the same frame
+/// they were announced — was put back every frame for as long as the process ran, and read into
+/// whichever session came next. Entries are also dropped after [`PENDING_PLAYER_DATA_SECS`]: a
+/// participant appears within a frame or two of its data, so anything older is for somebody who
+/// is not coming.
+#[derive(Component)]
 struct PendingPlayerData<T: EnsembleMessage> {
-    pending: Vec<(Option<PlayerUUID>, SyncPlayerData<T>)>,
+    pending: Vec<(Option<PlayerUUID>, SyncPlayerData<T>, f64)>,
 }
 
 impl<T: EnsembleMessage> Default for PendingPlayerData<T> {
@@ -91,6 +99,37 @@ impl<T: EnsembleMessage> Default for PendingPlayerData<T> {
         Self {
             pending: Vec::new(),
         }
+    }
+}
+
+/// How long player data waits for its participant before it is given up on.
+const PENDING_PLAYER_DATA_SECS: f64 = 10.0;
+
+/// On a lobby entity: the last `T` this peer asked to be its own there.
+///
+/// Kept so that it can be said again after a change of host. A client switching to a named new
+/// host sends nothing until it has reached it (see [`AwaitingHost`](crate::AwaitingHost)), so an
+/// edit made in that window was dropped; and one made just before the old host went may never
+/// have been broadcast. Either way the new host holds the old value, and nothing would ever send
+/// the new one.
+#[derive(Component)]
+struct RequestedPlayerData<T: EnsembleMessage>(T);
+
+/// Add `entries` to the lobby's buffer, creating it if this is the first thing to wait there.
+fn buffer_pending<T: EnsembleMessage>(
+    commands: &mut Commands,
+    lobby: Entity,
+    buffer: Option<Mut<PendingPlayerData<T>>>,
+    entries: Vec<(Option<PlayerUUID>, SyncPlayerData<T>, f64)>,
+) {
+    match buffer {
+        Some(mut buffer) => buffer.pending.extend(entries),
+        None if !entries.is_empty() => {
+            commands
+                .entity(lobby)
+                .try_insert(PendingPlayerData { pending: entries });
+        }
+        None => {}
     }
 }
 
@@ -198,23 +237,25 @@ fn publish_local_player_data<T: EnsembleMessage>(
 
 impl<T: EnsembleMessage> Plugin for PlayerDataPlugin<T> {
     fn build(&self, app: &mut App) {
-        app.init_resource::<PendingPlayerData<T>>()
-            .register_control_message_type::<SyncPlayerData<T>>(
-                // One name per data type, or two `PlayerDataPlugin`s would collide.
-                std::any::type_name::<SyncPlayerData<T>>(),
-                MessageAuthority::HostOnly,
-            )
-            .add_observer(handle_set_player_data::<T>)
-            .add_systems(
-                Update,
-                (
-                    broadcast_changed_player_data::<T>,
-                    sync_existing_player_data_to_new_clients::<T>
-                        .after(broadcast_changed_player_data::<T>),
-                    apply_received_player_data::<T>,
-                    clear_pending_on_host_change::<T>.before(apply_received_player_data::<T>),
-                ),
-            );
+        app.register_control_message_type::<SyncPlayerData<T>>(
+            // One name per data type, or two `PlayerDataPlugin`s would collide.
+            std::any::type_name::<SyncPlayerData<T>>(),
+            MessageAuthority::HostOnly,
+        )
+        .add_observer(handle_set_player_data::<T>)
+        .add_systems(
+            Update,
+            (
+                broadcast_changed_player_data::<T>,
+                sync_existing_player_data_to_new_clients::<T>
+                    .after(broadcast_changed_player_data::<T>),
+                // After the roster, so a participant announced in the same frame as its data
+                // is there to receive it.
+                apply_received_player_data::<T>.after(crate::systems::apply_lobby_state),
+                clear_pending_on_host_change::<T>.before(apply_received_player_data::<T>),
+                republish_player_data_to_a_new_host::<T>,
+            ),
+        );
     }
 }
 
@@ -222,10 +263,44 @@ impl<T: EnsembleMessage> Plugin for PlayerDataPlugin<T> {
 /// old host would be replayed as the new host's own, and refused as sent by somebody else.
 fn clear_pending_on_host_change<T: EnsembleMessage>(
     mut changes: MessageReader<crate::HostChanged>,
-    mut pending: ResMut<PendingPlayerData<T>>,
+    mut pending: Query<&mut PendingPlayerData<T>>,
 ) {
-    if changes.read().next().is_some() {
-        pending.pending.clear();
+    for change in changes.read() {
+        if let Ok(mut pending) = pending.get_mut(change.lobby) {
+            pending.pending.clear();
+        }
+    }
+}
+
+/// Say this peer's own data again once there is a new host to say it to.
+///
+/// When the host changes to this peer, at once: it now owns its participant and sets the value
+/// directly. When it changes to somebody else, once this peer has reached them — the moment
+/// [`AwaitingHost`] comes off — because until then a request has nowhere to go.
+fn republish_player_data_to_a_new_host<T: EnsembleMessage>(
+    mut commands: Commands,
+    mut changes: MessageReader<crate::HostChanged>,
+    mut reached: RemovedComponents<AwaitingHost>,
+    lobbies: Query<(&RequestedPlayerData<T>, Option<&AwaitingHost>), With<Lobby>>,
+) {
+    let mut lobbies_to_republish: Vec<Entity> = changes
+        .read()
+        .map(|change| change.lobby)
+        .chain(reached.read())
+        .collect();
+    lobbies_to_republish.sort();
+    lobbies_to_republish.dedup();
+    for lobby in lobbies_to_republish {
+        let Ok((requested, awaiting)) = lobbies.get(lobby) else {
+            continue;
+        };
+        if awaiting.is_some_and(|awaiting| awaiting.successor.is_some()) {
+            continue;
+        }
+        let data = requested.0.clone();
+        commands
+            .entity(lobby)
+            .trigger(move |entity| SetPlayerData::new(entity, data));
     }
 }
 
@@ -236,8 +311,9 @@ fn clear_pending_on_host_change<T: EnsembleMessage>(
 fn handle_set_player_data<T: EnsembleMessage>(
     event: On<SetPlayerData<T>>,
     mut commands: Commands,
+    time: Res<Time>,
     local_player: Option<Res<LocalMultiplayerPlayerId>>,
-    mut pending: ResMut<PendingPlayerData<T>>,
+    mut pending: Query<&mut PendingPlayerData<T>>,
     host_lobbies: Query<(), (With<Lobby>, With<Host>)>,
     participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
 ) {
@@ -247,6 +323,10 @@ fn handle_set_player_data<T: EnsembleMessage>(
 
     let lobby_entity = event.entity;
     let data = event.data.clone();
+    // Remembered on the lobby, to be said again to a new host. See `RequestedPlayerData`.
+    commands
+        .entity(lobby_entity)
+        .try_insert(RequestedPlayerData(data.clone()));
 
     if host_lobbies.get(lobby_entity).is_ok() {
         // Host: directly insert on own participant
@@ -254,17 +334,26 @@ fn handle_set_player_data<T: EnsembleMessage>(
             .iter()
             .find(|(_, p, pof)| pof.0 == lobby_entity && p.player_uuid == local_player.0)
         {
-            commands.entity(participant_entity).insert(PlayerData(data));
+            commands
+                .entity(participant_entity)
+                .try_insert(PlayerData(data));
         } else {
             // Participant not created yet — buffer for retry. The host's own request is
             // filed under its own identity, which is what the sender check will compare.
-            pending.pending.push((
+            let entry = (
                 Some(local_player.0),
                 SyncPlayerData {
                     player_uuid: local_player.0,
                     data,
                 },
-            ));
+                time.elapsed_secs_f64(),
+            );
+            buffer_pending(
+                &mut commands,
+                lobby_entity,
+                pending.get_mut(lobby_entity).ok(),
+                vec![entry],
+            );
         }
     } else {
         // Client: send request to host
@@ -343,67 +432,74 @@ fn sync_existing_player_data_to_new_clients<T: EnsembleMessage>(
 ///   the data to the participant entity, which triggers broadcast via change detection.
 /// - On a **client**: applies data from host broadcasts to the local participant entity.
 ///
-/// Messages that arrive before their target participant entity exists are buffered
-/// and retried on subsequent frames.
+/// Messages that arrive before their target participant entity exists are buffered on the lobby
+/// and retried on subsequent frames (see [`PendingPlayerData`]). A message that arrives while
+/// this peer is in no lobby is dropped: there is nothing it could be about.
 fn apply_received_player_data<T: EnsembleMessage>(
     mut commands: Commands,
+    time: Res<Time>,
     mut messages: MessageReader<ReceivedEnsembleMessage<SyncPlayerData<T>>>,
-    mut pending: ResMut<PendingPlayerData<T>>,
+    mut pending: Query<&mut PendingPlayerData<T>>,
     host_lobbies: Query<Entity, (With<Lobby>, With<Host>)>,
-    client_lobby: Option<Single<Entity, (With<Lobby>, Without<Host>)>>,
-    pending_client_lobby: Option<Single<Entity, (With<PendingLobby>, Without<Host>)>>,
+    client_lobbies: Query<Entity, (Or<(With<Lobby>, With<PendingLobby>)>, Without<Host>)>,
     participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
 ) {
-    let buffered = std::mem::take(&mut pending.pending);
-    let all_messages = buffered
-        .into_iter()
-        .chain(messages.read().map(|m| (m.sender, m.message.clone())));
+    let arrived: Vec<_> = messages
+        .read()
+        .map(|m| (m.sender, m.message.clone()))
+        .collect();
+    let host_lobby = host_lobbies.iter().next();
+    let Some(lobby) = host_lobby.or_else(|| client_lobbies.iter().next()) else {
+        return;
+    };
 
-    for (sender, sync_msg) in all_messages {
+    let now = time.elapsed_secs_f64();
+    let buffered = pending
+        .get_mut(lobby)
+        .map(|mut pending| std::mem::take(&mut pending.pending))
+        .unwrap_or_default();
+    let all_messages = buffered.into_iter().chain(
+        arrived
+            .into_iter()
+            .map(|(sender, message)| (sender, message, now)),
+    );
+    let mut still_waiting = Vec::new();
+
+    for (sender, sync_msg, buffered_at) in all_messages {
         let player_uuid = sync_msg.player_uuid;
 
         // Host: a client is requesting to set their data — its own, and nobody else's. The
         // target used to be whatever the message named, so one message rewrote any player.
-        if let Some(host_lobby) = host_lobbies.iter().next() {
-            if sender != Some(player_uuid) {
-                warn!(
-                    "refused player data for {player_uuid:#x} sent by {sender:#x?}: a client may \
-                     only set its own"
-                );
-                continue;
-            }
-            if let Some((participant_entity, _, _)) = participants
-                .iter()
-                .find(|(_, p, pof)| pof.0 == host_lobby && p.player_uuid == player_uuid)
-            {
-                commands
-                    .entity(participant_entity)
-                    .insert(PlayerData(sync_msg.data));
-            } else {
-                pending.pending.push((sender, sync_msg));
-            }
+        if host_lobby.is_some() && sender != Some(player_uuid) {
+            warn!(
+                "refused player data for {player_uuid:#x} sent by {sender:#x?}: a client may \
+                 only set its own"
+            );
             continue;
         }
-
-        // Client: apply synced data
-        let Some(lobby) = client_lobby
-            .as_ref()
-            .map(|s| **s)
-            .or_else(|| pending_client_lobby.as_ref().map(|s| **s))
-        else {
-            pending.pending.push((sender, sync_msg));
-            continue;
-        };
 
         if let Some((participant_entity, _, _)) = participants
             .iter()
             .find(|(_, p, pof)| pof.0 == lobby && p.player_uuid == player_uuid)
         {
+            // `try_`: a participant this frame's roster removed is still in the query.
             commands
                 .entity(participant_entity)
-                .insert(PlayerData(sync_msg.data));
+                .try_insert(PlayerData(sync_msg.data));
+        } else if now - buffered_at < PENDING_PLAYER_DATA_SECS {
+            still_waiting.push((sender, sync_msg, buffered_at));
         } else {
-            pending.pending.push((sender, sync_msg));
+            debug!(
+                "dropping player data for {player_uuid:#x}: no such participant appeared in \
+                 {PENDING_PLAYER_DATA_SECS}s"
+            );
         }
     }
+
+    buffer_pending(
+        &mut commands,
+        lobby,
+        pending.get_mut(lobby).ok(),
+        still_waiting,
+    );
 }
