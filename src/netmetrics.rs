@@ -14,6 +14,8 @@
 //! The cost when enabled is a few integer additions per packet; when the feature is
 //! off, none of this compiles in.
 
+use std::time::Duration;
+
 use bevy::prelude::*;
 
 use crate::SerializedLobbyPacket;
@@ -78,11 +80,11 @@ pub struct NetMetrics {
     last_tx_bytes: u64,
     last_rx_packets: u64,
     last_tx_packets: u64,
-    accum_secs: f64,
+    accumulated: Duration,
 }
 
 /// How often [`sample_rates`] recomputes the per-second fields.
-const SAMPLE_INTERVAL: f64 = 0.5;
+const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Global observer: count every serialized outbound packet.
 ///
@@ -103,12 +105,13 @@ pub(crate) fn count_outbound(
 
 /// Recompute the sampled per-second rates from cumulative deltas.
 pub(crate) fn sample_rates(mut metrics: ResMut<NetMetrics>, time: Res<Time>) {
-    metrics.accum_secs += time.delta_secs_f64();
-    if metrics.accum_secs < SAMPLE_INTERVAL {
+    metrics.accumulated += time.delta();
+    if metrics.accumulated < SAMPLE_INTERVAL {
         return;
     }
-    let dt = metrics.accum_secs;
-    metrics.accum_secs = 0.0;
+    // Rates over exactly the window that passed, so starting the next one from zero loses
+    // nothing.
+    let dt = std::mem::take(&mut metrics.accumulated).as_secs_f64();
 
     let d_rx_bytes = metrics.rx_bytes - metrics.last_rx_bytes;
     let d_tx_bytes = metrics.tx_bytes - metrics.last_tx_bytes;

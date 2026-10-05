@@ -9,6 +9,8 @@
 //! So the host sends what it has, about once a second, and every peer — host included — keeps it
 //! as a [`ParticipantLink`] on the participant it describes.
 
+use std::time::Duration;
+
 use bevy::prelude::*;
 
 use crate::{
@@ -19,7 +21,7 @@ use crate::{
 
 /// How often the host sends the report. A scoreboard reading, not a signal anything steers by:
 /// once a second is fresh enough to watch a ping move, and costs a few dozen bytes.
-const REPORT_INTERVAL_SECS: f32 = 1.0;
+const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A participant's connection to the host, as the host last measured it.
 ///
@@ -29,16 +31,16 @@ const REPORT_INTERVAL_SECS: f32 = 1.0;
 /// numbers described the old host's links.
 #[derive(Component, Debug, Clone, Copy, PartialEq)]
 pub struct ParticipantLink {
-    /// Round trip to the host, in seconds: the host's [`PeerRtt`] for this participant.
-    pub rtt: f64,
-    /// The network's part of that round trip, in seconds: the host's [`PeerWireRtt`], which
+    /// Round trip to the host: the host's [`PeerRtt`] for this participant.
+    pub rtt: Duration,
+    /// The network's part of that round trip: the host's [`PeerWireRtt`], which
     /// leaves out how long the participant's app held the ping before answering.
     ///
     /// The number to show as somebody's ping. [`rtt`](Self::rtt) also counts the time the ping
     /// waited for their next frame, so it rises with a slow machine's frame time — and on a
     /// scoreboard a player at 30 fps looked 20 ms worse connected than one at 144 on the same line.
     /// The same as `rtt` until the host has a wire measurement.
-    pub wire_rtt: f64,
+    pub wire_rtt: Duration,
     /// How this participant reaches the host. `None` until ICE has settled, or on a transport
     /// that does not report it.
     pub route: Option<PeerRoute>,
@@ -62,16 +64,16 @@ pub struct LinkEntry {
 impl LinkEntry {
     fn link(self) -> ParticipantLink {
         ParticipantLink {
-            rtt: f64::from(self.rtt_micros) / 1e6,
-            wire_rtt: f64::from(self.wire_micros) / 1e6,
+            rtt: Duration::from_micros(u64::from(self.rtt_micros)),
+            wire_rtt: Duration::from_micros(u64::from(self.wire_micros)),
             route: self.route,
         }
     }
 }
 
-/// Seconds as whole microseconds, for the wire: never negative, never past `u32::MAX`.
-fn micros(seconds: f64) -> u32 {
-    (seconds.max(0.0) * 1e6).min(f64::from(u32::MAX)) as u32
+/// A duration as whole microseconds, for the wire: never past `u32::MAX`, an hour and ten minutes.
+fn micros(duration: Duration) -> u32 {
+    u32::try_from(duration.as_micros()).unwrap_or(u32::MAX)
 }
 
 type Participants<'w, 's> = Query<
@@ -119,7 +121,7 @@ fn apply(
 pub(crate) fn send_link_reports(
     mut commands: Commands,
     time: Res<Time>,
-    mut cooldown: Local<f32>,
+    mut cadence: Local<crate::Cadence>,
     host: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
     clients: Query<
         (
@@ -136,19 +138,17 @@ pub(crate) fn send_link_reports(
     let Some(host) = host else {
         // Not hosting: the next lobby this peer hosts reports on its first frame, rather than
         // whenever the last one's clock would have come round.
-        *cooldown = 0.0;
+        cadence.reset();
         return;
     };
     let lobby = *host;
-    *cooldown -= time.delta_secs();
-    if *cooldown > 0.0 {
+    if !cadence.tick(time.delta(), REPORT_INTERVAL) {
         return;
     }
-    *cooldown = REPORT_INTERVAL_SECS;
 
     let entries: Vec<LinkEntry> = clients
         .iter()
-        .filter(|(_, of, rtt, _, _)| of.0 == lobby && rtt.0.is_finite())
+        .filter(|(_, of, ..)| of.0 == lobby)
         .map(|(uuid, _, rtt, wire, route)| LinkEntry {
             player: uuid.0,
             rtt_micros: micros(rtt.0),

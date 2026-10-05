@@ -85,6 +85,7 @@
 use bevy::prelude::*;
 
 mod broadcast;
+mod cadence;
 mod components;
 pub mod handshake;
 mod link_report;
@@ -113,6 +114,7 @@ mod types;
 pub use broadcast::{
     BroadcastLobbyMessage, LobbyBroadcastAppExt, LobbyBroadcastEnvelope, LobbyBroadcastPlugin,
 };
+pub use cadence::Cadence;
 pub use components::*;
 pub use handshake::{HandshakeVerified, ProtocolHandshake};
 pub use link_report::{LinkEntry, ParticipantLink, ParticipantLinks};

@@ -554,6 +554,6 @@ fn peer_rtt_reflects_each_clients_own_links() {
             .map(|rtt| rtt.0)
             .expect("published")
     };
-    assert!(rtt(&net, near) < 0.01);
-    assert!(rtt(&net, far) > 0.5);
+    assert!(rtt(&net, near) < Duration::from_millis(10));
+    assert!(rtt(&net, far) > Duration::from_millis(500));
 }

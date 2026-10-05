@@ -1023,12 +1023,16 @@ fn read_messages(world: &mut World, mut refused: Local<u64>) {
     }
 }
 
-// Retries every 500ms because the peer's `PendingLobby` / `PendingSteamLobbyClient`
-// entity may not exist yet when the first handshake arrives. Messages are sent
-// reliably so loss isn't the concern — only the entity-readiness race.
-//
-// Sent while joining, and again while following a new host: the new host seats this peer
-// when this handshake arrives, as it does for a joiner.
+/// How often the ready handshake is said again.
+///
+/// Retried because the peer's `PendingLobby` / `PendingSteamLobbyClient` entity may not exist yet
+/// when the first handshake arrives. Messages are sent reliably so loss isn't the concern — only
+/// the entity-readiness race.
+///
+/// Sent while joining, and again while following a new host: the new host seats this peer when
+/// this handshake arrives, as it does for a joiner.
+const HANDSHAKE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 fn send_client_handshakes(
     steam_client: Res<Client>,
     registry: Res<bevy_ensemble::EnsembleMessageRegistry>,
@@ -1042,13 +1046,11 @@ fn send_client_handshakes(
         (Or<(With<PendingLobby>, With<Lobby>)>, Without<Host>),
     >,
     time: Res<Time>,
-    mut cooldown: Local<f32>,
+    mut cadence: Local<bevy_ensemble::Cadence>,
 ) {
-    *cooldown -= time.delta_secs();
-    if *cooldown > 0.0 {
+    if !cadence.tick(time.delta(), HANDSHAKE_INTERVAL) {
         return;
     }
-    *cooldown = 0.5;
 
     let packet = encode_ensemble_message(&registry, &SteamReadyHandshake { from_host: false });
     for (lobby_id, pinned_host, promoted, awaiting) in client_lobbies.iter() {
@@ -1066,13 +1068,11 @@ fn send_host_handshakes(
     registry: Res<bevy_ensemble::EnsembleMessageRegistry>,
     host_lobbies: Query<&LobbySteamId, (With<Lobby>, With<Host>)>,
     time: Res<Time>,
-    mut cooldown: Local<f32>,
+    mut cadence: Local<bevy_ensemble::Cadence>,
 ) {
-    *cooldown -= time.delta_secs();
-    if *cooldown > 0.0 {
+    if !cadence.tick(time.delta(), HANDSHAKE_INTERVAL) {
         return;
     }
-    *cooldown = 0.5;
 
     let Some(lobby_id) = host_lobbies.iter().next() else {
         return;

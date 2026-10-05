@@ -1159,7 +1159,9 @@ impl LoopbackNetwork {
         if self.netsim == NetPreset::Off {
             return;
         }
-        let now = self.frame as f64 * self.frame_duration.as_secs_f64();
+        // In integer time, so the clock a delay is scheduled on is exact however long the run.
+        let nanos = self.frame_duration.as_nanos() * u128::from(self.frame);
+        let now = Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
         for peer in &mut self.peers {
             peer.app
                 .world_mut()
@@ -1376,7 +1378,7 @@ impl LoopbackNetwork {
         let host_uuid = self.peers[host.0].uuid;
         let netsim = (self.netsim != NetPreset::Off).then(|| self.netsim.config());
 
-        let mut per_client: Vec<(PlayerUUID, f64, f64)> = Vec::new();
+        let mut per_client: Vec<(PlayerUUID, Duration, Duration)> = Vec::new();
         for index in 0..self.peers.len() {
             let peer = PeerId(index);
             if self.peers[index].is_host || !self.peers[index].attachment.can_receive() {
@@ -1400,16 +1402,17 @@ impl LoopbackNetwork {
             // One sample of the same distribution `schedule` draws from, per direction.
             let up_jitter = self.sample_jitter(up);
             let down_jitter = self.sample_jitter(down);
-            let mut round_trip = (up.delay + down.delay).as_secs_f64() + up_jitter + down_jitter;
+            let mut round_trip =
+                up.delay + down.delay + Duration::from_secs_f64(up_jitter + down_jitter);
 
             // Netsim delays each peer's *inbound* path, so a round trip crosses two impaired
-            // paths — which is why its one-way `delay_ms` shows up as roughly double in
+            // paths — which is why its one-way `delay` shows up as roughly double in
             // `PeerRtt`. Leaving this out is not a small inaccuracy: a game that sizes its buffer
             // from `PeerRtt` would keep a buffer for a perfect link and stall on the first packet
             // that missed its tick.
             if let Some(config) = netsim {
-                let sampled = self.link_rng.unit() * config.jitter_ms;
-                round_trip += 2.0 * f64::from(config.delay_ms + sampled) / 1000.0;
+                let sampled = config.jitter.mul_f32(self.link_rng.unit());
+                round_trip += 2 * (config.delay + sampled);
             }
 
             // Published alongside the round trip, because a consumer sizing a playout buffer
@@ -1423,7 +1426,7 @@ impl LoopbackNetwork {
             // The expectation of one uniform draw is half the jitter; over two directions the
             // mean absolute deviation the real estimator converges to comes out at a quarter of
             // the sum.
-            let mean_jitter = (up.jitter + down.jitter).as_secs_f64() / 4.0;
+            let mean_jitter = (up.jitter + down.jitter) / 4;
             per_client.push((self.peers[index].uuid, round_trip, mean_jitter));
         }
 

@@ -36,6 +36,8 @@
 //! gone. The presets are one-way wire conditions either way; the model decides what the
 //! layer above does with them.
 
+use std::time::Duration;
+
 use bevy::prelude::*;
 
 use crate::{Instant, PlayerUUID, registry::decode_ensemble_packet_now};
@@ -103,26 +105,26 @@ impl NetPreset {
         match self {
             NetPreset::Off => NetSimConfig::OFF,
             NetPreset::Cable => NetSimConfig {
-                delay_ms: 15.0,
-                jitter_ms: 3.0,
+                delay: Duration::from_millis(15),
+                jitter: Duration::from_millis(3),
                 loss: 0.001,
                 duplicate: 0.0,
             },
             NetPreset::FourG => NetSimConfig {
-                delay_ms: 40.0,
-                jitter_ms: 15.0,
+                delay: Duration::from_millis(40),
+                jitter: Duration::from_millis(15),
                 loss: 0.005,
                 duplicate: 0.0,
             },
             NetPreset::BadWifi => NetSimConfig {
-                delay_ms: 60.0,
-                jitter_ms: 40.0,
+                delay: Duration::from_millis(60),
+                jitter: Duration::from_millis(40),
                 loss: 0.03,
                 duplicate: 0.01,
             },
             NetPreset::Satellite => NetSimConfig {
-                delay_ms: 300.0,
-                jitter_ms: 20.0,
+                delay: Duration::from_millis(300),
+                jitter: Duration::from_millis(20),
                 loss: 0.01,
                 duplicate: 0.0,
             },
@@ -133,11 +135,11 @@ impl NetPreset {
 /// The tunable impairment knobs applied to inbound packets.
 #[derive(Debug, Clone, Copy)]
 pub struct NetSimConfig {
-    /// Base one-way delay added to every packet, milliseconds.
-    pub delay_ms: f32,
-    /// Extra uniform random delay in `[0, jitter_ms)` added per packet, milliseconds.
-    /// Because it is sampled per packet, it also reorders the unreliable stream.
-    pub jitter_ms: f32,
+    /// Base one-way delay added to every packet.
+    pub delay: Duration,
+    /// Extra uniform random delay in `[0, jitter)` added per packet. Because it is sampled per
+    /// packet, it also reorders the unreliable stream.
+    pub jitter: Duration,
     /// Probability in `[0, 1]` that a packet is dropped outright.
     pub loss: f32,
     /// Probability in `[0, 1]` that a delivered packet is also duplicated.
@@ -147,8 +149,8 @@ pub struct NetSimConfig {
 impl NetSimConfig {
     /// A completely transparent configuration.
     pub const OFF: NetSimConfig = NetSimConfig {
-        delay_ms: 0.0,
-        jitter_ms: 0.0,
+        delay: Duration::ZERO,
+        jitter: Duration::ZERO,
         loss: 0.0,
         duplicate: 0.0,
     };
@@ -195,22 +197,22 @@ pub enum NetSimClock {
     /// Read elapsed seconds from Bevy's [`Time`].
     #[default]
     Time,
-    /// A manually advanced clock, in seconds from an arbitrary origin.
-    Manual(f64),
+    /// A manually advanced clock, as time since an arbitrary origin.
+    Manual(Duration),
 }
 
 impl NetSimClock {
-    /// Advance a manual clock by `secs`. Does nothing to [`NetSimClock::Time`], which
-    /// advances on its own.
-    pub fn advance(&mut self, secs: f64) {
+    /// Advance a manual clock by `by`. Does nothing to [`NetSimClock::Time`], which advances
+    /// on its own.
+    pub fn advance(&mut self, by: Duration) {
         if let NetSimClock::Manual(now) = self {
-            *now += secs;
+            *now += by;
         }
     }
 
-    /// Switch to a manual clock reading `secs`.
-    pub fn set(&mut self, secs: f64) {
-        *self = NetSimClock::Manual(secs);
+    /// Switch to a manual clock reading `now`.
+    pub fn set(&mut self, now: Duration) {
+        *self = NetSimClock::Manual(now);
     }
 }
 
@@ -218,16 +220,16 @@ impl NetSimClock {
 ///
 /// Returns `None` only when neither resource exists, which leaves the simulator inert
 /// rather than guessing at a time base.
-fn clock_now(world: &World) -> Option<f64> {
+fn clock_now(world: &World) -> Option<Duration> {
     match world.get_resource::<NetSimClock>() {
         Some(NetSimClock::Manual(now)) => Some(*now),
-        _ => world.get_resource::<Time>().map(|t| t.elapsed_secs_f64()),
+        _ => world.get_resource::<Time>().map(|t| t.elapsed()),
     }
 }
 
 /// One inbound packet held back until its scheduled release time.
 struct Delayed {
-    release: f64,
+    release: Duration,
     /// Insertion order, breaking release-time ties. `take_due` pulls packets out with
     /// `swap_remove`, so queue position is not insertion order and a stable sort alone
     /// would not give a repeatable drain.
@@ -250,7 +252,7 @@ pub struct NetSim {
     /// Latest release time scheduled per sender, for [`ChannelModel::Reliable`].
     /// A short association list: a session has a handful of peers, and unlike a
     /// hash map it cannot introduce iteration-order surprises.
-    last_release: Vec<(Option<PlayerUUID>, f64)>,
+    last_release: Vec<(Option<PlayerUUID>, Duration)>,
     next_seq: u64,
 }
 
@@ -321,7 +323,7 @@ impl NetSim {
         &mut self,
         sender: Option<PlayerUUID>,
         bytes: Vec<u8>,
-        mut release: f64,
+        mut release: Duration,
         received_at: Instant,
     ) {
         if self.channel == ChannelModel::Reliable {
@@ -349,7 +351,7 @@ impl NetSim {
     /// Sorting by release time is what turns per-packet jitter into real reordering;
     /// the `seq` tiebreak keeps packets clamped to the same release — and packets the
     /// caller queued at one instant — in the order they arrived.
-    fn take_due(&mut self, now: f64) -> Vec<(Option<PlayerUUID>, Vec<u8>, Instant)> {
+    fn take_due(&mut self, now: Duration) -> Vec<(Option<PlayerUUID>, Vec<u8>, Instant)> {
         let mut due: Vec<Delayed> = Vec::new();
         let mut i = 0;
         while i < self.queue.len() {
@@ -359,12 +361,7 @@ impl NetSim {
                 i += 1;
             }
         }
-        due.sort_by(|a, b| {
-            a.release
-                .partial_cmp(&b.release)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.seq.cmp(&b.seq))
-        });
+        due.sort_by_key(|delayed| (delayed.release, delayed.seq));
         due.into_iter()
             .map(|d| (d.sender, d.bytes, d.received_at))
             .collect()
@@ -412,16 +409,20 @@ pub(crate) fn offer_inbound(
     }
 
     let schedule = |sim: &mut NetSim| {
-        let jitter = if config.jitter_ms > 0.0 {
-            sim.roll() * config.jitter_ms
+        let jitter = if config.jitter.is_zero() {
+            Duration::ZERO
         } else {
-            0.0
+            config.jitter.mul_f32(sim.roll())
         };
         // A reliable channel does not lose the message, it resends it — which costs a
         // round trip, and (via `enqueue`'s clamp) holds up everything behind it. Modelling
         // it as a drop would test a failure a reliable protocol cannot actually have.
-        let retransmit = if lost { config.delay_ms * 2.0 } else { 0.0 };
-        now + ((config.delay_ms + jitter + retransmit) as f64) / 1000.0
+        let retransmit = if lost {
+            config.delay * 2
+        } else {
+            Duration::ZERO
+        };
+        now + config.delay + jitter + retransmit
     };
 
     let release = schedule(&mut sim);
@@ -456,13 +457,17 @@ pub(crate) fn drain_netsim(world: &mut World) {
 mod tests {
     use super::*;
 
+    fn secs(seconds: f64) -> Duration {
+        Duration::from_secs_f64(seconds)
+    }
+
     /// Queue `releases` in the order given, all from `sender`, then drain everything.
     /// Payloads are the arrival index, so the returned bytes spell out the delivery order.
     fn drain_in_order(sim: &mut NetSim, sender: Option<PlayerUUID>, releases: &[f64]) -> Vec<u8> {
         for (i, release) in releases.iter().enumerate() {
-            sim.enqueue(sender, vec![i as u8], *release, Instant::now());
+            sim.enqueue(sender, vec![i as u8], secs(*release), Instant::now());
         }
-        sim.take_due(f64::MAX)
+        sim.take_due(Duration::MAX)
             .into_iter()
             .map(|(_, b, _)| b[0])
             .collect()
@@ -472,8 +477,8 @@ mod tests {
     fn a_manual_clock_wins_over_time() {
         let mut world = World::new();
         world.insert_resource(Time::<()>::default());
-        world.insert_resource(NetSimClock::Manual(5.0));
-        assert_eq!(clock_now(&world), Some(5.0));
+        world.insert_resource(NetSimClock::Manual(secs(5.0)));
+        assert_eq!(clock_now(&world), Some(secs(5.0)));
     }
 
     #[test]
@@ -482,9 +487,9 @@ mod tests {
         world.insert_resource(Time::<()>::default());
 
         // The default variant is `Time`, so installing the resource changes nothing.
-        assert_eq!(clock_now(&world), Some(0.0));
+        assert_eq!(clock_now(&world), Some(Duration::ZERO));
         world.insert_resource(NetSimClock::default());
-        assert_eq!(clock_now(&world), Some(0.0));
+        assert_eq!(clock_now(&world), Some(Duration::ZERO));
     }
 
     #[test]
@@ -495,15 +500,15 @@ mod tests {
 
     #[test]
     fn advance_moves_a_manual_clock_and_leaves_time_alone() {
-        let mut clock = NetSimClock::Manual(1.0);
-        clock.advance(0.5);
-        assert_eq!(clock, NetSimClock::Manual(1.5));
+        let mut clock = NetSimClock::Manual(secs(1.0));
+        clock.advance(secs(0.5));
+        assert_eq!(clock, NetSimClock::Manual(secs(1.5)));
 
         let mut real = NetSimClock::Time;
-        real.advance(0.5);
+        real.advance(secs(0.5));
         assert_eq!(real, NetSimClock::Time, "`Time` advances itself");
-        real.set(2.0);
-        assert_eq!(real, NetSimClock::Manual(2.0));
+        real.set(secs(2.0));
+        assert_eq!(real, NetSimClock::Manual(secs(2.0)));
     }
 
     #[test]
@@ -536,14 +541,14 @@ mod tests {
         // nothing behind a late packet arrives before it.
         let mut sim = NetSim::default();
         sim.set_channel_model(ChannelModel::Reliable);
-        sim.enqueue(Some(1), vec![0], 1.0, Instant::now());
-        sim.enqueue(Some(1), vec![1], 0.1, Instant::now());
+        sim.enqueue(Some(1), vec![0], secs(1.0), Instant::now());
+        sim.enqueue(Some(1), vec![1], secs(0.1), Instant::now());
 
         assert!(
-            sim.take_due(0.5).is_empty(),
+            sim.take_due(secs(0.5)).is_empty(),
             "the second packet was released ahead of the one blocking it"
         );
-        assert_eq!(sim.take_due(1.0).len(), 2);
+        assert_eq!(sim.take_due(secs(1.0)).len(), 2);
     }
 
     #[test]
@@ -551,11 +556,11 @@ mod tests {
         // Nothing in either transport orders one peer's stream against another's.
         let mut sim = NetSim::default();
         sim.set_channel_model(ChannelModel::Reliable);
-        sim.enqueue(Some(1), vec![0], 1.0, Instant::now());
-        sim.enqueue(Some(2), vec![1], 0.5, Instant::now());
+        sim.enqueue(Some(1), vec![0], secs(1.0), Instant::now());
+        sim.enqueue(Some(2), vec![1], secs(0.5), Instant::now());
 
         let due: Vec<u8> = sim
-            .take_due(0.6)
+            .take_due(secs(0.6))
             .into_iter()
             .map(|(_, b, _)| b[0])
             .collect();
@@ -575,7 +580,7 @@ mod tests {
     /// many survived to the queue.
     fn offer_many(preset: NetPreset, channel: ChannelModel, count: usize) -> (usize, usize) {
         let mut world = World::new();
-        world.insert_resource(NetSimClock::Manual(0.0));
+        world.insert_resource(NetSimClock::Manual(Duration::ZERO));
         let mut sim = NetSim::default();
         sim.set_preset(preset);
         sim.set_channel_model(channel);
@@ -620,11 +625,11 @@ mod tests {
         // difference between a clean link and a lossy one.
         let clean = |channel| {
             let mut world = World::new();
-            world.insert_resource(NetSimClock::Manual(0.0));
+            world.insert_resource(NetSimClock::Manual(Duration::ZERO));
             let mut sim = NetSim::default();
             // No jitter, so the only variation left is the retransmit penalty.
             sim.set_preset(NetPreset::Satellite);
-            sim.config.jitter_ms = 0.0;
+            sim.config.jitter = Duration::ZERO;
             sim.set_channel_model(channel);
             world.insert_resource(sim);
             for _ in 0..200 {
@@ -632,7 +637,7 @@ mod tests {
             }
             // One-way delay is 300ms; a resend adds a 600ms round trip on top.
             let sim = world.resource::<NetSim>();
-            sim.queue.iter().filter(|d| d.release > 0.5).count()
+            sim.queue.iter().filter(|d| d.release > secs(0.5)).count()
         };
         assert!(
             clean(ChannelModel::Reliable) > 0,
@@ -653,7 +658,7 @@ mod tests {
             sim.set_preset(NetPreset::BadWifi);
             let config = sim.config();
             (0..64)
-                .map(|_| (sim.roll() < config.loss, sim.roll() * config.jitter_ms))
+                .map(|_| (sim.roll() < config.loss, config.jitter.mul_f32(sim.roll())))
                 .collect::<Vec<_>>()
         };
         assert_eq!(trace(), trace());

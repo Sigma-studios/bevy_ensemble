@@ -113,9 +113,9 @@ pub struct LobbyConnection {
     /// Requests sent on this connection that could still be refused for being over a rate limit,
     /// and so sent again. See [`LobbyConnection::send_request`].
     pub(crate) unanswered: bevy::platform::collections::HashMap<RequestId, Unanswered>,
-    /// When this connection next tells the server it is still here, in `Time::elapsed` seconds.
-    /// Zero, which is at once, for a new connection.
-    pub(crate) next_keep_alive_at: f64,
+    /// When this connection next tells the server it is still here, on `Time::elapsed`. Zero,
+    /// which is at once, for a new connection.
+    pub(crate) next_keep_alive_at: std::time::Duration,
 }
 
 /// A request sent and not yet answered, kept so that a [`SignallingError::RateLimited`] refusal
@@ -392,7 +392,7 @@ mod retry_tests {
             announced_name: String::new(),
             server_outdated: false,
             unanswered: Default::default(),
-            next_keep_alive_at: 0.0,
+            next_keep_alive_at: std::time::Duration::ZERO,
         };
         (connection, command_rx)
     }

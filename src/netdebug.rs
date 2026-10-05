@@ -25,6 +25,8 @@
 //! `ENSEMBLE_NETSIM=4g` environment variable overrides [`default_preset`](NetDebugPlugin::default_preset)
 //! at startup (handy for headless / CI runs that never touch the window).
 
+use std::time::Duration;
+
 use bevy::prelude::*;
 
 use crate::{
@@ -353,16 +355,17 @@ fn update_overlay_text(
 
     let peer_count = peers.iter().count();
     let (avg_rtt_ms, avg_wire_ms, worst_silence) = if peer_count > 0 {
-        let mut rtt_sum = 0.0;
-        let mut wire_sum = 0.0;
-        let mut worst = 0.0_f64;
+        let mut rtt_sum = Duration::ZERO;
+        let mut wire_sum = Duration::ZERO;
+        let mut worst = Duration::ZERO;
         for (rtt, silence, wire, _) in peers.iter() {
             rtt_sum += rtt.0;
-            wire_sum += wire.map(|w| w.0).unwrap_or(0.0);
+            wire_sum += wire.map_or(Duration::ZERO, |w| w.0);
             worst = worst.max(silence.0);
         }
-        let n = peer_count as f64;
-        (rtt_sum / n * 1000.0, wire_sum / n * 1000.0, worst)
+        let n = peer_count as u32;
+        let ms = |sum: Duration| (sum / n).as_secs_f64() * 1000.0;
+        (ms(rtt_sum), ms(wire_sum), worst.as_secs_f64())
     } else {
         (0.0, 0.0, 0.0)
     };
@@ -391,9 +394,9 @@ fn update_overlay_text(
     out.push_str(&format!("netsim: {}", sim.preset.label()));
     if sim.is_active() {
         out.push_str(&format!(
-            "  (+{:.0}ms ±{:.0}ms, loss {:.1}%, dup {:.1}%)",
-            cfg.delay_ms,
-            cfg.jitter_ms,
+            "  (+{:.0?} ±{:.0?}, loss {:.1}%, dup {:.1}%)",
+            cfg.delay,
+            cfg.jitter,
             cfg.loss * 100.0,
             cfg.duplicate * 100.0,
         ));

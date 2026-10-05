@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use bevy_ensemble::{
@@ -90,10 +92,10 @@ pub(crate) struct UntrustedPacketDrops(HashMap<u128, u32>);
 /// Well under any idle timeout a server would reasonably have, and cheap: one tiny frame over an
 /// otherwise silent WebSocket. Without it a host sitting in a lobby waiting for players is
 /// indistinguishable, to the server, from one that went away.
-const KEEP_ALIVE_INTERVAL_SECS: f64 = 20.0;
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(20);
 
-/// How long to wait between attempts to rebuild a lost signalling connection, in seconds.
-const RECONNECT_INTERVAL_SECS: f64 = 5.0;
+/// How long to wait between attempts to rebuild a lost signalling connection.
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Keep the signalling server's idea of this peer's name equal to [`SignallingDisplayName`].
 ///
@@ -395,7 +397,7 @@ pub(crate) fn apply_lobby_events(
                 };
                 let successor_within =
                     std::time::Duration::from_secs(u64::from(*idle_timeout_secs))
-                        + std::time::Duration::from_secs_f64(KEEP_ALIVE_INTERVAL_SECS)
+                        + KEEP_ALIVE_INTERVAL
                         + std::time::Duration::from_secs(10);
                 let reach_within = runtime
                     .join_timeout
@@ -1028,7 +1030,7 @@ pub(crate) fn poll_peer_routes(
 /// a client's from a join request in this crate, a host's from `bevy_ensemble` itself. Noticing
 /// them is uniform; where they came from is not.
 #[derive(Component)]
-pub(crate) struct PendingSince(f64);
+pub(crate) struct PendingSince(Duration);
 
 /// Give up on a lobby that has been about to happen for too long.
 ///
@@ -1054,13 +1056,13 @@ pub(crate) fn time_out_pending_lobbies(
     let Some(deadline) = runtime.join_timeout else {
         return;
     };
-    let now = time.elapsed_secs_f64();
+    let now = time.elapsed();
     for (entity, since, is_host) in pending.iter() {
         let Some(since) = since else {
             commands.entity(entity).try_insert(PendingSince(now));
             continue;
         };
-        if now - since.0 < deadline.as_secs_f64() {
+        if now.saturating_sub(since.0) < deadline {
             continue;
         }
         let what = if is_host {
@@ -1469,7 +1471,7 @@ pub(crate) fn read_peer_messages(world: &mut World) {
     }
 }
 
-/// Tell the signalling server this peer is still here, every [`KEEP_ALIVE_INTERVAL_SECS`].
+/// Tell the signalling server this peer is still here, every [`KEEP_ALIVE_INTERVAL`].
 ///
 /// Only once `Welcome` has arrived -- before that there is no session to keep alive -- and never
 /// on a connection already known to be gone.
@@ -1480,11 +1482,11 @@ pub(crate) fn send_keep_alives(mut lobby_conn: ResMut<LobbyConnection>, time: Re
     if lobby_conn.local_player_uuid.is_none() || lobby_conn.signalling_lost {
         return;
     }
-    let now = time.elapsed_secs_f64();
+    let now = time.elapsed();
     if now < lobby_conn.next_keep_alive_at {
         return;
     }
-    lobby_conn.next_keep_alive_at = now + KEEP_ALIVE_INTERVAL_SECS;
+    lobby_conn.next_keep_alive_at = now + KEEP_ALIVE_INTERVAL;
     let _ = lobby_conn.command_tx.send(ClientMessage::KeepAlive);
 }
 
@@ -1501,18 +1503,18 @@ pub(crate) fn reconnect_signalling(
     webrtc_runtime: Res<crate::WebrtcRuntime>,
     display_name: Res<SignallingDisplayName>,
     time: Res<Time>,
-    mut next_attempt: Local<f64>,
+    mut next_attempt: Local<Duration>,
     lobbies_with_id: Query<(), With<LobbyWebrtcId>>,
     mut per_socket: (ResMut<DeferredSignals>, ResMut<UntrustedPacketDrops>),
 ) {
     if !lobby_conn.signalling_lost || !lobbies_with_id.is_empty() {
         return;
     }
-    let now = time.elapsed_secs_f64();
+    let now = time.elapsed();
     if now < *next_attempt {
         return;
     }
-    *next_attempt = now + RECONNECT_INTERVAL_SECS;
+    *next_attempt = now + RECONNECT_INTERVAL;
 
     info!("reconnecting to the signalling server");
     let (new_socket, lobby_connection) = webrtc_runtime.build_socket(&display_name.0);

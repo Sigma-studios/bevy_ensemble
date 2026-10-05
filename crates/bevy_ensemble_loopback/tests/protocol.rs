@@ -303,5 +303,6 @@ fn both_channels_are_measured() {
         .next()
         .map(|(a, b)| (a.0, b.0))
         .expect("both estimates exist");
-    assert!(rtt.is_finite() && reliable.is_finite());
+    // A `Duration` can be neither NaN nor negative; that both arrived is what is being asked.
+    assert!(rtt > std::time::Duration::ZERO && reliable > std::time::Duration::ZERO);
 }

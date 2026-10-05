@@ -1,5 +1,7 @@
 use std::marker::PhantomData;
 
+use std::time::Duration;
+
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -86,12 +88,12 @@ pub struct SyncPlayerData<T> {
 /// On the lobby entity it is waiting in, so it goes with that lobby. As a resource it outlived
 /// every session, and an entry for a player who never appeared — one who left in the same frame
 /// they were announced — was put back every frame for as long as the process ran, and read into
-/// whichever session came next. Entries are also dropped after [`PENDING_PLAYER_DATA_SECS`]: a
+/// whichever session came next. Entries are also dropped after [`PENDING_PLAYER_DATA`]: a
 /// participant appears within a frame or two of its data, so anything older is for somebody who
 /// is not coming.
 #[derive(Component)]
 struct PendingPlayerData<T: EnsembleMessage> {
-    pending: Vec<(Option<PlayerUUID>, SyncPlayerData<T>, f64)>,
+    pending: Vec<(Option<PlayerUUID>, SyncPlayerData<T>, Duration)>,
 }
 
 impl<T: EnsembleMessage> Default for PendingPlayerData<T> {
@@ -103,7 +105,7 @@ impl<T: EnsembleMessage> Default for PendingPlayerData<T> {
 }
 
 /// How long player data waits for its participant before it is given up on.
-const PENDING_PLAYER_DATA_SECS: f64 = 10.0;
+const PENDING_PLAYER_DATA: Duration = Duration::from_secs(10);
 
 /// On a lobby entity: the last `T` this peer asked to be its own there.
 ///
@@ -120,7 +122,7 @@ fn buffer_pending<T: EnsembleMessage>(
     commands: &mut Commands,
     lobby: Entity,
     buffer: Option<Mut<PendingPlayerData<T>>>,
-    entries: Vec<(Option<PlayerUUID>, SyncPlayerData<T>, f64)>,
+    entries: Vec<(Option<PlayerUUID>, SyncPlayerData<T>, Duration)>,
 ) {
     match buffer {
         Some(mut buffer) => buffer.pending.extend(entries),
@@ -346,7 +348,7 @@ fn handle_set_player_data<T: EnsembleMessage>(
                     player_uuid: local_player.0,
                     data,
                 },
-                time.elapsed_secs_f64(),
+                time.elapsed(),
             );
             buffer_pending(
                 &mut commands,
@@ -453,7 +455,7 @@ fn apply_received_player_data<T: EnsembleMessage>(
         return;
     };
 
-    let now = time.elapsed_secs_f64();
+    let now = time.elapsed();
     let buffered = pending
         .get_mut(lobby)
         .map(|mut pending| std::mem::take(&mut pending.pending))
@@ -486,12 +488,12 @@ fn apply_received_player_data<T: EnsembleMessage>(
             commands
                 .entity(participant_entity)
                 .try_insert(PlayerData(sync_msg.data));
-        } else if now - buffered_at < PENDING_PLAYER_DATA_SECS {
+        } else if now.saturating_sub(buffered_at) < PENDING_PLAYER_DATA {
             still_waiting.push((sender, sync_msg, buffered_at));
         } else {
             debug!(
                 "dropping player data for {player_uuid:#x}: no such participant appeared in \
-                 {PENDING_PLAYER_DATA_SECS}s"
+                 {PENDING_PLAYER_DATA:?}"
             );
         }
     }
