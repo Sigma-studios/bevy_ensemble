@@ -82,14 +82,19 @@ pub(crate) fn encode_lobby_message<T: EnsembleMessage>(
 /// the observer handles notifying everyone and cleaning up the participant roster.
 pub(crate) fn on_lobby_client_removed(
     trigger: On<Remove, LobbyClient>,
-    query: Query<(&LobbyClientPlayerUuid, &LobbyParticipantOf)>,
+    query: Query<(
+        &LobbyClientPlayerUuid,
+        &LobbyParticipantOf,
+        Option<&crate::SeatRemoval>,
+    )>,
     host_lobbies: Query<(), (With<Lobby>, With<Host>)>,
     participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
     mut commands: Commands,
 ) {
-    let Ok((player_uuid, participant_of)) = query.get(trigger.event_target()) else {
+    let Ok((player_uuid, participant_of, reason)) = query.get(trigger.event_target()) else {
         return;
     };
+    let reason = reason.copied().unwrap_or(crate::SeatRemoval::Kicked);
 
     let lobby = participant_of.0;
     if host_lobbies.get(lobby).is_err() {
@@ -107,7 +112,10 @@ pub(crate) fn on_lobby_client_removed(
     commands.queue(move |world: &mut World| {
         world.trigger(LobbyClientMessage::<RemoveLobbyParticipant> {
             entity: removed,
-            message: RemoveLobbyParticipant { player_uuid },
+            message: RemoveLobbyParticipant {
+                player_uuid,
+                reason,
+            },
             send_mode: SendMode::Reliable,
         });
     });
@@ -116,7 +124,10 @@ pub(crate) fn on_lobby_client_removed(
     if let Ok(mut lobby_commands) = commands.get_entity(lobby) {
         lobby_commands.trigger(move |entity| LobbyMessage::<RemoveLobbyParticipant> {
             entity,
-            message: RemoveLobbyParticipant { player_uuid },
+            message: RemoveLobbyParticipant {
+                player_uuid,
+                reason,
+            },
             send_mode: SendMode::Reliable,
         });
     }

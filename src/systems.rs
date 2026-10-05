@@ -378,9 +378,14 @@ pub(crate) fn apply_lobby_state(
                     .as_ref()
                     .is_some_and(|local| local.0 == remove.player_uuid)
                 {
-                    info!("the host removed this peer from the lobby");
+                    let reason = match remove.reason {
+                        crate::SeatRemoval::Kicked => LobbyLeftReason::Kicked,
+                        crate::SeatRemoval::TimedOut => LobbyLeftReason::TimedOut,
+                        crate::SeatRemoval::Left => LobbyLeftReason::Left,
+                    };
+                    info!("the host removed this peer from the lobby: {reason:?}");
                     commands.queue(move |world: &mut World| {
-                        end_client_session(world, client_lobby, LobbyLeftReason::Kicked)
+                        end_client_session(world, client_lobby, reason)
                     });
                     return;
                 }

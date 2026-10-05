@@ -34,8 +34,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     HandshakeVerified, Host, HostUuid, LivenessGrace, Lobby, LobbyClient, LobbyClientPlayerUuid,
-    LobbyMessage, LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId, PeerLastPong,
-    PeerReliableRtt, PeerRoute, PeerRtt, PeerRttJitter, PeerWireRtt, PendingLobby, PlayerUUID,
+    LobbyMessage, LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId, PeerReliableRtt,
+    PeerRoute, PeerRtt, PeerRttJitter, PeerSilence, PeerWireRtt, PendingLobby, PlayerUUID,
     ReceivedEnsembleMessage, RemoveLobbyParticipant, SendMode,
     handshake::ProtocolMatched,
     ping::{EnsemblePong, PeerLastPongSeq},
@@ -204,7 +204,7 @@ pub(crate) type HostLinkState = (
     PeerWireRtt,
     PeerReliableRtt,
     PeerRttJitter,
-    PeerLastPong,
+    PeerSilence,
     PeerLastPongSeq,
     LivenessGrace,
     PeerRoute,
@@ -464,7 +464,10 @@ fn participant_departed(world: &mut World, lobby: Entity, uuid: PlayerUUID) {
     if hosting {
         world.trigger(LobbyMessage::<RemoveLobbyParticipant> {
             entity: lobby,
-            message: RemoveLobbyParticipant { player_uuid: uuid },
+            message: RemoveLobbyParticipant {
+                player_uuid: uuid,
+                reason: crate::SeatRemoval::Left,
+            },
             send_mode: SendMode::Reliable,
         });
     }
@@ -493,7 +496,7 @@ pub(crate) fn take_back_a_silent_host(
                 commands
                     .entity(lobby)
                     .try_remove::<AwaitingHost>()
-                    .try_insert(PeerLastPong(0.0));
+                    .try_insert(PeerSilence(0.0));
             }
         }
     }
@@ -548,7 +551,10 @@ pub(crate) fn run_host_migration_clocks(
         commands.entity(participant).try_despawn();
         commands.entity(lobby).trigger(move |entity| LobbyMessage {
             entity,
-            message: RemoveLobbyParticipant { player_uuid: uuid },
+            message: RemoveLobbyParticipant {
+                player_uuid: uuid,
+                reason: crate::SeatRemoval::TimedOut,
+            },
             send_mode: SendMode::Reliable,
         });
     }

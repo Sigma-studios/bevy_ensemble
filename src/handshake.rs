@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     EnsembleMessageRegistry, Host, HostUuid, Lobby, LobbyClient, LobbyClientPlayerUuid,
     LobbyJoinFailed, LobbyLeft, LobbyLeftReason, LobbyParticipantOf, LocalMultiplayerPlayerId,
-    PeerLastPong, PendingLobby, ReceivedEnsembleMessage, SendMode,
+    PeerSilence, PendingLobby, ReceivedEnsembleMessage, SendMode,
     messages::{LobbyClientMessage, LobbyMessage},
     migration::{AwaitingHost, MigratedSeat, VerifiedHost},
     registry::{HeldUntilVerified, PROTOCOL_VERSION, decode_verified_packet},
@@ -269,7 +269,7 @@ pub(crate) fn verify_protocol(
                     commands
                         .entity(lobby)
                         .try_remove::<AwaitingHost>()
-                        .try_insert(PeerLastPong(0.0))
+                        .try_insert(PeerSilence(0.0))
                         .trigger(move |entity| LobbyClientMessage {
                             entity,
                             message: answer,

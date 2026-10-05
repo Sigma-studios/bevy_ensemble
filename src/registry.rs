@@ -16,8 +16,8 @@ const MESSAGE_TYPE_INDEX_BYTES: usize = std::mem::size_of::<u16>();
 
 /// The type index that marks a packet as a frame of several messages rather than one message.
 ///
-/// Reserved, as is [`HANDSHAKE_INDEX`]: a registry can hold at most `u16::MAX - 2` sorted types,
-/// so no message ever travels under either.
+/// Reserved, as are [`HANDSHAKE_INDEX`] and [`TRANSPORT_KEEPALIVE_INDICES`]: a registry holds at
+/// most `u16::MAX - 4` sorted types, so no message ever travels under any of them.
 const FRAME_INDEX: u16 = u16::MAX;
 
 /// The type index the protocol handshake travels under, on every peer, whatever else it
@@ -29,13 +29,24 @@ const FRAME_INDEX: u16 = u16::MAX;
 /// exactly the failure it exists to report. So it is pinned outside the sorted space.
 pub const HANDSHAKE_INDEX: u16 = u16::MAX - 1;
 
+/// The type indices a backend's transport may put keepalives under: a ping, then its pong.
+///
+/// A transport that answers keepalives itself, below the app — `bevy_ensemble_sockets` does, so
+/// that a peer whose app is frozen is still heard from (see [`HeardFrom`](crate::HeardFrom)) —
+/// needs bytes it can tell from a game's without anybody adding a header to every packet. These
+/// two indices are never handed to a message, so six bytes under one of them are a keepalive and
+/// nothing else. One that reaches the decoder anyway is dropped without a word.
+pub const TRANSPORT_KEEPALIVE_INDICES: [u16; 2] = [u16::MAX - 2, u16::MAX - 3];
+
 /// The largest number of sorted types a registry holds.
-const MAX_SORTED_TYPES: usize = (u16::MAX - 2) as usize;
+const MAX_SORTED_TYPES: usize = (u16::MAX - 4) as usize;
 
 /// Bumped when the wire format of the core itself changes: the framing, the handshake, the
 /// header. Folded into [`EnsembleMessageRegistry::wire_hash`], so two builds that register the
 /// same names but frame them differently still refuse each other.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// 3: the transport keepalive indices were reserved, and a seat's removal says why.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Runtime registry that maps message types to compact indices for network serialization.
 ///
@@ -563,6 +574,10 @@ pub(crate) fn decode_ensemble_packet_now(
     let Some(sender) = sender else {
         return decode_verified_packet(world, None, packet, received_at);
     };
+    // Whatever it turns out to hold, it is proof the sender is there.
+    if let Some(mut heard) = world.get_resource_mut::<crate::HeardFrom>() {
+        heard.mark(sender);
+    }
     let verified = peer_is_verified(world, sender);
     // Where an unverified sender's packets wait: this peer's lobby, pending or promoted. With no
     // lobby there is nothing to hold for. Held packets are replayed once the sender is verified,
@@ -683,6 +698,11 @@ fn decode_one(
     if index == FRAME_INDEX {
         warn!("Received a frame inside a frame; not decoding it");
         return false;
+    }
+    if TRANSPORT_KEEPALIVE_INDICES.contains(&index) {
+        // A transport's own, which it normally answers before the app sees it. Already counted
+        // as hearing from the sender; there is nothing else in it.
+        return true;
     }
 
     #[cfg(feature = "netmetrics")]

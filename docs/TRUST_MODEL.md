@@ -55,11 +55,13 @@ answers before anyone is named. A lobby nobody names a host for ends with `Lobby
 
 ## Liveness
 
-A peer that stops answering pings for `PeerTimeout` (5 s) is gone: the host despawns its
-`LobbyClient`, which tells everyone; a client whose host is gone ends its session with
-`LobbyLeft { reason: PeerTimeout }`. The transport's own disconnect detection is not relied on
-alone, because a NAT binding that expired or a tab in the background looks connected to the
-transport for as long as it takes ICE to give up.
+A peer that is not heard from for `PeerTimeout` (10 s) is gone. The host despawns its
+`LobbyClient`, which tells everyone, and tells the client it timed out. A client whose host is
+gone ends its session with `LobbyLeft { reason: PeerTimeout }`. The transport's own disconnect
+detection is not relied on alone, because an expired NAT binding looks connected to the transport
+for as long as it takes ICE to give up. What counts as hearing from a peer is anything at all: a
+packet, or a keepalive its transport answered while its app was frozen. A tab in the background is
+therefore not a dead peer.
 
 ## Threats this closes
 

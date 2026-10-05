@@ -1384,6 +1384,14 @@ pub(crate) fn send_serialized_lobby_packet(
     );
 }
 
+// The socket answers keepalives under two type indices it must never see a game message use,
+// and the core is what promises that.
+const _: () = assert!(
+    bevy_ensemble_sockets::KEEPALIVE_PING_INDEX == bevy_ensemble::TRANSPORT_KEEPALIVE_INDICES[0]
+        && bevy_ensemble_sockets::KEEPALIVE_PONG_INDEX
+            == bevy_ensemble::TRANSPORT_KEEPALIVE_INDICES[1]
+);
+
 /// Drain the socket and decode what the trusted peers sent.
 ///
 /// The trust decision is [`accept_packet_from`]: a client reads its host, a host reads the
@@ -1391,10 +1399,21 @@ pub(crate) fn send_serialized_lobby_packet(
 /// packet from anybody else reaches a message reader at all -- the per-type `HostOnly` check in
 /// `bevy_ensemble` is the second line, not the first.
 pub(crate) fn read_peer_messages(world: &mut World) {
-    let packets = {
+    let (packets, heard) = {
         let mut socket = world.resource_mut::<crate::EnsembleSocketRes>();
-        socket.receive()
+        // The socket answers keepalives below the app, so a peer whose app is frozen is still
+        // heard from; this side only has to keep asking. See `bevy_ensemble_sockets::inbox`.
+        socket.send_keepalives();
+        (socket.receive(), socket.take_heard())
     };
+    // Everything heard counts, a keepalive answered by a peer's socket while its game sleeps
+    // included. Untrusted peers too: the liveness of a peer this side does not seat is read by
+    // nobody.
+    if let Some(mut heard_from) = world.get_resource_mut::<bevy_ensemble::HeardFrom>() {
+        for peer in heard {
+            heard_from.mark(peer);
+        }
+    }
     if packets.is_empty() {
         return;
     }
@@ -1572,12 +1591,13 @@ pub(crate) fn disconnect_removed_lobby_client(
         &LobbyClientWebrtcUuid,
         &LobbyClientPlayerUuid,
         Option<&LobbyParticipantOf>,
+        Option<&bevy_ensemble::SeatRemoval>,
     )>,
     hosted_lobbies: Query<(), (With<Lobby>, With<Host>)>,
     registry: Res<bevy_ensemble::EnsembleMessageRegistry>,
     mut socket: ResMut<crate::EnsembleSocketRes>,
 ) {
-    let Ok((webrtc_uuid, player_uuid, seat_of)) = query.get(trigger.event_target()) else {
+    let Ok((webrtc_uuid, player_uuid, seat_of, reason)) = query.get(trigger.event_target()) else {
         return;
     };
 
@@ -1592,6 +1612,9 @@ pub(crate) fn disconnect_removed_lobby_client(
             &registry,
             &RemoveLobbyParticipant {
                 player_uuid: player_uuid.0,
+                reason: reason
+                    .copied()
+                    .unwrap_or(bevy_ensemble::SeatRemoval::Kicked),
             },
         );
         socket.send(packet.into_boxed_slice(), webrtc_uuid.0);

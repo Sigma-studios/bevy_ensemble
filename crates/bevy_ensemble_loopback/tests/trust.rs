@@ -14,10 +14,10 @@ use bevy_ensemble::{
     BroadcastLobbyMessage, EnsembleAppExt, EnsembleMessageRegistry, EnsemblePlugin, EnsemblePong,
     HandshakeVerified, Host, HostUuid, Lobby, LobbyBroadcastAppExt, LobbyBroadcastEnvelope,
     LobbyBroadcastPlugin, LobbyClient, LobbyClientPlayerUuid, LobbyLeft, LobbyLeftReason,
-    LobbyParticipant, LocalMultiplayerPlayerId, MessageAuthority, PROTOCOL_VERSION, PeerLastPong,
-    PeerRtt, PeerTimeout, PlayerData, PlayerDataPlugin, ProtocolHandshake, ReceivedEnsembleMessage,
-    RefusedPackets, RemoveLobbyParticipant, SendMode, SetPlayerData, StartHosting,
-    SyncLobbyParticipant, SyncPlayerData, encode_ensemble_message,
+    LobbyParticipant, LocalMultiplayerPlayerId, MessageAuthority, PROTOCOL_VERSION, PeerRtt,
+    PeerSilence, PeerTimeout, PlayerData, PlayerDataPlugin, ProtocolHandshake,
+    ReceivedEnsembleMessage, RefusedPackets, RemoveLobbyParticipant, SeatRemoval, SendMode,
+    SetPlayerData, StartHosting, SyncLobbyParticipant, SyncPlayerData, encode_ensemble_message,
 };
 use bevy_ensemble_loopback::{Link, LoopbackNetwork, LoopbackTransportPlugin, PeerId};
 use serde::{Deserialize, Serialize};
@@ -215,7 +215,14 @@ fn a_broadcast_from_a_client_is_delivered_everywhere_as_that_client() {
 #[test]
 fn a_kick_wrapped_in_an_envelope_does_not_kick() {
     let (mut net, host, a, b) = trio();
-    let payload = encode(&net, b, &RemoveLobbyParticipant { player_uuid: 2 });
+    let payload = encode(
+        &net,
+        b,
+        &RemoveLobbyParticipant {
+            player_uuid: 2,
+            reason: SeatRemoval::Kicked,
+        },
+    );
     let envelope = LobbyBroadcastEnvelope {
         sender: 3,
         payload,
@@ -355,7 +362,14 @@ fn a_roster_sync_from_a_non_host_is_ignored() {
 #[test]
 fn a_removal_from_a_non_host_does_not_remove_anyone() {
     let (mut net, _host, a, b) = trio();
-    let bytes = encode(&net, b, &RemoveLobbyParticipant { player_uuid: 2 });
+    let bytes = encode(
+        &net,
+        b,
+        &RemoveLobbyParticipant {
+            player_uuid: 2,
+            reason: SeatRemoval::Kicked,
+        },
+    );
     net.deliver_raw(a, 3, bytes);
     net.run(4);
     assert!(
@@ -445,6 +459,8 @@ fn an_unsolicited_pong_is_ignored_and_an_absurd_one_cannot_poison_the_estimate()
     assert!(after.is_finite() && after >= 0.0);
 }
 
+/// A client that still hears the host but is no longer heard by it: the host gives the seat up
+/// after the timeout, and tells the client so, which still hears it.
 #[test]
 fn a_peer_that_stops_answering_pings_is_removed_after_the_timeout() {
     let (mut net, host, a, _b) = trio();
@@ -464,19 +480,77 @@ fn a_peer_that_stops_answering_pings_is_removed_after_the_timeout() {
         1,
         "the host dropped the silent client"
     );
-    assert!(
-        !has_lobby(&mut net, a),
-        "and the client, hearing no pong, left"
-    );
+    assert!(!has_lobby(&mut net, a), "and the client, told so, left");
     assert_eq!(
         net.app(a).world().resource::<Departures>().0,
-        vec![LobbyLeftReason::PeerTimeout]
+        vec![LobbyLeftReason::TimedOut],
+        "the host is still talking to it, so it is not the host that went quiet"
     );
     assert!(
         net.app(a)
             .world()
             .get_resource::<LocalMultiplayerPlayerId>()
             .is_none()
+    );
+}
+
+/// A client whose app stops — a browser tab in the background — while its transport keeps
+/// answering keepalives is still there, for as long as it sleeps, and carries on when it wakes.
+#[test]
+fn a_frozen_client_whose_transport_still_answers_keeps_its_seat() {
+    let (mut net, host, a, b) = trio();
+    for peer in [host, a, b] {
+        net.app_mut(peer)
+            .world_mut()
+            .insert_resource(PeerTimeout(Some(Duration::from_secs(1))));
+    }
+    net.set_transport_keepalive(true);
+    net.run(64);
+    assert_eq!(lobby_clients(&mut net, host), 2);
+
+    // Five seconds, five times the timeout, with A's app not running at all.
+    for _ in 0..64 * 5 {
+        net.step_only(&[host, b]);
+    }
+    assert_eq!(
+        lobby_clients(&mut net, host),
+        2,
+        "A's game was asleep, but its connection answered the whole time"
+    );
+
+    // A wakes. It must not decide that the host, which it did not hear from while it was not
+    // listening, has gone.
+    net.run(64);
+    assert!(
+        has_lobby(&mut net, a),
+        "A is still in the lobby after waking"
+    );
+    assert_eq!(net.app(a).world().resource::<Departures>().0, vec![]);
+    assert_eq!(lobby_clients(&mut net, host), 2);
+}
+
+/// The same freeze over a transport that does not answer for the app: the host gives the seat up,
+/// and the client, waking, is told it timed out — not that it was kicked.
+#[test]
+fn a_frozen_client_over_a_silent_transport_is_told_it_timed_out() {
+    let (mut net, host, a, b) = trio();
+    for peer in [host, a, b] {
+        net.app_mut(peer)
+            .world_mut()
+            .insert_resource(PeerTimeout(Some(Duration::from_secs(1))));
+    }
+    net.run(64);
+
+    for _ in 0..90 {
+        net.step_only(&[host, b]);
+    }
+    assert_eq!(lobby_clients(&mut net, host), 1, "the host dropped A");
+
+    net.run(8);
+    assert!(!has_lobby(&mut net, a));
+    assert_eq!(
+        net.app(a).world().resource::<Departures>().0,
+        vec![LobbyLeftReason::TimedOut]
     );
 }
 
@@ -488,7 +562,7 @@ fn a_live_peer_is_never_dropped_under_satellite_jitter() {
     assert_eq!(lobby_clients(&mut net, host), 2);
     let world = net.app_mut(host).world_mut();
     let worst = world
-        .query_filtered::<&PeerLastPong, With<LobbyClient>>()
+        .query_filtered::<&PeerSilence, With<LobbyClient>>()
         .iter(world)
         .map(|p| p.0)
         .fold(0.0, f64::max);
@@ -630,7 +704,7 @@ fn a_peer_under_liveness_grace_outlives_the_timeout_but_not_the_grace() {
             extra: Duration::from_millis(300),
         },
         // Silence: as if the client's pongs stopped a quarter second ago.
-        PeerLastPong(0.25),
+        PeerSilence(0.25),
     ));
     net.step_only(&[host]);
     assert!(
@@ -641,7 +715,7 @@ fn a_peer_under_liveness_grace_outlives_the_timeout_but_not_the_grace() {
     net.app_mut(host)
         .world_mut()
         .entity_mut(seat)
-        .insert(PeerLastPong(0.45));
+        .insert(PeerSilence(0.45));
     net.step_only(&[host]);
     assert!(
         net.app(host).world().get_entity(seat).is_err(),

@@ -28,7 +28,7 @@
 use bevy::prelude::*;
 
 use crate::{
-    PeerLastPong, PeerRoute, PeerRtt, PeerWireRtt,
+    PeerRoute, PeerRtt, PeerSilence, PeerWireRtt,
     netmetrics::NetMetrics,
     netsim::{NetPreset, NetSim},
 };
@@ -330,7 +330,7 @@ fn update_overlay_text(
     time: Res<Time>,
     peers: Query<(
         &PeerRtt,
-        &PeerLastPong,
+        &PeerSilence,
         Option<&PeerWireRtt>,
         Option<&PeerRoute>,
     )>,
@@ -356,10 +356,10 @@ fn update_overlay_text(
         let mut rtt_sum = 0.0;
         let mut wire_sum = 0.0;
         let mut worst = 0.0_f64;
-        for (rtt, last_pong, wire, _) in peers.iter() {
+        for (rtt, silence, wire, _) in peers.iter() {
             rtt_sum += rtt.0;
             wire_sum += wire.map(|w| w.0).unwrap_or(0.0);
-            worst = worst.max(last_pong.0);
+            worst = worst.max(silence.0);
         }
         let n = peer_count as f64;
         (rtt_sum / n * 1000.0, wire_sum / n * 1000.0, worst)

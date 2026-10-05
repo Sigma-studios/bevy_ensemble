@@ -129,7 +129,7 @@ When a remote player disconnects from a hosted lobby:
    ```rust,ignore
    commands.entity(lobby_entity).trigger(move |entity| LobbyMessage::<RemoveLobbyParticipant> {
        entity,
-       message: RemoveLobbyParticipant { player_uuid },
+       message: RemoveLobbyParticipant { player_uuid, reason: SeatRemoval::Left },
    });
    ```
 3. Despawn the participant entity on the host.
@@ -205,6 +205,31 @@ flowing through the window that decides whether the session survives.
 A backend built on another transport has no obligation to restart anything, but should report
 the same states with the same meanings, and in particular should not report `Disconnected` for a
 loss it is about to recover from.
+
+## Liveness
+
+The core times a peer out after `PeerTimeout` (10 s by default) of hearing **nothing** from it.
+`PeerSilence` on the peer's entity is how long that has been. Every packet passed to
+`decode_ensemble_packet` counts, so a backend that does nothing more gets liveness from whatever
+its peers' apps send, the core's own pings included. That transport drops a peer whose app has
+stopped running frames, however healthy its connection.
+
+A transport that can hear a peer below its app should say so. Mark each peer it heard from in the
+`HeardFrom` resource, once per frame, before `Update`. A keepalive answered without the app, or bytes
+received but not yet read, both count. The WebRTC backend does this from `read_peer_messages`. Its
+socket pings every peer four times a second (`EnsembleSocket::send_keepalives`), answers pings in
+the data channel's message handler, and reports everything it heard through `take_heard`. A browser
+still delivers network events to a tab in the background, so a player whose tab is hidden keeps
+their seat.
+
+A transport that puts keepalives on the same channel as game packets can use the two type indices in
+`TRANSPORT_KEEPALIVE_INDICES`. The registry never gives them to a message. A keepalive that reaches
+the decoder anyway is dropped silently.
+
+When a host removes a seat for a reason, insert `SeatRemoval` on the `LobbyClient` before
+despawning it. The removal message carries the reason, and the removed client leaves with the
+matching `LobbyLeftReason`. A backend that sends its own removal notice should read the reason the
+same way.
 
 ## Message Registration
 
