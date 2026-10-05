@@ -12,7 +12,7 @@ use crate::{
 /// How often a peer restates its readiness handshake, in seconds.
 ///
 /// Only the *repeat* rate. The first one goes out on the frame a lobby appears.
-const HANDSHAKE_INTERVAL: f32 = 0.5;
+const HANDSHAKE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Internal handshake message exchanged over data channels to confirm readiness.
 #[derive(Message, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -32,7 +32,7 @@ pub(crate) fn send_client_handshakes(
     socket: ResMut<EnsembleSocketRes>,
     client_lobbies: Query<&LobbyWebrtcId, (Without<Host>, Or<(With<PendingLobby>, With<Lobby>)>)>,
     time: Res<Time>,
-    mut cooldown: Local<f32>,
+    mut cadence: Local<bevy_ensemble::Cadence>,
 ) {
     // Emptiness first, cooldown second. The other way round spends the timer while
     // there is nothing to send, so on the frame a lobby finally appears the timer is
@@ -44,14 +44,12 @@ pub(crate) fn send_client_handshakes(
     // And reset while there is none, for the same reason one session later: a cooldown left
     // mid-cycle by the last session would hold back the next one's first handshake.
     if client_lobbies.is_empty() {
-        *cooldown = 0.0;
+        cadence.reset();
         return;
     }
-    *cooldown -= time.delta_secs();
-    if *cooldown > 0.0 {
+    if !cadence.tick(time.delta(), HANDSHAKE_INTERVAL) {
         return;
     }
-    *cooldown = HANDSHAKE_INTERVAL;
 
     let packet = encode_ensemble_message(&registry, &WebrtcReadyHandshake { from_host: false });
     let data: Box<[u8]> = packet.into_boxed_slice();
@@ -67,7 +65,7 @@ pub(crate) fn send_host_handshakes(
     socket: ResMut<EnsembleSocketRes>,
     host_lobbies: Query<&LobbyWebrtcId, (With<Lobby>, With<Host>)>,
     time: Res<Time>,
-    mut cooldown: Local<f32>,
+    mut cadence: Local<bevy_ensemble::Cadence>,
 ) {
     // Emptiness first, cooldown second. The other way round spends the timer while
     // there is nothing to send, so on the frame a lobby finally appears the timer is
@@ -79,14 +77,12 @@ pub(crate) fn send_host_handshakes(
     // And reset while there is none, for the same reason one session later: a cooldown left
     // mid-cycle by the last session would hold back the next one's first handshake.
     if host_lobbies.is_empty() {
-        *cooldown = 0.0;
+        cadence.reset();
         return;
     }
-    *cooldown -= time.delta_secs();
-    if *cooldown > 0.0 {
+    if !cadence.tick(time.delta(), HANDSHAKE_INTERVAL) {
         return;
     }
-    *cooldown = HANDSHAKE_INTERVAL;
 
     let packet = encode_ensemble_message(&registry, &WebrtcReadyHandshake { from_host: true });
     let data: Box<[u8]> = packet.into_boxed_slice();

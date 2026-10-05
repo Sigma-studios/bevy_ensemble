@@ -598,7 +598,7 @@ impl WebrtcRuntime {
             announced_name: display_name.to_owned(),
             server_outdated: false,
             unanswered: Default::default(),
-            next_keep_alive_at: 0.0,
+            next_keep_alive_at: std::time::Duration::ZERO,
         };
 
         (EnsembleSocketRes(socket), lobby_connection)

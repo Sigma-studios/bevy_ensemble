@@ -496,7 +496,7 @@ pub(crate) fn take_back_a_silent_host(
                 commands
                     .entity(lobby)
                     .try_remove::<AwaitingHost>()
-                    .try_insert(PeerSilence(0.0));
+                    .try_insert(PeerSilence::default());
             }
         }
     }

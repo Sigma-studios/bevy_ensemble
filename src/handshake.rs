@@ -17,6 +17,8 @@
 //! harness included — gets exactly the same check, and so that it can be tested without a
 //! socket.
 
+use std::time::Duration;
+
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -99,7 +101,7 @@ pub struct HandshakeVerified;
 pub(crate) struct ProtocolMatched(pub(crate) std::collections::HashSet<u128>);
 
 /// How often a new host states its protocol again to a member it inherited that has not answered.
-const MIGRATED_SEAT_REANNOUNCE_SECS: f32 = 1.0;
+const MIGRATED_SEAT_REANNOUNCE: Duration = Duration::from_secs(1);
 
 /// State our protocol to each new peer, once — and, on a host that inherited its members, again
 /// every second to each one that has not answered.
@@ -121,15 +123,16 @@ pub(crate) fn announce_protocol(
         ),
     >,
     time: Res<Time>,
-    mut since_reannounce: Local<f32>,
+    mut since_reannounce: Local<Duration>,
 ) {
     let mut reannounce: Vec<Entity> = Vec::new();
     if unverified_migrated_seats.is_empty() {
-        *since_reannounce = 0.0;
+        *since_reannounce = Duration::ZERO;
     } else {
-        *since_reannounce += time.delta_secs();
-        if *since_reannounce >= MIGRATED_SEAT_REANNOUNCE_SECS {
-            *since_reannounce = 0.0;
+        *since_reannounce += time.delta();
+        if *since_reannounce >= MIGRATED_SEAT_REANNOUNCE {
+            // Less the interval rather than back to zero, so a frame's overshoot is not lost.
+            *since_reannounce = since_reannounce.saturating_sub(MIGRATED_SEAT_REANNOUNCE);
             reannounce.extend(unverified_migrated_seats.iter());
         }
     }
@@ -269,7 +272,7 @@ pub(crate) fn verify_protocol(
                     commands
                         .entity(lobby)
                         .try_remove::<AwaitingHost>()
-                        .try_insert(PeerSilence(0.0))
+                        .try_insert(PeerSilence::default())
                         .trigger(move |entity| LobbyClientMessage {
                             entity,
                             message: answer,

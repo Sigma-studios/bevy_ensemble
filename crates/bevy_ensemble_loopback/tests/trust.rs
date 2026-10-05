@@ -426,7 +426,7 @@ fn player_data_on_a_client_is_taken_only_from_the_host() {
 #[test]
 fn an_unsolicited_pong_is_ignored_and_an_absurd_one_cannot_poison_the_estimate() {
     let (mut net, host, a, _b) = trio();
-    let rtt = |net: &mut LoopbackNetwork| -> Option<f64> {
+    let rtt = |net: &mut LoopbackNetwork| -> Option<Duration> {
         let world = net.app_mut(host).world_mut();
         world
             .query_filtered::<&PeerRtt, With<LobbyClient>>()
@@ -434,10 +434,10 @@ fn an_unsolicited_pong_is_ignored_and_an_absurd_one_cannot_poison_the_estimate()
             .next()
             .map(|r| r.0)
     };
-    // Real pings have been flowing since the join: the estimate exists and is finite.
+    // Real pings have been flowing since the join: the estimate exists. (A `Duration` cannot be
+    // NaN or negative, which is what this used to have to check.)
     net.run(64);
     let measured = rtt(&mut net).expect("pongs arrived");
-    assert!(measured.is_finite() && measured >= 0.0);
 
     // A flood of garbage: unknown sequence numbers, absurd dwell. (The unit tests in
     // `ping.rs` pin that an unsolicited pong is not a sample at all; this pins that a flood
@@ -456,7 +456,10 @@ fn an_unsolicited_pong_is_ignored_and_an_absurd_one_cannot_poison_the_estimate()
     }
     net.run(2);
     let after = rtt(&mut net).expect("still there");
-    assert!(after.is_finite() && after >= 0.0);
+    assert!(
+        after < measured + Duration::from_millis(100),
+        "a flood of unsolicited pongs moved the estimate from {measured:?} to {after:?}"
+    );
 }
 
 /// A client that still hears the host but is no longer heard by it: the host gives the seat up
@@ -565,8 +568,12 @@ fn a_live_peer_is_never_dropped_under_satellite_jitter() {
         .query_filtered::<&PeerSilence, With<LobbyClient>>()
         .iter(world)
         .map(|p| p.0)
-        .fold(0.0, f64::max);
-    assert!(worst < 2.0, "the longest silence was {worst}s");
+        .max()
+        .unwrap_or_default();
+    assert!(
+        worst < Duration::from_secs(2),
+        "the longest silence was {worst:?}"
+    );
 }
 
 #[test]
@@ -704,7 +711,7 @@ fn a_peer_under_liveness_grace_outlives_the_timeout_but_not_the_grace() {
             extra: Duration::from_millis(300),
         },
         // Silence: as if the client's pongs stopped a quarter second ago.
-        PeerSilence(0.25),
+        PeerSilence(Duration::from_millis(250)),
     ));
     net.step_only(&[host]);
     assert!(
@@ -715,7 +722,7 @@ fn a_peer_under_liveness_grace_outlives_the_timeout_but_not_the_grace() {
     net.app_mut(host)
         .world_mut()
         .entity_mut(seat)
-        .insert(PeerSilence(0.45));
+        .insert(PeerSilence(Duration::from_millis(450)));
     net.step_only(&[host]);
     assert!(
         net.app(host).world().get_entity(seat).is_err(),

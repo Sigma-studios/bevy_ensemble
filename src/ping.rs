@@ -38,7 +38,7 @@ use crate::{
 ///
 /// Ten a second, and it costs nothing worth counting: the payload is a few bytes and it goes
 /// unreliably, against a lockstep stream already sending 64 messages a second in each direction.
-const PING_INTERVAL_SECS: f32 = 0.1;
+const PING_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How many of this peer's own pings are remembered. A pong for anything older is not matched
 /// and not measured. At ten a second this is three seconds, ten times any round trip worth
@@ -47,7 +47,7 @@ const OUTSTANDING_PINGS: usize = 32;
 
 /// A round trip longer than this is not a measurement of anything a game can use, and a peer
 /// that reports one is either broken or lying.
-const MAX_ROUND_TRIP_SECS: f64 = 30.0;
+const MAX_ROUND_TRIP: Duration = Duration::from_secs(30);
 
 /// Internal ping message sent over data channels to measure RTT.
 ///
@@ -110,15 +110,15 @@ impl OutstandingPings {
     }
 }
 
-/// Round-trip time to a connected peer, in seconds.
+/// Round-trip time to a connected peer, smoothed.
 ///
 /// Added to `LobbyClient` entities on the host (one per peer) and to the
 /// lobby entity on clients (single connection to the host).
-#[derive(Component, Debug, Clone, Copy)]
-pub struct PeerRtt(pub f64);
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerRtt(pub Duration);
 
-/// Estimated round-trip **wire time** to a peer, in seconds: the full RTT minus the time
-/// the peer spent holding the ping (its [`EnsemblePong::dwell_micros`]).
+/// Estimated round-trip **wire time** to a peer: the full RTT minus the time the peer spent
+/// holding the ping (its [`EnsemblePong::dwell_micros`]).
 ///
 /// This isolates and removes the remote's in-app processing. What remains is the network
 /// transit plus each side's socket-poll latency and local send/receive pipeline — the app
@@ -126,19 +126,19 @@ pub struct PeerRtt(pub f64);
 /// this is dominated by frame/poll alignment rather than literal cable time, and shrinks
 /// toward ~0 with an uncapped frame loop. On a real remote peer it converges to the
 /// genuine network RTT. Added alongside [`PeerRtt`].
-#[derive(Component, Debug, Clone, Copy)]
-pub struct PeerWireRtt(pub f64);
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerWireRtt(pub Duration);
 
-/// Round trip measured on the reliable, ordered channel, in seconds.
+/// Round trip measured on the reliable, ordered channel.
 ///
 /// Includes whatever retransmission and head-of-line delay that channel is carrying, which
 /// [`PeerRtt`] — measured on the unreliable channel — cannot see. A buffer that has to cover a
 /// reliable stream, as a lockstep action stream is, sizes itself from this one.
-#[derive(Component, Debug, Clone, Copy)]
-pub struct PeerReliableRtt(pub f64);
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerReliableRtt(pub Duration);
 
-/// How much a peer's round trip varies, in seconds: an EMA of each raw sample's absolute
-/// deviation from the smoothed mean.
+/// How much a peer's round trip varies: an EMA of each raw sample's absolute deviation from the
+/// smoothed mean.
 ///
 /// # Why this has to be measured here
 ///
@@ -155,14 +155,14 @@ pub struct PeerReliableRtt(pub f64);
 /// spread, so a buffer that was meant to carry jitter headroom carried none.
 ///
 /// Added alongside [`PeerRtt`], on the same entities.
-#[derive(Component, Debug, Clone, Copy)]
-pub struct PeerRttJitter(pub f64);
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerRttJitter(pub Duration);
 
-/// Seconds since anything was heard from a peer.
+/// How long since anything was heard from a peer.
 ///
 /// Present from the moment a peer is known — on the host's `LobbyClient` entity, on a client's
 /// lobby entity — not from the first thing it says, so a peer that never says anything is timed
-/// from the start. Ticked up every frame and reset to `0.0` whenever the peer is heard from: any
+/// from the start. Ticked up every frame and reset to zero whenever the peer is heard from: any
 /// packet decoded from it, or anything its backend reports through [`HeardFrom`]. [`PeerTimeout`]
 /// is what acts on it.
 ///
@@ -171,8 +171,8 @@ pub struct PeerRttJitter(pub f64);
 /// never finds a peer silent for the whole time it was away itself; and a peer whose app stalled
 /// is still heard from by a backend that answers keepalives below the app, so it is never silent
 /// for that time either.
-#[derive(Component, Debug, Clone, Copy, Default)]
-pub struct PeerSilence(pub f64);
+#[derive(Component, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerSilence(pub Duration);
 
 /// The old name of [`PeerSilence`], from when only a pong reset it.
 #[deprecated(note = "renamed `PeerSilence`: anything heard from the peer resets it now")]
@@ -262,18 +262,16 @@ pub(crate) fn send_pings(
     lobbies: Query<(Entity, Option<&AwaitingHost>), With<Lobby>>,
     time: Res<Time>,
     mut outstanding: ResMut<OutstandingPings>,
-    mut cooldown: Local<f32>,
+    mut cadence: Local<crate::Cadence>,
 ) {
     if lobbies.is_empty() {
         // The next session starts its own clock rather than inheriting what was left of this one.
-        *cooldown = 0.0;
+        cadence.reset();
         return;
     }
-    *cooldown -= time.delta_secs();
-    if *cooldown > 0.0 {
+    if !cadence.tick(time.delta(), PING_INTERVAL) {
         return;
     }
-    *cooldown = PING_INTERVAL_SECS;
 
     let seq = outstanding.issue(Instant::now());
     for (lobby, awaiting) in lobbies.iter() {
@@ -374,6 +372,29 @@ fn smooth(previous: Option<f64>, sample: f64) -> f64 {
     }
 }
 
+/// [`smooth`], on durations. The blend is done in `f64` seconds: a weighted mean of two
+/// durations, ten times a second per peer, where the rounding back to nanoseconds is far below
+/// anything measured.
+fn smooth_duration(previous: Option<Duration>, sample: Duration) -> Duration {
+    Duration::from_secs_f64(smooth(
+        previous.map(|previous| previous.as_secs_f64()),
+        sample.as_secs_f64(),
+    ))
+}
+
+/// [`smooth_jitter`], on durations.
+fn smooth_jitter_duration(
+    previous_jitter: Option<Duration>,
+    previous_mean: Option<Duration>,
+    sample: Duration,
+) -> Duration {
+    Duration::from_secs_f64(smooth_jitter(
+        previous_jitter.map(|jitter| jitter.as_secs_f64()),
+        previous_mean.map(|mean| mean.as_secs_f64()),
+        sample.as_secs_f64(),
+    ))
+}
+
 /// Fold one raw sample into the jitter estimate.
 ///
 /// The deviation is taken against the *previous* mean rather than the updated one, so the sample
@@ -395,8 +416,8 @@ fn smooth_jitter(previous_jitter: Option<f64>, previous_mean: Option<f64>, sampl
 
 /// One accepted pong, reduced to the two numbers the estimators fold.
 struct Sample {
-    e2e: f64,
-    wire: f64,
+    e2e: Duration,
+    wire: Duration,
 }
 
 /// Turn a pong into a sample, or say why it is not one.
@@ -410,11 +431,12 @@ fn sample_from(
     received_at: Instant,
 ) -> Option<Sample> {
     let sent_at = outstanding.sent_at(pong.seq)?;
-    let e2e = received_at.checked_duration_since(sent_at)?.as_secs_f64();
-    if !e2e.is_finite() || e2e > MAX_ROUND_TRIP_SECS {
+    let e2e = received_at.checked_duration_since(sent_at)?;
+    if e2e > MAX_ROUND_TRIP {
         return None;
     }
-    let dwell = (f64::from(pong.dwell_micros) / 1_000_000.0).clamp(0.0, e2e);
+    // In integer time, so a dwell can neither be negative nor take the wire estimate below zero.
+    let dwell = Duration::from_micros(u64::from(pong.dwell_micros)).min(e2e);
     Some(Sample {
         e2e,
         wire: e2e - dwell,
@@ -514,19 +536,21 @@ pub(crate) fn receive_pongs(
         // `try_`: a seat can be despawned in the same frame its pong is read — a liveness
         // timeout, a disconnect — and an insert on an entity that is gone is an error.
         if pong.reliable {
-            commands.entity(entity).try_insert(PeerReliableRtt(smooth(
-                prev_reliable.map(|p| p.0),
-                sample.e2e,
-            )));
+            commands
+                .entity(entity)
+                .try_insert(PeerReliableRtt(smooth_duration(
+                    prev_reliable.map(|p| p.0),
+                    sample.e2e,
+                )));
             continue;
         }
 
         let previous_mean = prev_rtt.map(|p| p.0);
         commands.entity(entity).try_insert((
-            PeerRtt(smooth(previous_mean, sample.e2e)),
-            PeerWireRtt(smooth(prev_wire.map(|p| p.0), sample.wire)),
+            PeerRtt(smooth_duration(previous_mean, sample.e2e)),
+            PeerWireRtt(smooth_duration(prev_wire.map(|p| p.0), sample.wire)),
             // Folded from the raw `e2e` against the mean as it stood *before* this sample.
-            PeerRttJitter(smooth_jitter(
+            PeerRttJitter(smooth_jitter_duration(
                 prev_jitter.map(|p| p.0),
                 previous_mean,
                 sample.e2e,
@@ -546,15 +570,15 @@ pub(crate) fn arm_peer_liveness(
     new_client_lobbies: Query<Entity, (Added<Lobby>, Without<Host>, Without<PeerSilence>)>,
 ) {
     for entity in new_clients.iter().chain(new_client_lobbies.iter()) {
-        commands.entity(entity).try_insert(PeerSilence(0.0));
+        commands.entity(entity).try_insert(PeerSilence::default());
     }
 }
 
 /// Add this frame to every peer's [`PeerSilence`].
 pub(crate) fn tick_silence(time: Res<Time>, mut peers: Query<&mut PeerSilence>) {
-    let dt = time.delta_secs_f64();
+    let delta = time.delta();
     for mut silence in peers.iter_mut() {
-        silence.0 += dt;
+        silence.0 += delta;
     }
 }
 
@@ -583,7 +607,7 @@ pub(crate) fn hear_peers(
     if host_lobby.is_some() {
         for (uuid, mut silence) in clients.iter_mut() {
             if heard.0.contains(&uuid.0) {
-                silence.0 = 0.0;
+                silence.0 = Duration::ZERO;
             }
         }
     } else {
@@ -592,7 +616,7 @@ pub(crate) fn hear_peers(
             .is_none_or(|host| heard.0.contains(&host.0));
         if from_host {
             for mut silence in client_lobbies.iter_mut() {
-                silence.0 = 0.0;
+                silence.0 = Duration::ZERO;
             }
         }
     }
@@ -631,16 +655,15 @@ pub(crate) fn detect_dead_peers(
     let Some(base) = timeout.0 else {
         return;
     };
-    let limit_for = |grace: Option<&LivenessGrace>| {
-        (base + grace.map_or(Duration::ZERO, |grace| grace.extra)).as_secs_f64()
-    };
+    let limit_for =
+        |grace: Option<&LivenessGrace>| base + grace.map_or(Duration::ZERO, |grace| grace.extra);
 
     if host_lobby.is_some() {
         for (entity, uuid, silence, grace) in clients.iter() {
             let limit = limit_for(grace);
             if silence.0 > limit {
                 info!(
-                    "dropping client {:#x}: nothing heard from it for {:.1}s (limit {limit:.1}s)",
+                    "dropping client {:#x}: nothing heard from it for {:.1?} (limit {limit:.1?})",
                     uuid.0, silence.0
                 );
                 // Inserted before the despawn, in one command, so the removal observers find it.
@@ -658,7 +681,7 @@ pub(crate) fn detect_dead_peers(
         let limit = limit_for(grace);
         if silence.0 > limit {
             warn!(
-                "nothing heard from the host for {:.1}s (limit {limit:.1}s)",
+                "nothing heard from the host for {:.1?} (limit {limit:.1?})",
                 silence.0
             );
             // Waits for a successor if the lobby can have one, and ends the session as a
@@ -782,8 +805,8 @@ mod tests {
         let outstanding = outstanding_at(base, &[1.0]);
         let sample =
             sample_from(&outstanding, &pong(1, 10_000), after(base, 1.05)).expect("a real ping");
-        assert!((sample.e2e - 0.05).abs() < 1e-6);
-        assert!((sample.wire - 0.04).abs() < 1e-6);
+        assert!((sample.e2e.as_secs_f64() - 0.05).abs() < 1e-6);
+        assert!((sample.wire.as_secs_f64() - 0.04).abs() < 1e-6);
     }
 
     #[test]
@@ -794,8 +817,8 @@ mod tests {
         let outstanding = outstanding_at(base, &[1.0]);
         let sample = sample_from(&outstanding, &pong(1, u32::MAX), after(base, 1.05))
             .expect("still a real ping");
-        assert_eq!(sample.wire, 0.0);
-        assert!((sample.e2e - 0.05).abs() < 1e-6);
+        assert_eq!(sample.wire, Duration::ZERO);
+        assert!((sample.e2e.as_secs_f64() - 0.05).abs() < 1e-6);
     }
 
     #[test]
@@ -806,7 +829,7 @@ mod tests {
             sample_from(
                 &outstanding,
                 &pong(1, 0),
-                after(base, 1.0 + MAX_ROUND_TRIP_SECS + 1.0)
+                after(base, 1.0 + MAX_ROUND_TRIP.as_secs_f64() + 1.0)
             )
             .is_none()
         );

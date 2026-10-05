@@ -4,6 +4,30 @@ One section per phase of the netcode overhaul, in the order they landed. Each na
 what to change in a consumer, and why. Both peers of a session must be built from the same
 commit; the join handshake enforces it from phase E2 onward.
 
+## Durations, not seconds
+
+Times were bare `f64`/`f32` seconds or milliseconds, with the unit only in a name or a doc comment.
+Every consumer converted by hand: one cast to `f32`, one went straight back to a `Duration`, and a
+scoreboard wrote `* 1000.0`. They are `std::time::Duration` now. The wire format is unchanged
+(integer microseconds), so this is not a protocol change.
+
+- `PeerRtt`, `PeerWireRtt`, `PeerReliableRtt`, `PeerRttJitter` and `PeerSilence` hold a
+  `Duration`. The smoothing is still done in `f64` internally and converted when published, ten
+  times a second per peer.
+- `ParticipantLink { rtt, wire_rtt }` are `Duration`s.
+- `NetSimConfig { delay, jitter }` replaces `delay_ms` / `jitter_ms`. `NetSimClock::Manual`,
+  `advance` and `set` take a `Duration`.
+- The new `Cadence` is a countdown that keeps its phase. The backends' repeating timers used to
+  restart from zero each time they fired, losing a frame's overshoot every period: ten pings a
+  second came out as seven and a half at 30 fps. Pings, link reports and the WebRTC and Steam
+  handshakes now run on it.
+- The signalling server rounds the idle timeout it announces up rather than down.
+
+**What to change**
+- Read `.0.as_millis()` or `.0.as_secs_f64()` where you read the `f64`.
+- Construct `PeerSilence(Duration::ZERO)` (or `default()`).
+- Rename `delay_ms` / `jitter_ms` to `delay` / `jitter` and give them `Duration`s.
+
 ## Protocol v3 — liveness is the connection's, not the app's
 
 A peer was alive while its app answered pings, and an app answers from its frame loop. A browser

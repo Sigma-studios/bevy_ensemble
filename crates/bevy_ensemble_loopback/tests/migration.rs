@@ -633,13 +633,16 @@ fn liveness_resumes_against_the_new_host() {
     assert!(has_lobby(&mut net, b));
     assert!(departures(&net, b).is_empty());
     let world = net.app_mut(b).world_mut();
-    let last_pong = world
+    let silence = world
         .query_filtered::<&PeerSilence, With<Lobby>>()
         .iter(world)
         .next()
         .expect("the liveness clock runs again")
         .0;
-    assert!(last_pong < 1.0, "no pong from the new host in {last_pong}s");
+    assert!(
+        silence < Duration::from_secs(1),
+        "nothing heard from the new host in {silence:?}"
+    );
     assert_eq!(verified_seats(&mut net, a), [B]);
 }
 

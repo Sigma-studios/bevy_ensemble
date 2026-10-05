@@ -52,12 +52,14 @@ fn generate_lobby_code(state: &ServerState) -> String {
 fn migratable(state: &ServerState, lobby_id: u64) -> ServerMessage {
     ServerMessage::LobbyMigratable {
         lobby_id,
+        // Rounded up, not down: a client waits this long for the server to notice a host has
+        // gone, and telling it 1 s for a 1.5 s timeout would have it give up first.
         idle_timeout_secs: state
             .limits
             .idle_timeout
-            .as_secs()
-            .try_into()
-            .unwrap_or(u32::MAX),
+            .as_secs_f64()
+            .ceil()
+            .min(f64::from(u32::MAX)) as u32,
     }
 }
 
