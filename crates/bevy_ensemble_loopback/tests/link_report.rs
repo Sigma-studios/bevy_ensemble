@@ -99,4 +99,10 @@ fn every_peer_sees_every_players_ping_and_route() {
             .filter_map(|(_, link)| *link)
             .all(|link| link.rtt.is_finite() && link.rtt >= 0.0)
     );
+    assert!(
+        seen.iter().filter_map(|(_, link)| *link).all(|link| {
+            link.wire_rtt.is_finite() && link.wire_rtt >= 0.0 && link.wire_rtt <= link.rtt
+        }),
+        "the network's part of a round trip is never more than the round trip"
+    );
 }

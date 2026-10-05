@@ -1,10 +1,29 @@
-use std::collections::VecDeque;
+//! Round trips and liveness.
+//!
+//! Two different questions, answered in two different places.
+//!
+//! **How long a message takes** is measured here, with [`EnsemblePing`]s that go through the
+//! frame loop like any game message: through the outbound batching, through the network
+//! simulator when it is on, and answered by the other side's app. That is the path a game's own
+//! messages take, and what an input lead or a playout buffer has to be sized for — so it is what
+//! [`PeerRtt`] and its relatives measure, and the responder's time holding the ping is reported
+//! so [`PeerWireRtt`] can take it out.
+//!
+//! **Whether a peer is still there** is not a question for its app. A frozen app — a browser tab
+//! in the background, a long load — stops answering pings while its connection is perfectly
+//! healthy, and timing peers out on pongs dropped every player who looked away for a few seconds.
+//! A peer is alive while *anything* is heard from it: every packet decoded from it counts, and a
+//! backend whose transport answers keepalives by itself — the WebRTC socket does, from its data
+//! channel handlers — reports what it heard through [`HeardFrom`] whether or not the app has read
+//! it. [`PeerSilence`] is how long it has been since anything was, and [`PeerTimeout`] acts on it.
+
+use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 
 use bevy::prelude::*;
 
 use crate::{
-    Host, Instant, Lobby, LobbyClient, LobbyClientPlayerUuid, PendingLobby,
+    Host, HostUuid, Instant, Lobby, LobbyClient, LobbyClientPlayerUuid, PendingLobby, PlayerUUID,
     ReceivedEnsembleMessage, SendMode,
     messages::{LobbyClientMessage, LobbyMessage},
     migration::{AwaitingHost, HostLossCause, host_lost},
@@ -139,45 +158,89 @@ pub struct PeerReliableRtt(pub f64);
 #[derive(Component, Debug, Clone, Copy)]
 pub struct PeerRttJitter(pub f64);
 
-/// Seconds elapsed since the last pong was received from a peer.
+/// Seconds since anything was heard from a peer.
 ///
 /// Present from the moment a peer is known — on the host's `LobbyClient` entity, on a client's
-/// lobby entity — not from its first pong, so a peer that never answers is timed from the
-/// start. Reset to `0.0` on each pong and ticked up every frame; [`PeerTimeout`] is what acts on
-/// it.
+/// lobby entity — not from the first thing it says, so a peer that never says anything is timed
+/// from the start. Ticked up every frame and reset to `0.0` whenever the peer is heard from: any
+/// packet decoded from it, or anything its backend reports through [`HeardFrom`]. [`PeerTimeout`]
+/// is what acts on it.
+///
+/// Counted in frame time rather than read off a clock, which is what makes a frozen app safe on
+/// both ends. The app that stalled adds at most one frame's capped delta when it wakes, so it
+/// never finds a peer silent for the whole time it was away itself; and a peer whose app stalled
+/// is still heard from by a backend that answers keepalives below the app, so it is never silent
+/// for that time either.
 #[derive(Component, Debug, Clone, Copy, Default)]
-pub struct PeerLastPong(pub f64);
+pub struct PeerSilence(pub f64);
+
+/// The old name of [`PeerSilence`], from when only a pong reset it.
+#[deprecated(note = "renamed `PeerSilence`: anything heard from the peer resets it now")]
+pub type PeerLastPong = PeerSilence;
+
+/// Peers heard from since liveness last looked, by their [`PlayerUUID`].
+///
+/// Every decoded packet marks its sender here. A backend whose transport hears from peers below
+/// the app — keepalives answered by the socket itself — marks them too, each frame, so that a peer
+/// whose app is frozen but whose connection is not stays alive. Drained every frame into
+/// [`PeerSilence`].
+#[derive(Resource, Debug, Default)]
+pub struct HeardFrom(HashSet<PlayerUUID>);
+
+impl HeardFrom {
+    /// Something arrived from `peer`.
+    pub fn mark(&mut self, peer: PlayerUUID) {
+        self.0.insert(peer);
+    }
+}
 
 /// The newest pong sequence number accepted from a peer, so a duplicate or a replay of an old
 /// pong cannot be folded into the estimate twice.
 #[derive(Component, Debug, Clone, Copy)]
 pub(crate) struct PeerLastPongSeq(pub u32);
 
-/// How long a peer may go without answering a ping before it is treated as gone.
+/// How long a peer may go without being heard from before it is treated as gone.
 ///
-/// On the host, a client past this is despawned as if it had disconnected, which tells everyone
-/// else. On a client, a host past this ends the session with
+/// On the host, a client past this is despawned as if it had disconnected — with
+/// [`SeatRemoval::TimedOut`] on it, so it is told it timed out rather than that it was kicked —
+/// and everyone else is told it left. On a client, a host past this ends the session with
 /// [`LobbyLeft { reason: PeerTimeout }`](crate::LobbyLeft) — or, in a lobby that can migrate,
 /// starts the wait for a new host, during which an answer from the old one still counts. `None`
 /// disables the check.
 ///
 /// The transport's own disconnect detection is not enough on its own: a NAT binding that
-/// expired, a process that froze while its OS keeps acknowledging, or a tab in the background
-/// all look connected to the transport for as long as it takes ICE to give up, which is many
-/// seconds and sometimes never. Five seconds is long enough that no link a game would play on
-/// trips it — the satellite preset is a 600 ms round trip — and short enough that a session does
-/// not sit waiting on somebody who is not there.
+/// expired, or a process that died while its OS keeps acknowledging, look connected to the
+/// transport for as long as it takes ICE to give up, which is many seconds and sometimes never.
+///
+/// What this measures is the connection, not the app — see [`PeerSilence`] — so the timeout only
+/// has to outlast a bad patch on a real link: ten seconds rides out a Wi-Fi drop or a burst of
+/// loss, and a player who really left stands in the session no longer than that. It used to be
+/// five seconds of *pongs*, which a backgrounded tab could not send, and players were dropped for
+/// looking away.
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct PeerTimeout(pub Option<Duration>);
 
-/// Extra time a peer may go without a pong before [`PeerTimeout`] acts on it.
+/// Why a host is removing a client's seat, on the `LobbyClient` entity as it is despawned.
 ///
-/// A transport that knows the silence has a cause and an end -- an ICE restart in flight, a
-/// tab the OS has told it is suspended -- inserts this on the peer's entity (the `LobbyClient`
-/// on a host, the lobby on a client) and removes it when the path is back. Without it a
-/// five-second liveness check would end the session before a restart that takes ten had a
-/// chance, and the restart would be pointless. Capped: the extra is added to the timeout, not
-/// substituted for it, so a peer that never comes back still goes.
+/// The removal observers read it to tell the player which it was. Absent means
+/// [`Kicked`](Self::Kicked): despawning a seat is how a game kicks.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SeatRemoval {
+    Kicked,
+    /// Nothing was heard from the client for [`PeerTimeout`], or it never reached a new host.
+    TimedOut,
+    /// The player went of their own accord. Only ever news to everybody else.
+    Left,
+}
+
+/// Extra silence a peer may have before [`PeerTimeout`] acts on it.
+///
+/// A transport that knows the silence has a cause and an end -- an ICE restart in flight --
+/// inserts this on the peer's entity (the `LobbyClient` on a host, the lobby on a client) and
+/// removes it when the path is back. Without it the liveness check would end the session before a
+/// restart that takes fifteen seconds had a chance, and the restart would be pointless. Capped:
+/// the extra is added to the timeout, not substituted for it, so a peer that never comes back
+/// still goes.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct LivenessGrace {
     /// Added to [`PeerTimeout`] while present.
@@ -186,7 +249,7 @@ pub struct LivenessGrace {
 
 impl Default for PeerTimeout {
     fn default() -> Self {
-        Self(Some(Duration::from_secs(5)))
+        Self(Some(Duration::from_secs(10)))
     }
 }
 
@@ -451,10 +514,10 @@ pub(crate) fn receive_pongs(
         // `try_`: a seat can be despawned in the same frame its pong is read — a liveness
         // timeout, a disconnect — and an insert on an entity that is gone is an error.
         if pong.reliable {
-            commands.entity(entity).try_insert((
-                PeerReliableRtt(smooth(prev_reliable.map(|p| p.0), sample.e2e)),
-                PeerLastPong(0.0),
-            ));
+            commands.entity(entity).try_insert(PeerReliableRtt(smooth(
+                prev_reliable.map(|p| p.0),
+                sample.e2e,
+            )));
             continue;
         }
 
@@ -468,33 +531,72 @@ pub(crate) fn receive_pongs(
                 previous_mean,
                 sample.e2e,
             )),
-            PeerLastPong(0.0),
             PeerLastPongSeq(pong.seq),
         ));
     }
 }
 
-/// Start the liveness clock the moment a peer is known, not the moment it first answers.
+/// Start the liveness clock the moment a peer is known, not the moment it first speaks.
 ///
-/// A client that connects and never pongs used to have no [`PeerLastPong`] at all, and so
-/// could never time out; the only peers that could be found dead were ones that had once been
-/// alive.
+/// A client that connected and never answered used to have no silence clock at all, and so could
+/// never time out; the only peers that could be found dead were ones that had once been alive.
 pub(crate) fn arm_peer_liveness(
     mut commands: Commands,
-    new_clients: Query<Entity, (Added<LobbyClient>, Without<PeerLastPong>)>,
-    new_client_lobbies: Query<Entity, (Added<Lobby>, Without<Host>, Without<PeerLastPong>)>,
+    new_clients: Query<Entity, (Added<LobbyClient>, Without<PeerSilence>)>,
+    new_client_lobbies: Query<Entity, (Added<Lobby>, Without<Host>, Without<PeerSilence>)>,
 ) {
     for entity in new_clients.iter().chain(new_client_lobbies.iter()) {
-        commands.entity(entity).try_insert(PeerLastPong(0.0));
+        commands.entity(entity).try_insert(PeerSilence(0.0));
     }
 }
 
-/// Increments [`PeerLastPong`] every frame so consumers can detect stale connections.
-pub(crate) fn tick_last_pong(time: Res<Time>, mut peers: Query<&mut PeerLastPong>) {
+/// Add this frame to every peer's [`PeerSilence`].
+pub(crate) fn tick_silence(time: Res<Time>, mut peers: Query<&mut PeerSilence>) {
     let dt = time.delta_secs_f64();
-    for mut last_pong in peers.iter_mut() {
-        last_pong.0 += dt;
+    for mut silence in peers.iter_mut() {
+        silence.0 += dt;
     }
+}
+
+/// End the silence of every peer heard from this frame.
+///
+/// On a host, a peer is the `LobbyClient` with its uuid. On a client, the only peer whose
+/// silence is kept is the host, on the lobby entity; anything from anybody else says nothing
+/// about the host.
+pub(crate) fn hear_peers(
+    mut heard: ResMut<HeardFrom>,
+    host_uuid: Option<Res<HostUuid>>,
+    host_lobby: Option<Single<(), (With<Lobby>, With<Host>)>>,
+    mut clients: Query<(&LobbyClientPlayerUuid, &mut PeerSilence), With<LobbyClient>>,
+    mut client_lobbies: Query<
+        &mut PeerSilence,
+        (
+            Or<(With<Lobby>, With<PendingLobby>)>,
+            Without<Host>,
+            Without<LobbyClient>,
+        ),
+    >,
+) {
+    if heard.0.is_empty() {
+        return;
+    }
+    if host_lobby.is_some() {
+        for (uuid, mut silence) in clients.iter_mut() {
+            if heard.0.contains(&uuid.0) {
+                silence.0 = 0.0;
+            }
+        }
+    } else {
+        let from_host = host_uuid
+            .as_ref()
+            .is_none_or(|host| heard.0.contains(&host.0));
+        if from_host {
+            for mut silence in client_lobbies.iter_mut() {
+                silence.0 = 0.0;
+            }
+        }
+    }
+    heard.0.clear();
 }
 
 /// Act on [`PeerTimeout`].
@@ -512,13 +614,13 @@ pub(crate) fn detect_dead_peers(
         (
             Entity,
             &LobbyClientPlayerUuid,
-            &PeerLastPong,
+            &PeerSilence,
             Option<&LivenessGrace>,
         ),
         With<LobbyClient>,
     >,
     client_lobbies: Query<
-        (Entity, &PeerLastPong, Option<&LivenessGrace>),
+        (Entity, &PeerSilence, Option<&LivenessGrace>),
         (
             Or<(With<Lobby>, With<PendingLobby>)>,
             Without<Host>,
@@ -534,26 +636,30 @@ pub(crate) fn detect_dead_peers(
     };
 
     if host_lobby.is_some() {
-        for (entity, uuid, last_pong, grace) in clients.iter() {
+        for (entity, uuid, silence, grace) in clients.iter() {
             let limit = limit_for(grace);
-            if last_pong.0 > limit {
+            if silence.0 > limit {
                 info!(
-                    "dropping client {:#x}: no pong for {:.1}s (limit {limit:.1}s)",
-                    uuid.0, last_pong.0
+                    "dropping client {:#x}: nothing heard from it for {:.1}s (limit {limit:.1}s)",
+                    uuid.0, silence.0
                 );
-                commands.entity(entity).try_despawn();
+                // Inserted before the despawn, in one command, so the removal observers find it.
+                commands
+                    .entity(entity)
+                    .try_insert(SeatRemoval::TimedOut)
+                    .try_despawn();
             }
         }
         return;
     }
 
     // A lobby already waiting for a host is on the migration's clock instead of this one.
-    for (entity, last_pong, grace) in client_lobbies.iter() {
+    for (entity, silence, grace) in client_lobbies.iter() {
         let limit = limit_for(grace);
-        if last_pong.0 > limit {
+        if silence.0 > limit {
             warn!(
-                "the host has not answered a ping for {:.1}s (limit {limit:.1}s)",
-                last_pong.0
+                "nothing heard from the host for {:.1}s (limit {limit:.1}s)",
+                silence.0
             );
             // Waits for a successor if the lobby can have one, and ends the session as a
             // `PeerTimeout` if it cannot.

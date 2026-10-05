@@ -267,6 +267,9 @@ pub struct SyncLobbyParticipant {
 #[derive(Message, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoveLobbyParticipant {
     pub player_uuid: PlayerUUID,
+    /// Why, for the one being removed: a player told "kicked" for a connection that went quiet
+    /// thinks the host threw them out. Everyone else reads it as "left".
+    pub reason: crate::SeatRemoval,
 }
 
 /// A deserialized message received from the network.

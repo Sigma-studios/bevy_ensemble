@@ -516,6 +516,9 @@ pub struct LoopbackNetwork {
     /// The host [`lose_host`](Self::lose_host) took away, until [`name_host`](Self::name_host)
     /// replaces it.
     lost_host: Option<PeerId>,
+    /// Whether a frozen peer's transport still answers: see
+    /// [`set_transport_keepalive`](Self::set_transport_keepalive).
+    transport_keepalive: bool,
 }
 
 impl LoopbackNetwork {
@@ -544,6 +547,7 @@ impl LoopbackNetwork {
             known_clients: HashMap::new(),
             migration: None,
             lost_host: None,
+            transport_keepalive: false,
         };
         network.seed(0x2545_f491_4f6c_dd1d);
         network
@@ -1275,14 +1279,53 @@ impl LoopbackNetwork {
 
     /// One frame in which only `peers` run. The rest are frozen: no update, so nothing sent, and
     /// what arrives for them waits in their inbox. A backgrounded tab, from the outside.
+    ///
+    /// With [`set_transport_keepalive`](Self::set_transport_keepalive) on, a frozen peer whose
+    /// link is up is still heard from by every peer that runs, as its socket would be.
     pub fn step_only(&mut self, peers: &[PeerId]) {
         self.advance(1);
+        if self.transport_keepalive {
+            self.hear_frozen_peers(peers);
+        }
         for peer in peers {
             if !self.peers[peer.0].crashed {
                 self.peers[peer.0].app.update();
             }
         }
         self.collect_outbound();
+    }
+
+    /// Model a transport that answers keepalives below the app, as WebRTC's socket does.
+    ///
+    /// Off by default, which is a transport whose liveness is whatever the app sends — and which
+    /// drops a peer whose app froze. On, a peer frozen by [`step_only`](Self::step_only) whose link
+    /// still carries what it sends is marked heard ([`HeardFrom`](bevy_ensemble::HeardFrom)) by
+    /// every peer that runs that frame and can hear it: its app sent nothing, its socket answered.
+    pub fn set_transport_keepalive(&mut self, on: bool) {
+        self.transport_keepalive = on;
+    }
+
+    fn hear_frozen_peers(&mut self, running: &[PeerId]) {
+        let frozen: Vec<PlayerUUID> = (0..self.peers.len())
+            .filter(|index| !running.contains(&PeerId(*index)))
+            .filter(|index| {
+                let peer = &self.peers[*index];
+                !peer.crashed && peer.attachment.can_send()
+            })
+            .map(|index| self.peers[index].uuid)
+            .collect();
+        for listener in running {
+            let peer = &mut self.peers[listener.0];
+            if peer.crashed || !peer.attachment.can_receive() {
+                continue;
+            }
+            let world = peer.app.world_mut();
+            if let Some(mut heard) = world.get_resource_mut::<bevy_ensemble::HeardFrom>() {
+                for uuid in &frozen {
+                    heard.mark(*uuid);
+                }
+            }
+        }
     }
 
     /// One frame in which `each` decides what every peer does — several updates, none, or

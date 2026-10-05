@@ -130,9 +130,11 @@ pub use netsim::{ChannelModel, NetPreset, NetSim, NetSimClock, NetSimConfig, Net
 pub use outbound::{MAX_DATAGRAM_BYTES, OutboundBatches, UNRELIABLE_ADVISORY_BYTES};
 #[cfg(feature = "persistence")]
 pub use persistence::PersistedResourcePlugin;
+#[allow(deprecated)]
+pub use ping::PeerLastPong;
 pub use ping::{
-    EnsemblePing, EnsemblePong, LivenessGrace, PeerLastPong, PeerReliableRtt, PeerRtt,
-    PeerRttJitter, PeerTimeout, PeerWireRtt,
+    EnsemblePing, EnsemblePong, HeardFrom, LivenessGrace, PeerReliableRtt, PeerRtt, PeerRttJitter,
+    PeerSilence, PeerTimeout, PeerWireRtt, SeatRemoval,
 };
 pub use player_data::{
     LocalPlayerData, PersistedPlayerDataPlugin, PlayerData, PlayerDataPlugin, SetPlayerData,
@@ -140,7 +142,8 @@ pub use player_data::{
 };
 pub use registry::{
     EnsembleMessageRegistry, HANDSHAKE_INDEX, HeldUntilVerified, PROTOCOL_VERSION, RefusedPackets,
-    decode_ensemble_packet, encode_ensemble_message, frame_packets, packet_index, unframe_packet,
+    TRANSPORT_KEEPALIVE_INDICES, decode_ensemble_packet, encode_ensemble_message, frame_packets,
+    packet_index, unframe_packet,
 };
 pub use route::PeerRoute;
 pub use session::{
@@ -196,6 +199,7 @@ impl Plugin for EnsemblePlugin {
             .init_resource::<registry::RefusedPackets>()
             .init_resource::<ping::PeerTimeout>()
             .init_resource::<ping::OutstandingPings>()
+            .init_resource::<ping::HeardFrom>()
             .init_resource::<outbound::OutboundBatches>()
             .add_message::<StartHosting>()
             .add_message::<systems::LobbyStateUpdate>()
@@ -275,8 +279,15 @@ impl Plugin for EnsemblePlugin {
                     // so these Update handlers already see this frame's pings/pongs.
                     ping::respond_to_pings,
                     ping::receive_pongs,
-                    ping::tick_last_pong,
-                    ping::detect_dead_peers.after(ping::tick_last_pong),
+                    // Anything heard this frame — decoded in PreUpdate, or reported by the
+                    // backend's transport — ends the silence this frame added to.
+                    (
+                        ping::tick_silence,
+                        ping::hear_peers,
+                        ping::detect_dead_peers,
+                    )
+                        .chain()
+                        .after(ping::arm_peer_liveness),
                 ),
             )
             .add_systems(

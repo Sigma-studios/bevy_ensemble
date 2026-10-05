@@ -318,7 +318,7 @@ pub(crate) fn create_peer_connection(
     signal_tx: mpsc::UnboundedSender<OutgoingSignal>,
     peer_state_tx: mpsc::UnboundedSender<(u128, PeerState)>,
     route_tx: mpsc::UnboundedSender<crate::RouteReport>,
-    message_tx: mpsc::UnboundedSender<(u128, Box<[u8]>, Instant)>,
+    inbox: crate::Inbox,
     ice_servers: &IceServers,
     discarded_candidates: Arc<AtomicU64>,
     handle: tokio::runtime::Handle,
@@ -551,21 +551,21 @@ pub(crate) fn create_peer_connection(
         }));
     }
 
-    // Both channels feed into the same message receiver.
-    {
-        let msg_tx = message_tx.clone();
-        reliable_channel.on_message(Box::new(move |msg| {
+    // Both channels feed into the same inbox, and a keepalive is answered from here, on the
+    // runtime, on the channel it came in on — see `inbox`. Through the outbound queue like any
+    // other send, and through a weak handle to it: the queue's worker owns the channels, the
+    // channels own these handlers, and a strong sender here would keep the worker alive for ever.
+    for (channel, reliable) in [(&reliable_channel, true), (&unreliable_channel, false)] {
+        let inbox = inbox.clone();
+        let replies = outbound_tx.downgrade();
+        channel.on_message(Box::new(move |msg| {
             let received_at = Instant::now();
-            let _ = msg_tx.send((peer_id, msg.data.to_vec().into_boxed_slice(), received_at));
-            Box::pin(async {})
-        }));
-    }
-
-    {
-        let msg_tx = message_tx;
-        unreliable_channel.on_message(Box::new(move |msg| {
-            let received_at = Instant::now();
-            let _ = msg_tx.send((peer_id, msg.data.to_vec().into_boxed_slice(), received_at));
+            let bytes = msg.data.to_vec().into_boxed_slice();
+            if let Some(reply) = inbox.arrive(peer_id, bytes, received_at, reliable)
+                && let Some(replies) = replies.upgrade()
+            {
+                let _ = replies.send((bytes::Bytes::copy_from_slice(&reply), reliable));
+            }
             Box::pin(async {})
         }));
     }

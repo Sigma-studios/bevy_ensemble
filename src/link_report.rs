@@ -13,7 +13,8 @@ use bevy::prelude::*;
 
 use crate::{
     Host, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyParticipant, LobbyParticipantOf,
-    PeerRoute, PeerRtt, PlayerUUID, ReceivedEnsembleMessage, SendMode, messages::LobbyMessage,
+    PeerRoute, PeerRtt, PeerWireRtt, PlayerUUID, ReceivedEnsembleMessage, SendMode,
+    messages::LobbyMessage,
 };
 
 /// How often the host sends the report. A scoreboard reading, not a signal anything steers by:
@@ -30,6 +31,14 @@ const REPORT_INTERVAL_SECS: f32 = 1.0;
 pub struct ParticipantLink {
     /// Round trip to the host, in seconds: the host's [`PeerRtt`] for this participant.
     pub rtt: f64,
+    /// The network's part of that round trip, in seconds: the host's [`PeerWireRtt`], which
+    /// leaves out how long the participant's app held the ping before answering.
+    ///
+    /// The number to show as somebody's ping. [`rtt`](Self::rtt) also counts the time the ping
+    /// waited for their next frame, so it rises with a slow machine's frame time — and on a
+    /// scoreboard a player at 30 fps looked 20 ms worse connected than one at 144 on the same line.
+    /// The same as `rtt` until the host has a wire measurement.
+    pub wire_rtt: f64,
     /// How this participant reaches the host. `None` until ICE has settled, or on a transport
     /// that does not report it.
     pub route: Option<PeerRoute>,
@@ -46,6 +55,7 @@ pub struct LinkEntry {
     pub player: PlayerUUID,
     /// Microseconds, so the wire carries an integer and a report cannot smuggle in a `NaN`.
     pub rtt_micros: u32,
+    pub wire_micros: u32,
     pub route: Option<PeerRoute>,
 }
 
@@ -53,9 +63,15 @@ impl LinkEntry {
     fn link(self) -> ParticipantLink {
         ParticipantLink {
             rtt: f64::from(self.rtt_micros) / 1e6,
+            wire_rtt: f64::from(self.wire_micros) / 1e6,
             route: self.route,
         }
     }
+}
+
+/// Seconds as whole microseconds, for the wire: never negative, never past `u32::MAX`.
+fn micros(seconds: f64) -> u32 {
+    (seconds.max(0.0) * 1e6).min(f64::from(u32::MAX)) as u32
 }
 
 type Participants<'w, 's> = Query<
@@ -110,6 +126,7 @@ pub(crate) fn send_link_reports(
             &LobbyClientPlayerUuid,
             &LobbyParticipantOf,
             &PeerRtt,
+            Option<&PeerWireRtt>,
             Option<&PeerRoute>,
         ),
         With<LobbyClient>,
@@ -131,10 +148,11 @@ pub(crate) fn send_link_reports(
 
     let entries: Vec<LinkEntry> = clients
         .iter()
-        .filter(|(_, of, rtt, _)| of.0 == lobby && rtt.0.is_finite())
-        .map(|(uuid, _, rtt, route)| LinkEntry {
+        .filter(|(_, of, rtt, _, _)| of.0 == lobby && rtt.0.is_finite())
+        .map(|(uuid, _, rtt, wire, route)| LinkEntry {
             player: uuid.0,
-            rtt_micros: (rtt.0.max(0.0) * 1e6).min(f64::from(u32::MAX)) as u32,
+            rtt_micros: micros(rtt.0),
+            wire_micros: micros(wire.map_or(rtt.0, |wire| wire.0).min(rtt.0)),
             route: route.copied(),
         })
         .collect();

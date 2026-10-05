@@ -1,4 +1,5 @@
 mod diagnosis;
+mod inbox;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 mod recovery;
@@ -13,6 +14,12 @@ use tokio::sync::mpsc;
 
 /// Monotonic clock used to stamp received messages (works natively and on wasm).
 pub use web_time::Instant;
+
+pub(crate) use inbox::Inbox;
+use inbox::Keepalive;
+pub use inbox::{
+    KEEPALIVE_INTERVAL, KEEPALIVE_PING_INDEX, KEEPALIVE_PONG_INDEX, MAX_QUEUED_UNRELIABLE,
+};
 
 /// Signal data exchanged between peers via the signalling server.
 ///
@@ -193,8 +200,11 @@ pub(crate) type RouteReport = (u128, PeerRoute, Option<String>);
 pub struct EnsembleSocket {
     signal_tx: mpsc::UnboundedSender<OutgoingSignal>,
     signal_rx: mpsc::UnboundedReceiver<OutgoingSignal>,
-    message_tx: mpsc::UnboundedSender<(u128, Box<[u8]>, Instant)>,
-    message_rx: mpsc::UnboundedReceiver<(u128, Box<[u8]>, Instant)>,
+    /// What every connection has received, written by their message handlers. See [`inbox`].
+    inbox: Inbox,
+    /// When the next round of keepalive pings is due; `None` until the first.
+    next_keepalive: Option<Instant>,
+    keepalive_seq: u32,
     #[cfg(not(target_arch = "wasm32"))]
     peers: HashMap<u128, native::NativePeerConnection>,
     #[cfg(target_arch = "wasm32")]
@@ -223,12 +233,12 @@ impl EnsembleSocket {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new(runtime_handle: tokio::runtime::Handle) -> Self {
         let (signal_tx, signal_rx) = mpsc::unbounded_channel();
-        let (message_tx, message_rx) = mpsc::unbounded_channel();
         Self {
             signal_tx,
             signal_rx,
-            message_tx,
-            message_rx,
+            inbox: Inbox::default(),
+            next_keepalive: None,
+            keepalive_seq: 0,
             peers: HashMap::new(),
             events: HashMap::new(),
             states: HashMap::new(),
@@ -244,12 +254,12 @@ impl EnsembleSocket {
     #[cfg(target_arch = "wasm32")]
     pub fn new() -> Self {
         let (signal_tx, signal_rx) = mpsc::unbounded_channel();
-        let (message_tx, message_rx) = mpsc::unbounded_channel();
         Self {
             signal_tx,
             signal_rx,
-            message_tx,
-            message_rx,
+            inbox: Inbox::default(),
+            next_keepalive: None,
+            keepalive_seq: 0,
             peers: HashMap::new(),
             events: HashMap::new(),
             states: HashMap::new(),
@@ -303,7 +313,7 @@ impl EnsembleSocket {
                 self.signal_tx.clone(),
                 state_tx,
                 route_tx,
-                self.message_tx.clone(),
+                self.inbox.clone(),
                 &self.ice_servers,
                 Arc::clone(&self.discarded_candidates),
                 self.runtime_handle.clone(),
@@ -320,7 +330,7 @@ impl EnsembleSocket {
                 self.signal_tx.clone(),
                 state_tx,
                 route_tx,
-                self.message_tx.clone(),
+                self.inbox.clone(),
                 &self.ice_servers,
                 Arc::clone(&self.discarded_candidates),
             );
@@ -415,7 +425,7 @@ impl EnsembleSocket {
                         self.signal_tx.clone(),
                         state_tx,
                         route_tx,
-                        self.message_tx.clone(),
+                        self.inbox.clone(),
                         &self.ice_servers,
                         Arc::clone(&self.discarded_candidates),
                         self.runtime_handle.clone(),
@@ -432,7 +442,7 @@ impl EnsembleSocket {
                         self.signal_tx.clone(),
                         state_tx,
                         route_tx,
-                        self.message_tx.clone(),
+                        self.inbox.clone(),
                         &self.ice_servers,
                         Arc::clone(&self.discarded_candidates),
                     );
@@ -635,13 +645,49 @@ impl EnsembleSocket {
     /// Receive all pending messages from all peers.
     ///
     /// Each entry carries the [`Instant`] at which the bytes came off the data channel
-    /// (stamped in the `on_message` callback, not when this method is called).
+    /// (stamped in the `on_message` callback, not when this method is called). Keepalives are
+    /// not among them: the socket answers those itself.
+    ///
+    /// An app that has not called this for a while finds at most [`MAX_QUEUED_UNRELIABLE`] of
+    /// each peer's unreliable packets, the newest; see [`dropped_backlog`](Self::dropped_backlog).
     pub fn receive(&mut self) -> Vec<(u128, Box<[u8]>, Instant)> {
-        let mut messages = Vec::new();
-        while let Ok(msg) = self.message_rx.try_recv() {
-            messages.push(msg);
+        self.inbox.drain()
+    }
+
+    /// Ping every connected peer, if [`KEEPALIVE_INTERVAL`] has passed since the last round.
+    ///
+    /// Call it every frame. Only the pinging is tied to the frame loop: the answer comes from
+    /// the other side's data channel handler, so a peer whose app is frozen still answers, and a
+    /// frozen app — which sends nothing — is not expecting answers either.
+    pub fn send_keepalives(&mut self) {
+        let now = Instant::now();
+        if self.next_keepalive.is_some_and(|due| now < due) {
+            return;
         }
-        messages
+        self.next_keepalive = Some(now + KEEPALIVE_INTERVAL);
+        self.keepalive_seq = self.keepalive_seq.wrapping_add(1);
+        let ping = Keepalive::Ping(self.keepalive_seq).encode();
+        let peers: Vec<u128> = self.connected_peers().collect();
+        for peer in peers {
+            self.send_with_mode(Box::new(ping), peer, false);
+        }
+    }
+
+    /// The peers anything has been heard from since the last call — a game packet or a
+    /// keepalive, whether or not the app has read it yet.
+    ///
+    /// This is the liveness signal. It is written by the data channel handlers as bytes arrive,
+    /// so it keeps being true of a peer through any stretch of time this app was not running
+    /// frames: when it wakes, the first call says who kept talking meanwhile.
+    pub fn take_heard(&mut self) -> Vec<u128> {
+        self.inbox.take_heard()
+    }
+
+    /// Unreliable packets dropped, over the socket's lifetime, because the app was not reading
+    /// fast enough to keep [`MAX_QUEUED_UNRELIABLE`] of them. Zero in a session whose app never
+    /// stalls.
+    pub fn dropped_backlog(&self) -> u64 {
+        self.inbox.dropped()
     }
 
     /// Drain outbound signals that need to be sent to the signalling server.

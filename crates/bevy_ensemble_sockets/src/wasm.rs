@@ -304,7 +304,7 @@ pub(crate) fn create_peer_connection(
     signal_tx: mpsc::UnboundedSender<OutgoingSignal>,
     peer_state_tx: mpsc::UnboundedSender<(u128, PeerState)>,
     route_tx: mpsc::UnboundedSender<crate::RouteReport>,
-    message_tx: mpsc::UnboundedSender<(u128, Box<[u8]>, Instant)>,
+    inbox: crate::Inbox,
     ice_servers: &IceServers,
     discarded_candidates: Arc<AtomicU64>,
 ) -> WasmPeerConnection {
@@ -495,32 +495,27 @@ pub(crate) fn create_peer_connection(
     reliable_dc.set_onclose(Some(onclose.as_ref().unchecked_ref()));
     onclose.forget();
 
-    // Both channels feed into the same message receiver.
-    let msg_tx_reliable = message_tx.clone();
-    let onmessage_reliable: Closure<dyn FnMut(MessageEvent)> =
-        Closure::wrap(Box::new(move |event: MessageEvent| {
-            let received_at = Instant::now();
-            if let Ok(buf) = event.data().dyn_into::<js_sys::ArrayBuffer>() {
-                let arr = js_sys::Uint8Array::new(&buf);
-                let _ =
-                    msg_tx_reliable.send((peer_id, arr.to_vec().into_boxed_slice(), received_at));
-            }
-        }));
-    reliable_dc.set_onmessage(Some(onmessage_reliable.as_ref().unchecked_ref()));
-    onmessage_reliable.forget();
-
-    let msg_tx_unreliable = message_tx;
-    let onmessage_unreliable: Closure<dyn FnMut(MessageEvent)> =
-        Closure::wrap(Box::new(move |event: MessageEvent| {
-            let received_at = Instant::now();
-            if let Ok(buf) = event.data().dyn_into::<js_sys::ArrayBuffer>() {
-                let arr = js_sys::Uint8Array::new(&buf);
-                let _ =
-                    msg_tx_unreliable.send((peer_id, arr.to_vec().into_boxed_slice(), received_at));
-            }
-        }));
-    unreliable_dc.set_onmessage(Some(onmessage_unreliable.as_ref().unchecked_ref()));
-    onmessage_unreliable.forget();
+    // Both channels feed into the same inbox, and a keepalive is answered from right here, on
+    // the channel it came in on. This handler is a network event, which a browser still delivers
+    // to a tab in the background — where the frame loop, and everything the game would have
+    // answered with, has stopped. See `inbox`.
+    for (dc, reliable) in [(&reliable_dc, true), (&unreliable_dc, false)] {
+        let inbox = inbox.clone();
+        let reply_on = dc.clone();
+        let onmessage: Closure<dyn FnMut(MessageEvent)> =
+            Closure::wrap(Box::new(move |event: MessageEvent| {
+                let received_at = Instant::now();
+                if let Ok(buf) = event.data().dyn_into::<js_sys::ArrayBuffer>() {
+                    let arr = js_sys::Uint8Array::new(&buf);
+                    let bytes = arr.to_vec().into_boxed_slice();
+                    if let Some(reply) = inbox.arrive(peer_id, bytes, received_at, reliable) {
+                        let _ = reply_on.send_with_u8_array(&reply);
+                    }
+                }
+            }));
+        dc.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+        onmessage.forget();
+    }
 
     WasmPeerConnection {
         connection: conn,

@@ -120,10 +120,14 @@ pub enum LobbyLeftReason {
     Left,
     /// The host removed this peer.
     Kicked,
+    /// The host heard nothing from this peer for longer than [`PeerTimeout`](crate::PeerTimeout)
+    /// and gave its seat up. The connection was failing in this direction, since this peer is
+    /// still hearing the host.
+    TimedOut,
     /// The host's connection ended, or it closed the lobby. In a lobby that can migrate, only
     /// after no new host was named, or the one named could not be reached.
     HostGone,
-    /// The host stopped answering pings for longer than [`PeerTimeout`](crate::PeerTimeout).
+    /// Nothing was heard from the host for longer than [`PeerTimeout`](crate::PeerTimeout).
     PeerTimeout,
     /// The signalling connection closed, so no new peer could ever be reached.
     SignallingLost,

@@ -41,10 +41,10 @@ pub use crate::{
     LocalPlayerData,
     // Ping
     ParticipantLink,
-    PeerLastPong,
     PeerRoute,
     PeerRtt,
     PeerRttJitter,
+    PeerSilence,
     PeerWireRtt,
 
     PendingLobby,
@@ -71,6 +71,10 @@ pub use crate::{
 
     TransportBackend,
 };
+
+// The old name of `PeerSilence`, kept so games that read it still build.
+#[allow(deprecated)]
+pub use crate::PeerLastPong;
 
 // Keeping a resource across sessions (feature `persistence`).
 #[cfg(feature = "persistence")]

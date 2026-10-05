@@ -4,6 +4,45 @@ One section per phase of the netcode overhaul, in the order they landed. Each na
 what to change in a consumer, and why. Both peers of a session must be built from the same
 commit; the join handshake enforces it from phase E2 onward.
 
+## Protocol v3 — liveness is the connection's, not the app's
+
+A peer was alive while its app answered pings, and an app answers from its frame loop. A browser
+stops that loop entirely for a tab in the background, and a long load or shader compile stalls it
+natively. So a player who looked away for five seconds lost their seat, on a connection that was
+fine. The host told them they had been kicked.
+
+- **A peer is alive while anything is heard from it.** Every decoded packet counts. A transport can
+  also report peers it heard below the app through the new `HeardFrom` resource. The WebRTC socket
+  does: it sends keepalives four times a second (`EnsembleSocket::send_keepalives`), answers them
+  from the data channel's message handler, which a browser still runs in a hidden tab, and reports
+  them with `take_heard`. Its keepalives travel under two newly reserved type indices,
+  `TRANSPORT_KEEPALIVE_INDICES`. That reservation is why `PROTOCOL_VERSION` is 3.
+- `PeerLastPong` is renamed **`PeerSilence`**: seconds since the peer was last heard from. The old
+  name remains as a deprecated alias for reading; construct `PeerSilence`.
+- `PeerTimeout` defaults to **10 s** (was 5 s). It now measures the connection, so it only has to
+  outlast a bad patch on a real link.
+- The socket keeps at most `MAX_QUEUED_UNRELIABLE` (512) of each peer's unreliable packets waiting
+  to be read, dropping the oldest. A tab that slept for minutes wakes to a bounded backlog.
+  `dropped_backlog()` counts what was dropped.
+- `RemoveLobbyParticipant` carries a `reason: SeatRemoval` (`Kicked`, `TimedOut`, `Left`). A host
+  that times a client out inserts `SeatRemoval::TimedOut` on the seat before despawning it. The
+  client leaves with the new **`LobbyLeftReason::TimedOut`** rather than `Kicked`.
+- Round trips (`PeerRtt`, `PeerWireRtt`, `PeerReliableRtt`, `PeerRttJitter`) are measured exactly
+  as before, through the frame loop and the network simulator. They are what a game's messages
+  experience.
+- `ParticipantLink` gains `wire_rtt`, the host's `PeerWireRtt` for that participant. That is the
+  network's part of the round trip, and the figure to show as a ping: `rtt` also counts the wait for
+  the participant's next frame. A `ParticipantLink` built by hand needs it.
+- The loopback harness's `set_transport_keepalive(true)` makes a peer frozen by `step_only` keep
+  being heard, as over WebRTC.
+
+**What to change**
+- Match `LobbyLeftReason::TimedOut` wherever you match `LobbyLeftReason`.
+- Rename `PeerLastPong` to `PeerSilence`.
+- Add `reason` to any `RemoveLobbyParticipant` you build.
+- Both peers must be on protocol v3; the handshake refuses a v2 peer with "protocol version 3 here, 2
+  there".
+
 ## Fix — the lobby entity is the session: ordered roster, lobby-scoped state
 
 A client read `SyncLobbyParticipant` and `RemoveLobbyParticipant` in two unordered systems, so the

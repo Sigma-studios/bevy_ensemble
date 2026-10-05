@@ -13,7 +13,7 @@ use bevy_ensemble::{
     EnsembleMessageRegistry, EnsemblePlugin, HandshakeVerified, HeldUntilVerified, Host,
     HostChanged, HostLossCause, HostMigratable, HostMigrationTimeouts, HostUuid, Lobby,
     LobbyBroadcastAppExt, LobbyBroadcastPlugin, LobbyClient, LobbyClientPlayerUuid, LobbyLeft,
-    LobbyLeftReason, LobbyMessage, LobbyParticipant, LocalMultiplayerPlayerId, PeerLastPong,
+    LobbyLeftReason, LobbyMessage, LobbyParticipant, LocalMultiplayerPlayerId, PeerSilence,
     PeerTimeout, PlayerData, PlayerDataPlugin, ReceivedEnsembleMessage, SetPlayerData,
     VerifiedHost, encode_ensemble_message,
 };
@@ -634,7 +634,7 @@ fn liveness_resumes_against_the_new_host() {
     assert!(departures(&net, b).is_empty());
     let world = net.app_mut(b).world_mut();
     let last_pong = world
-        .query_filtered::<&PeerLastPong, With<Lobby>>()
+        .query_filtered::<&PeerSilence, With<Lobby>>()
         .iter(world)
         .next()
         .expect("the liveness clock runs again")
