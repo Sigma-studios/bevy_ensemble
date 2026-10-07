@@ -11,6 +11,7 @@ use web_time::Instant;
 
 use tokio::sync::mpsc;
 use webrtc::api::APIBuilder;
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
@@ -323,7 +324,11 @@ pub(crate) fn create_peer_connection(
     discarded_candidates: Arc<AtomicU64>,
     handle: tokio::runtime::Handle,
 ) -> NativePeerConnection {
-    let api = APIBuilder::new().build();
+    // Container and VM bridges would be offered as host candidates nobody can reach, and enough
+    // of them bury the real LAN address until the relay wins: see `interfaces`.
+    let mut settings = SettingEngine::default();
+    settings.set_interface_filter(Box::new(crate::interfaces::gathers_from));
+    let api = APIBuilder::new().with_setting_engine(settings).build();
 
     let config = RTCConfiguration {
         ice_servers: ice_servers

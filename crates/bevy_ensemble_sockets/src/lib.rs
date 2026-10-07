@@ -1,6 +1,8 @@
 mod diagnosis;
 mod inbox;
 #[cfg(not(target_arch = "wasm32"))]
+mod interfaces;
+#[cfg(not(target_arch = "wasm32"))]
 mod native;
 mod recovery;
 #[cfg(target_arch = "wasm32")]
