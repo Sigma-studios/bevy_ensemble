@@ -325,7 +325,8 @@ pub(crate) fn create_peer_connection(
     handle: tokio::runtime::Handle,
 ) -> NativePeerConnection {
     // Container and VM bridges would be offered as host candidates nobody can reach, and enough
-    // of them bury the real LAN address until the relay wins: see `interfaces`.
+    // of them bury the real LAN address until the relay wins: see `interfaces`, and the
+    // default-route ranking where candidates are sent.
     let mut settings = SettingEngine::default();
     settings.set_interface_filter(Box::new(crate::interfaces::gathers_from));
     let api = APIBuilder::new().with_setting_engine(settings).build();
@@ -389,7 +390,7 @@ pub(crate) fn create_peer_connection(
                     log::info!("peer {peer_id:#x}: finished gathering local candidates");
                     return;
                 };
-                let init = match candidate.to_json() {
+                let mut init = match candidate.to_json() {
                     Ok(init) => init,
                     Err(error) => {
                         log::warn!(
@@ -399,6 +400,12 @@ pub(crate) fn create_peer_connection(
                         return;
                     }
                 };
+                // Looked up per candidate, not per connection, so an ICE restart after a
+                // network change ranks the new default route first.
+                init.candidate = crate::interfaces::promote_default_route(
+                    &init.candidate,
+                    &crate::interfaces::default_route_addrs(),
+                );
                 let json = serde_json::to_string(&init).unwrap();
                 // The candidate line carries its type (host / srflx / relay) and address, which
                 // is what says whether this peer has anything a remote peer could reach it on.
