@@ -19,6 +19,8 @@ mod connection;
 mod handshake;
 #[cfg(feature = "client")]
 mod join_first;
+#[cfg(all(feature = "client", not(target_arch = "wasm32")))]
+mod relay_log;
 #[cfg(feature = "client")]
 mod session;
 #[cfg(feature = "client")]
@@ -34,6 +36,8 @@ use bevy_ensemble::{EnsembleAppExt, EnsembleTransportAppExt, MessageAuthority};
 pub use bevy_ensemble_sockets::{IceServer, IceServers};
 #[cfg(feature = "client")]
 pub use join_first::JoinFirstLobby;
+#[cfg(all(feature = "client", not(target_arch = "wasm32")))]
+pub use relay_log::relay_log_path;
 
 /// Bevy plugin for WebRTC P2P networking via a signaling server.
 ///
@@ -262,8 +266,9 @@ pub const QUIET_ICE_LOG_FILTER: &str = "webrtc_ice::agent::agent_gather=error,\
 
 /// A connection settled on the relay, and this is why: every candidate both sides offered, every
 /// pair ICE checked and how it went, with a verdict on top. Plain text, one per relayed
-/// connection, also logged as a warning. A game can keep it somewhere a player can find it and
-/// send it in; the host's copy covers every client's connection.
+/// connection, logged as a warning and, on a native build, appended to the file at
+/// [`relay_log_path`] — somewhere a player can find it and send it in. The host's copy covers
+/// every client's connection. Read it as a message for anything more a game wants to do with it.
 #[cfg(feature = "client")]
 #[derive(Message, Clone, Debug)]
 pub struct RelayReport {
@@ -715,5 +720,13 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
             .add_observer(systems::send_serialized_lobby_packet)
             .add_observer(systems::cancel_abandoned_request)
             .add_observer(systems::disconnect_removed_lobby_client);
+
+        // Every relay report into a file, the frame it is made: the browser console keeps the
+        // web build's, and nothing keeps a native build's unless this does.
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_systems(
+            Update,
+            relay_log::keep_relay_reports.after(systems::poll_peer_routes),
+        );
     }
 }

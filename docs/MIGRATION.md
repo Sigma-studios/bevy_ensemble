@@ -4,6 +4,18 @@ One section per phase of the netcode overhaul, in the order they landed. Each na
 what to change in a consumer, and why. Both peers of a session must be built from the same
 commit; the join handshake enforces it from phase E2 onward.
 
+## Relay reports are kept in a file
+
+A `RelayReport` used to be logged and written as a message, and keeping it anywhere a player could
+find it was each game's job; run-2d did, and nobody else did. A native build now appends every
+report to a file itself, under the platform's log directory in a folder named after the plugin's
+`game` id — `relay_log_path(game)` says where. It cannot be turned off. The web build is
+unchanged: the browser console keeps the warning.
+
+- A game that kept its own copy should drop it, or each report is written twice.
+- The file names the other peer by uuid, which is all this crate knows them by. The message is
+  still written, for a game that wants to do more with it.
+
 ## Durations, not seconds
 
 Times were bare `f64`/`f32` seconds or milliseconds, with the unit only in a name or a doc comment.
