@@ -4,6 +4,22 @@ One section per phase of the netcode overhaul, in the order they landed. Each na
 what to change in a consumer, and why. Both peers of a session must be built from the same
 commit; the join handshake enforces it from phase E2 onward.
 
+## Storage is a resource, and kept natively too
+
+`PersistedResourcePlugin` (and `PlayerDataPlugin::persisted`) used to write to the page's local
+storage on the web and do nothing anywhere else. Where things are kept is now a `Storage` resource
+the game inserts, and natively it is a file per key.
+
+- **Insert `Storage::platform()` in `main`**, before the plugins. Without one nothing is kept, on
+  the web as well — on purpose, so that a test building a game's plugins never reads or writes the
+  developer's own settings. A test about keeping things inserts `Storage::in_memory()`.
+- Keys are `<game>.<name>`, as they already had to be. The web keeps them under the same keys as
+  before, so nothing a player has stored is lost. Natively the value goes to
+  `<config>/<game>/<name>`, `<config>` being `$XDG_CONFIG_HOME`, else `%APPDATA%`, else
+  `~/.config`.
+- A game that kept its own settings beside this one can read and write through the same
+  `Storage`: `Storage::of(app)` while building a plugin, `Res<Storage>` in a system.
+
 ## Relay reports are kept in a file
 
 A `RelayReport` used to be logged and written as a message, and keeping it anywhere a player could

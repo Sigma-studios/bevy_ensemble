@@ -131,7 +131,7 @@ pub use netmetrics::{NetMetrics, NetMetricsPlugin};
 pub use netsim::{ChannelModel, NetPreset, NetSim, NetSimClock, NetSimConfig, NetSimPlugin};
 pub use outbound::{MAX_DATAGRAM_BYTES, OutboundBatches, UNRELIABLE_ADVISORY_BYTES};
 #[cfg(feature = "persistence")]
-pub use persistence::PersistedResourcePlugin;
+pub use persistence::{PersistedResourcePlugin, Storage};
 #[allow(deprecated)]
 pub use ping::PeerLastPong;
 pub use ping::{

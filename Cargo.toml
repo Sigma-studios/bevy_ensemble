@@ -21,8 +21,8 @@ serde = { version = "1", features = ["derive"] }
 # storage inspector — which is where a bug report about a wrong name is actually answered.
 serde_json = { version = "1", optional = true }
 
-# The page's local storage, for `persistence`. Web only: off the web there is no page, and the
-# module's other half does nothing.
+# The page's local storage, for `persistence`. Web only: off the web a value is kept in a file,
+# which needs nothing beyond std.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-sys = { version = "0.3", features = ["Window", "Storage"] }
 
@@ -33,8 +33,8 @@ web-sys = { version = "0.3", features = ["Window", "Storage"] }
 [features]
 default = ["netmetrics", "netdebug", "persistence"]
 
-# Keep a resource across sessions — on the web, in the page's local storage. Inert until the game
-# adds `PersistedResourcePlugin`, like the two below.
+# Keep things across sessions — in the page's local storage on the web, in a file per key
+# natively. Inert until the game inserts a `Storage` and reads or writes it, like the two below.
 persistence = ["dep:serde_json"]
 
 # Lightweight network counters (bytes/packets in & out, sampled rates).

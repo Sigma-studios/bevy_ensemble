@@ -157,8 +157,8 @@ impl<T: EnsembleMessage> Default for PlayerDataPlugin<T> {
 impl<T: EnsembleMessage + Default> PlayerDataPlugin<T> {
     /// Keep the local player's own copy across sessions, and publish it whenever a lobby appears.
     ///
-    /// `key` is the storage key, shared with everything else on the origin, so prefix it with
-    /// something that belongs to the game (`"mygame.profile"`).
+    /// `key` is the storage key, `<game>.<name>` (`"mygame.profile"`), and it is kept wherever the
+    /// game's [`Storage`](crate::Storage) is — nowhere, until the game inserts one.
     ///
     /// The `Default` bound is why this is a separate constructor rather than a field: a game that
     /// only wants the synchronised half should not have to invent a default for its data.
