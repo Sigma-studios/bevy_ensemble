@@ -78,7 +78,7 @@ pub use crate::PeerLastPong;
 
 // Keeping a resource across sessions (feature `persistence`).
 #[cfg(feature = "persistence")]
-pub use crate::PersistedResourcePlugin;
+pub use crate::{PersistedResourcePlugin, Storage};
 
 // Network metrics (feature `netmetrics`).
 #[cfg(feature = "netmetrics")]
