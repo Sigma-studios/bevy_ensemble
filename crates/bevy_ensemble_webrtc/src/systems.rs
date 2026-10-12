@@ -976,8 +976,9 @@ pub(crate) fn poll_peer_routes(
             info!("peer {peer_id:#x} is connected through the relay, not directly");
         }
     }
-    // A warning, not information: it is the one line a player can send in about a relayed
-    // session, and release builds commonly compile everything below `warn` out.
+    // A warning, not information: release builds commonly compile everything below `warn` out,
+    // and on the web the console is the only place the report is kept. A native build also
+    // appends it to a file — see `relay_log`.
     for (peer, report) in socket.take_relay_reports() {
         warn!("{report}");
         relay_reports.write(crate::RelayReport { peer, report });
