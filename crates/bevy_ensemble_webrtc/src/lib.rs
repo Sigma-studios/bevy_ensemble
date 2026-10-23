@@ -37,7 +37,14 @@ pub use bevy_ensemble_sockets::{IceServer, IceServers};
 #[cfg(feature = "client")]
 pub use join_first::JoinFirstLobby;
 #[cfg(all(feature = "client", not(target_arch = "wasm32")))]
-pub use relay_log::relay_log_path;
+pub use relay_log::{relay_log_path, session_log_layer, session_log_path};
+
+/// No file on the web: the browser console keeps the log. See the native
+/// `session_log_layer`, which this stands in for so that a game can call it unconditionally.
+#[cfg(all(feature = "client", target_arch = "wasm32"))]
+pub fn session_log_layer(_game: &str) -> Option<bevy::log::BoxedLayer> {
+    None
+}
 
 /// Bevy plugin for WebRTC P2P networking via a signaling server.
 ///
@@ -79,6 +86,16 @@ pub struct BevyEnsembleWebrtcPlugin {
     /// every build from before the declaration existed does. See
     /// [`ClientMessage::DeclareGame`](protocol::ClientMessage::DeclareGame).
     pub game: String,
+    /// How long a broken link is given to be made again, or `None` to end it as soon as it
+    /// breaks.
+    ///
+    /// Marks every lobby [`Reconnectable`](bevy_ensemble::Reconnectable): a host holds the seat
+    /// of a client whose connection failed and connects to it again, and the client waits for
+    /// it, its place in the game kept. A link breaks for reasons that have nothing to do with
+    /// anybody leaving — a DTLS or SCTP failure, a Wi-Fi drop, a NAT rebinding past what an ICE
+    /// restart can repair — and the signalling server still lists both ends in the lobby, so
+    /// there is always somebody to reconnect to.
+    pub reconnect_within: Option<std::time::Duration>,
 }
 
 #[cfg(feature = "client")]
@@ -91,6 +108,7 @@ impl Default for BevyEnsembleWebrtcPlugin {
             ice_servers: IceServers::default(),
             join_timeout: Some(std::time::Duration::from_secs(15)),
             game: String::new(),
+            reconnect_within: Some(bevy_ensemble::Reconnectable::default().within),
         }
     }
 }
@@ -529,6 +547,7 @@ pub(crate) struct WebrtcRuntime {
     ice_servers: IceServers,
     pub(crate) join_timeout: Option<std::time::Duration>,
     game: String,
+    pub(crate) reconnect_within: Option<std::time::Duration>,
 }
 
 #[cfg(feature = "client")]
@@ -624,6 +643,7 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
             ice_servers: self.ice_servers.clone(),
             join_timeout: self.join_timeout,
             game: self.game.clone(),
+            reconnect_within: self.reconnect_within,
         };
 
         let (socket, lobby_connection) = webrtc_runtime.build_socket(&self.display_name);
@@ -676,6 +696,9 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
                         .before(systems::join_requested_lobbies)
                         .before(systems::refresh_lobby_list),
                     systems::poll_socket_peers,
+                    // After the states, so a seat whose link broke this frame is held -- the
+                    // core does it in this frame's commands -- before it is looked for.
+                    systems::redial_held_seats.after(systems::poll_socket_peers),
                     systems::poll_peer_routes,
                     // After the lobby events so that, on the frame a client's `LobbyJoined` and
                     // its host's offer both arrive, the host is known before the offer is judged.
@@ -719,7 +742,9 @@ impl Plugin for BevyEnsembleWebrtcPlugin {
             )
             .add_observer(systems::send_serialized_lobby_packet)
             .add_observer(systems::cancel_abandoned_request)
-            .add_observer(systems::disconnect_removed_lobby_client);
+            .add_observer(systems::disconnect_removed_lobby_client)
+            .add_observer(systems::mark_reconnectable)
+            .add_observer(systems::close_the_link_to_a_silent_host);
 
         // Every relay report into a file, the frame it is made: the browser console keeps the
         // web build's, and nothing keeps a native build's unless this does.

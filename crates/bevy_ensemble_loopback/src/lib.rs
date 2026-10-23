@@ -127,7 +127,8 @@ use bevy_ensemble::{
     AwaitingHost, EnsembleSet, EnsembleTransportAppExt, Host, HostLost, HostMigratable, HostUuid,
     Instant, LeaveLobby, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyLeft, LobbyLeftReason,
     LobbyParticipantOf, LocalMultiplayerPlayerId, NetPreset, NewHostNamed, PeerRtt, PeerRttJitter,
-    PendingLobby, PlayerUUID, SendMode, SerializedLobbyPacket, decode_ensemble_packet,
+    PendingLobby, PlayerUUID, Reconnectable, SeatLinkLost, SendMode, SerializedLobbyPacket,
+    decode_ensemble_packet,
 };
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
@@ -513,6 +514,8 @@ pub struct LoopbackNetwork {
     known_clients: HashMap<(usize, Entity), PlayerUUID>,
     /// Put on every lobby, when set: see [`set_host_migration`](Self::set_host_migration).
     migration: Option<HostMigratable>,
+    /// Put on every lobby, when set: see [`set_reconnection`](Self::set_reconnection).
+    reconnection: Option<Reconnectable>,
     /// The host [`lose_host`](Self::lose_host) took away, until [`name_host`](Self::name_host)
     /// replaces it.
     lost_host: Option<PeerId>,
@@ -546,6 +549,7 @@ impl LoopbackNetwork {
             pending_corruptions: HashMap::new(),
             known_clients: HashMap::new(),
             migration: None,
+            reconnection: None,
             lost_host: None,
             transport_keepalive: false,
         };
@@ -580,7 +584,7 @@ impl LoopbackNetwork {
         let lobby = app.world_mut().spawn((Lobby, Host)).id();
         app.world_mut().insert_resource(HostUuid(uuid));
         let peer = self.push_peer(app, uuid, true, Some(lobby), Attachment::Connected);
-        self.mark_migratable(peer);
+        self.apply_lobby_policies(peer);
         peer
     }
 
@@ -596,7 +600,7 @@ impl LoopbackNetwork {
         let lobby = app.world_mut().spawn(Lobby).id();
         self.tell_who_the_host_is(&mut app);
         let peer = self.push_peer(app, uuid, false, Some(lobby), Attachment::Connected);
-        self.mark_migratable(peer);
+        self.apply_lobby_policies(peer);
         self.spawn_lobby_client(self.host(), uuid);
         peer
     }
@@ -619,7 +623,7 @@ impl LoopbackNetwork {
         let lobby = app.world_mut().spawn(PendingLobby).id();
         self.tell_who_the_host_is(&mut app);
         let peer = self.push_peer(app, uuid, false, Some(lobby), Attachment::Pending);
-        self.mark_migratable(peer);
+        self.apply_lobby_policies(peer);
         peer
     }
 
@@ -694,8 +698,23 @@ impl LoopbackNetwork {
         ));
     }
 
-    /// Make `peer`'s lobby migratable, or not, to match [`set_host_migration`](Self::set_host_migration).
-    fn mark_migratable(&mut self, peer: PeerId) {
+    /// Make `peer`'s lobby migratable and reconnectable, or not, to match
+    /// [`set_host_migration`](Self::set_host_migration) and
+    /// [`set_reconnection`](Self::set_reconnection).
+    fn apply_lobby_policies(&mut self, peer: PeerId) {
+        let reconnection = self.reconnection;
+        if let Some(lobby) = self.peers[peer.0].lobby
+            && let Ok(mut lobby) = self.peers[peer.0].app.world_mut().get_entity_mut(lobby)
+        {
+            match reconnection {
+                Some(reconnection) => {
+                    lobby.insert(reconnection);
+                }
+                None => {
+                    lobby.remove::<Reconnectable>();
+                }
+            }
+        }
         let migration = self.migration;
         let Some(lobby) = self.peers[peer.0].lobby else {
             return;
@@ -742,6 +761,53 @@ impl LoopbackNetwork {
         self.despawn_lobby_client(uuid);
     }
 
+    /// The link between `peer` and its host breaks, and both ends' transports notice: what a
+    /// backend reports when a connection fails — a DTLS or SCTP failure, a path ICE could not
+    /// restore — while the arbiter still has both in the lobby.
+    ///
+    /// The host is told [`SeatLinkLost`] for the client's seat and the client [`HostLost`] for its
+    /// lobby; what each does about it is the core's, by the lobby's [`Reconnectable`] and
+    /// [`HostMigratable`]. Nothing flows either way until [`reconnect`](Self::reconnect), which is
+    /// the host reaching the client again: a new seat for the same player.
+    pub fn break_link(&mut self, peer: PeerId) {
+        assert!(
+            !self.peers[peer.0].is_host,
+            "the host's links are its clients'; break one of those"
+        );
+        let uuid = self.peers[peer.0].uuid;
+        self.peers[peer.0].attachment = Attachment::Disconnected;
+        self.in_flight
+            .retain(|packet| packet.to != peer && packet.from != peer);
+
+        if let Some(host) = self.try_host() {
+            let world = self.peers[host.0].app.world_mut();
+            let seat = world
+                .query_filtered::<(Entity, &LobbyClientPlayerUuid), With<LobbyClient>>()
+                .iter(world)
+                .find(|(_, player_uuid)| player_uuid.0 == uuid)
+                .map(|(entity, _)| entity);
+            if let Some(seat) = seat {
+                world.trigger(SeatLinkLost { entity: seat });
+                world.flush();
+            }
+        }
+
+        let Some(lobby) = self.peers[peer.0].lobby else {
+            return;
+        };
+        let world = self.peers[peer.0].app.world_mut();
+        if world.get_entity(lobby).is_err() {
+            return;
+        }
+        world.trigger(HostLost { entity: lobby });
+        world.flush();
+        if world.get_entity(lobby).is_err() {
+            // A lobby with nothing to wait for ends on the spot.
+            self.peers[peer.0].lobby = None;
+            self.peers[peer.0].attachment = Attachment::Left;
+        }
+    }
+
     /// A peer that still receives everything and is heard by nobody.
     ///
     /// The shape of an expired NAT binding, a frozen process whose OS still acks, or a
@@ -753,8 +819,10 @@ impl LoopbackNetwork {
         self.in_flight.retain(|packet| packet.from != peer);
     }
 
-    /// Undo [`disconnect`](Self::disconnect) or [`half_open`](Self::half_open): the same app, the
-    /// same uuid, both directions open. Respawns the host's `LobbyClient` if it was dropped.
+    /// Undo [`disconnect`](Self::disconnect), [`break_link`](Self::break_link) or
+    /// [`half_open`](Self::half_open): the same app, the same uuid, both directions open.
+    /// Respawns the host's `LobbyClient` if it was dropped — after a broken link, the host
+    /// reaching the client again.
     pub fn reconnect(&mut self, peer: PeerId) {
         assert!(
             !matches!(self.peers[peer.0].attachment, Attachment::Left),
@@ -809,7 +877,7 @@ impl LoopbackNetwork {
         world.insert_resource(HostUuid(host));
         self.peers[peer.0].lobby = Some(lobby);
         self.peers[peer.0].attachment = Attachment::Connected;
-        self.mark_migratable(peer);
+        self.apply_lobby_policies(peer);
         self.spawn_lobby_client(self.host(), uuid);
     }
 
@@ -848,10 +916,20 @@ impl LoopbackNetwork {
         self.peers[new_host.0].is_host = true;
         self.peers[new_host.0].attachment = Attachment::Connected;
         self.peers[new_host.0].crashed = false;
-        self.mark_migratable(new_host);
+        self.apply_lobby_policies(new_host);
     }
 
     // ---- host migration --------------------------------------------------------------------
+
+    /// Make every lobby [`Reconnectable`] with this window — the ones that exist and the ones added
+    /// after — or, with `None`, none of them. Off by default, so that a test of anything else sees
+    /// a broken link end as it always did.
+    pub fn set_reconnection(&mut self, reconnection: Option<Reconnectable>) {
+        self.reconnection = reconnection;
+        for index in 0..self.peers.len() {
+            self.apply_lobby_policies(PeerId(index));
+        }
+    }
 
     /// Make every lobby migratable with these waits — the ones that exist and the ones added after
     /// — or, with `None`, none of them. Off by default, as it is for a backend that has no party
@@ -859,7 +937,7 @@ impl LoopbackNetwork {
     pub fn set_host_migration(&mut self, migration: Option<HostMigratable>) {
         self.migration = migration;
         for index in 0..self.peers.len() {
-            self.mark_migratable(PeerId(index));
+            self.apply_lobby_policies(PeerId(index));
         }
     }
 

@@ -257,3 +257,42 @@ fn twenty_connect_cycles_never_drop_a_candidate() {
     }
     assert_eq!(connected, 20);
 }
+
+/// The offerer drops its connection and makes a new one while the answerer still holds the old:
+/// a host reaching a client again after the link between them broke at the host's end. The new
+/// offer carries a new certificate, so it is a new connection rather than an ICE restart: the
+/// answerer reports the old one `Disconnected`, answers afresh, and traffic flows on the new one.
+#[test]
+fn a_new_connection_from_the_offerer_replaces_the_answerers_old_one() {
+    let runtime = tokio::runtime::Runtime::new().expect("a tokio runtime");
+    let mut pair = Pair::new(runtime.handle());
+    if !pair.connect() {
+        skip_inconclusive();
+        return;
+    }
+
+    // Only the offerer lets go: the answerer has not noticed anything yet.
+    pair.a.disconnect_peer(B);
+    pair.b_states.clear();
+    if !pair.connect() {
+        skip_inconclusive();
+        return;
+    }
+    assert_eq!(
+        pair.b_states.first(),
+        Some(&PeerState::Disconnected),
+        "the old connection is reported over before the new one says anything: {:?}",
+        pair.b_states
+    );
+    assert!(
+        pair.b_states.contains(&PeerState::Connected),
+        "the answerer is connected again: {:?}",
+        pair.b_states
+    );
+    pair.a.send(Box::new(*b"again"), B);
+    assert!(
+        pair.b_receives(b"again", Duration::from_secs(5)),
+        "traffic flows on the new connection"
+    );
+    pair.disconnect();
+}

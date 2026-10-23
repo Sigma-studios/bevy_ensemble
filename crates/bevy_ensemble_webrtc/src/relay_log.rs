@@ -1,4 +1,4 @@
-//! Every relay report kept in a file a player can find and send in.
+//! Every relay report, and every run's log, kept in a file a player can find and send in.
 //!
 //! A [`RelayReport`](crate::RelayReport) is logged as a warning, which is enough on the web — the
 //! browser console keeps it — but a native build has no console anybody sees. So native builds
@@ -40,6 +40,39 @@ pub fn relay_log_path(game: &str) -> Option<std::path::PathBuf> {
             .or_else(|| var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))?
     };
     Some(dir.join(folder).join("relay-reports.txt"))
+}
+
+/// Where this run's log goes: `session.log`, beside [`relay_log_path`]'s reports. The run before
+/// is kept as `session.previous.log`.
+pub fn session_log_path(game: &str) -> Option<std::path::PathBuf> {
+    Some(relay_log_path(game)?.with_file_name("session.log"))
+}
+
+/// Every line the console gets, in a file a player can find and send in: for
+/// `LogPlugin::custom_layer`, as `custom_layer: |_| session_log_layer("my-game")`.
+///
+/// A native build's console is a terminal nobody launched it from, so what a peer saw when a
+/// session went wrong was lost the moment it happened — and the peer that saw the most is often
+/// the one that is not the developer's: a host on somebody else's machine. The file is the run's,
+/// started afresh each launch; the run before is moved to `session.previous.log`, so a player who
+/// started the game again after a bad session to look for the file has not just overwritten it.
+/// What reaches it is what the `LogPlugin`'s filter lets through, as for the console.
+///
+/// `None` where there is nowhere to write: no home directory, a folder that cannot be made. On
+/// the web there is no file, and the browser console keeps everything already.
+pub fn session_log_layer(game: &str) -> Option<bevy::log::BoxedLayer> {
+    use bevy::log::tracing_subscriber::{Layer, fmt};
+
+    let path = session_log_path(game)?;
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    let _ = std::fs::rename(&path, path.with_file_name("session.previous.log"));
+    let file = std::fs::File::create(&path).ok()?;
+    Some(
+        fmt::layer()
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .boxed(),
+    )
 }
 
 pub(crate) fn keep_relay_reports(

@@ -138,8 +138,11 @@ When a remote player disconnects from a hosted lobby:
 When the host disconnects (detected on the client side):
 
 1. Close the platform-level connection.
-2. If the lobby is `HostMigratable` and promoted, trigger `HostLost` on it instead of despawning; see
-   below. Otherwise despawn the client's lobby entity.
+2. If the lobby is `Reconnectable` or `HostMigratable`, and promoted, trigger `HostLost` on it
+   instead of despawning; see below. Otherwise despawn the client's lobby entity.
+
+A connection that failed is not a player who left. A backend that can connect to a member again
+reports it as such and lets the core keep the session; see *Reconnecting a Broken Link*.
 
 Never notify a seat that it was removed when it is removed *with* its lobby: that is the host leaving,
 not a kick. A relationship despawns its sources after itself, so by the time a seat's removal is
@@ -180,6 +183,36 @@ somebody else, the backend repins and triggers `NewHostNamed` in the same frame.
 channel of its own to say "closed" can use shared state instead. Steam marks the lobby data, so a
 member that sees the host leave first does not take the lobby over.
 
+## Reconnecting a Broken Link (optional)
+
+Most connections that fail fail between two peers that are both still in the lobby: a DTLS or SCTP
+error, a Wi-Fi drop, a path no ICE restart could restore. The platform still lists both, so nobody
+will name a successor; ending the session over it costs a player their place for nothing. A backend
+whose host can open a new connection to a member at any time can have the core hold the place
+instead:
+
+| When | The backend |
+|------|-------------|
+| A lobby is promoted, hosted or joined | inserts `Reconnectable { within }` on the lobby entity |
+| On the host, a seated client's connection fails | triggers `SeatLinkLost` on its `LobbyClient` seat, instead of despawning it |
+| On the host, a participant is `AwaitingSeat` and has no seat | connects to it again and spawns a seat as for a join; the core finds the existing participant |
+| On the client, the host's connection fails | triggers `HostLost` on the lobby, as for a migratable one |
+| On the host, a seat is removed with `HeldSeat` on it | closes the connection, sends no removal notice |
+
+The core does the rest. `SeatLinkLost` removes the seat quietly — `HeldSeat` on it tells every
+removal observer that nobody left — and holds the participant as `AwaitingSeat` for `within`; the
+liveness check reports a silent client the same way. `HostLost` on a reconnectable lobby waits as
+`AwaitingHost` with the old host as its own successor (`AwaitingHost::is_reconnect`), drops the link
+state, and is ended by the same handshake that ends a migration. No `HostChanged` is written. If
+nobody reconnects in time the seat is dropped as `SeatRemoval::TimedOut`, and the client leaves —
+or, in a migratable lobby, goes on to wait for a successor.
+
+The WebRTC backend is the worked example: `BevyEnsembleWebrtcPlugin::reconnect_within` (20 s, `None`
+to opt out) marks every lobby, `poll_socket_peers` reports the failures, and `redial_held_seats`
+offers again every five seconds while a seat is held. The socket closes a connection the moment it
+reports it over, so the other end hears at once, and tells a new connection from an ICE restart by
+the DTLS fingerprint in the offer: a host's new offer replaces whatever the client still held.
+
 ## Connection State and ICE Restart
 
 `bevy_ensemble_sockets` reports each peer through `EnsembleSocket::update_peers` as a
@@ -190,8 +223,8 @@ member that sees the host leave first does not take the lobby over.
 | `Connecting` | A connection exists; offer/answer and gathering are under way. Reported once, first. | Logs it. |
 | `Connected` | The reliable data channel is open. | Logs it; the handshake takes it from here. |
 | `Reconnecting` | ICE lost the path (Wi-Fi to cellular, a NAT rebinding) and is restarting. The data channels are still open; sends are queued by SCTP and delivered once a new pair is nominated. | Logs it, keeps everything: the host keeps the `LobbyClient`, the client keeps its lobby. |
-| `Disconnected` | A connection that was open has ended. | Host: despawns the `LobbyClient`. Client: if it was the host, triggers `HostLost` on a joined migratable lobby, and otherwise despawns the lobby (`LobbyLeft { HostGone }`). |
-| `Failed` | Over for good: no pair ever worked, or a restart found none within `ICE_RESTART_TIMEOUT` (15 s) or `MAX_ICE_RESTARTS` (3). Nothing is reported after it. | Same teardown as `Disconnected`, plus `LobbyJoinFailed` with a reason. |
+| `Disconnected` | A connection that was open has ended — or was replaced by a new one from the same peer. The socket has closed it. | Host: `SeatLinkLost` on the `LobbyClient` (a seat still connecting is despawned). Client: if it was the host, triggers `HostLost` on a joined reconnectable or migratable lobby, and otherwise despawns the lobby (`LobbyLeft { HostGone }`). |
+| `Failed` | Over for good: no pair ever worked, or a restart found none within `ICE_RESTART_TIMEOUT` (15 s) or `MAX_ICE_RESTARTS` (3). The socket has closed it, and nothing more is reported about it. | Same as `Disconnected`, plus `LobbyJoinFailed` with a reason for a join that failed. |
 
 Only the side that made the original offer restarts ICE — in this protocol, the host — because a
 restart *is* a new offer and a client's offers are refused. The host's ICE agent notices the loss

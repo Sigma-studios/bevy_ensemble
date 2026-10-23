@@ -4,6 +4,44 @@ One section per phase of the netcode overhaul, in the order they landed. Each na
 what to change in a consumer, and why. Both peers of a session must be built from the same
 commit; the join handshake enforces it from phase E2 onward.
 
+## A native build's log is kept in a file
+
+`session_log_layer(game)` is a `LogPlugin::custom_layer` that writes everything the console gets to
+`session.log`, beside the relay reports (`session_log_path(game)` says where), and keeps the run
+before as `session.previous.log`. Opt in from the game's `LogPlugin`:
+`custom_layer: |_| bevy_ensemble_webrtc::session_log_layer("my-game")`. On the web it is `None`:
+the browser console already keeps the log. Written because the side of a session that saw what
+went wrong is often a native host on somebody else's machine, launched from no terminal.
+
+## A broken link is made again, and the player keeps their place
+
+A connection that failed used to end the session for that player, while both ends were still in
+the lobby: the host removed the seat (and with it whatever the game kept on the player), and the
+client either left or, in a migratable lobby, waited up to ninety seconds for a successor that the
+server was never going to name — playing on alone, since nothing was arriving from the host. Now a
+`Reconnectable` lobby holds the seat and the host connects to the client again. See *Reconnecting a
+Broken Link* in `backends.md`.
+
+- **WebRTC: on by default.** `BevyEnsembleWebrtcPlugin::reconnect_within` is 20 s; `None` restores
+  the old ending. A host and a client must both be on this build for it to work; an older peer ends
+  the link as before.
+- **New in the core:** `Reconnectable`, `SeatLinkLost`, `HeldSeat`, `AwaitingHost::is_reconnect`.
+  A client waiting for its host to come back is `AwaitingHost` with `successor == Some(previous)`.
+  It sends nothing and no `HostChanged` follows; the component goes when the host is reached again.
+  On the host, the participant is `AwaitingSeat` meanwhile, and its new seat is a `MigratedSeat`.
+- **A game should not play through `AwaitingHost`.** Nothing from the host can arrive: hold the
+  clock and say so on screen. The ticked bridge holds it for you.
+- **A layer that keys per-peer state on the seat** sees the seat removed and a new one added for the
+  same uuid. `HeldSeat` on the removed seat tells it apart from a departure.
+- **The liveness timeout on a host** now reports `SeatLinkLost` rather than despawning the seat as
+  `SeatRemoval::TimedOut`; a lobby that is not reconnectable still gets the old removal.
+- **Sockets:** a connection reported `Disconnected` or `Failed` is closed by the socket at that
+  moment, and an offer with a new DTLS fingerprint from a peer this side answered replaces the old
+  connection (reported `Disconnected`, then `Connecting`) instead of being applied as an ICE
+  restart. A backend no longer needs to `disconnect_peer` after a loss.
+- **Loopback:** `set_reconnection(Some(Reconnectable))`, and `break_link(peer)` for a connection
+  failing at both ends; `reconnect(peer)` is the host reaching it again.
+
 ## Storage is a resource, and kept natively too
 
 `PersistedResourcePlugin` (and `PlayerDataPlugin::persisted`) used to write to the page's local

@@ -87,6 +87,10 @@ name = "host_migration"
 required-features = ["server"]
 
 [[test]]
+name = "reconnect"
+required-features = ["server"]
+
+[[test]]
 name = "lobby_listing"
 required-features = ["server"]
 

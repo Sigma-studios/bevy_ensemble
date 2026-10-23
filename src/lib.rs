@@ -120,8 +120,9 @@ pub use handshake::{HandshakeVerified, ProtocolHandshake};
 pub use link_report::{LinkEntry, ParticipantLink, ParticipantLinks};
 pub use messages::*;
 pub use migration::{
-    AwaitingHost, AwaitingSeat, HostChanged, HostLossCause, HostLost, HostMigratable,
-    HostMigrationTimeouts, LobbyClosed, NewHostNamed, ParticipantDeparted, VerifiedHost,
+    AwaitingHost, AwaitingSeat, HeldSeat, HostChanged, HostLossCause, HostLost, HostMigratable,
+    HostMigrationTimeouts, LobbyClosed, NewHostNamed, ParticipantDeparted, Reconnectable,
+    SeatLinkLost, VerifiedHost,
 };
 #[cfg(feature = "netdebug")]
 pub use netdebug::{NetDebugConfig, NetDebugExtras, NetDebugPlugin};
@@ -246,6 +247,7 @@ impl Plugin for EnsemblePlugin {
         app.add_observer(migration::on_host_lost)
             .add_observer(migration::on_new_host_named)
             .add_observer(migration::on_participant_departed)
+            .add_observer(migration::on_seat_link_lost)
             .add_systems(First, migration::finish_closing_lobbies)
             .add_systems(
                 Update,

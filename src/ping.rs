@@ -26,7 +26,7 @@ use crate::{
     Host, HostUuid, Instant, Lobby, LobbyClient, LobbyClientPlayerUuid, PendingLobby, PlayerUUID,
     ReceivedEnsembleMessage, SendMode,
     messages::{LobbyClientMessage, LobbyMessage},
-    migration::{AwaitingHost, HostLossCause, host_lost},
+    migration::{AwaitingHost, HostLossCause, SeatLinkLost, host_lost},
 };
 
 /// How often each peer pings every other.
@@ -201,9 +201,11 @@ pub(crate) struct PeerLastPongSeq(pub u32);
 
 /// How long a peer may go without being heard from before it is treated as gone.
 ///
-/// On the host, a client past this is despawned as if it had disconnected — with
-/// [`SeatRemoval::TimedOut`] on it, so it is told it timed out rather than that it was kicked —
-/// and everyone else is told it left. On a client, a host past this ends the session with
+/// On the host, a client past this has lost its link ([`SeatLinkLost`]): in a
+/// [`Reconnectable`](crate::Reconnectable) lobby its seat is held while it is reached again, and
+/// in any other it is despawned as if it had disconnected — with [`SeatRemoval::TimedOut`] on
+/// it, so it is told it timed out rather than that it was kicked — and everyone else is told it
+/// left. On a client, a host past this ends the session with
 /// [`LobbyLeft { reason: PeerTimeout }`](crate::LobbyLeft) — or, in a lobby that can migrate,
 /// starts the wait for a new host, during which an answer from the old one still counts. `None`
 /// disables the check.
@@ -663,14 +665,13 @@ pub(crate) fn detect_dead_peers(
             let limit = limit_for(grace);
             if silence.0 > limit {
                 info!(
-                    "dropping client {:#x}: nothing heard from it for {:.1?} (limit {limit:.1?})",
+                    "the link to client {:#x} is dead: nothing heard from it for {:.1?} (limit \
+                     {limit:.1?})",
                     uuid.0, silence.0
                 );
-                // Inserted before the despawn, in one command, so the removal observers find it.
-                commands
-                    .entity(entity)
-                    .try_insert(SeatRemoval::TimedOut)
-                    .try_despawn();
+                // Held for it to be reached again in a lobby that can, removed as a timeout in
+                // any other.
+                commands.trigger(SeatLinkLost { entity });
             }
         }
         return;
