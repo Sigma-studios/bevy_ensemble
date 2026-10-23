@@ -5,7 +5,7 @@ use crate::{
     RemoveLobbyParticipant, SendMode,
     components::LobbyParticipants,
     messages::{EnsembleMessage, LobbyClientMessage, LobbyMessage},
-    migration::AwaitingHost,
+    migration::{AwaitingHost, HeldSeat},
     registry::{EnsembleMessageRegistry, encode_ensemble_message},
 };
 
@@ -80,20 +80,27 @@ pub(crate) fn encode_lobby_message<T: EnsembleMessage>(
 ///
 /// This enables kicking a player by simply despawning their `LobbyClient` entity —
 /// the observer handles notifying everyone and cleaning up the participant roster.
+///
+/// Except a [`HeldSeat`]: its link broke and its player is being held for it to come back, so
+/// nobody is told anything and the participant stays.
 pub(crate) fn on_lobby_client_removed(
     trigger: On<Remove, LobbyClient>,
     query: Query<(
         &LobbyClientPlayerUuid,
         &LobbyParticipantOf,
         Option<&crate::SeatRemoval>,
+        Has<HeldSeat>,
     )>,
     host_lobbies: Query<(), (With<Lobby>, With<Host>)>,
     participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
     mut commands: Commands,
 ) {
-    let Ok((player_uuid, participant_of, reason)) = query.get(trigger.event_target()) else {
+    let Ok((player_uuid, participant_of, reason, held)) = query.get(trigger.event_target()) else {
         return;
     };
+    if held {
+        return;
+    }
     let reason = reason.copied().unwrap_or(crate::SeatRemoval::Kicked);
 
     let lobby = participant_of.0;

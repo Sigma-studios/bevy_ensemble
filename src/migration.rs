@@ -21,6 +21,28 @@
 //! Both end in a [`HostChanged`] message, which is what a game reads. A lobby that is never told
 //! who the host became ends as it always did, with `LobbyLeft { HostGone }`.
 //!
+//! # A link lost is not a host lost
+//!
+//! Most of the time the host has not gone anywhere: the connection between it and one client
+//! broke — a DTLS or SCTP failure, a Wi-Fi drop, a liveness timeout — and both are still in the
+//! lobby as far as the arbiter is concerned. Nobody will name a successor, because nobody
+//! left. A lobby a backend marks [`Reconnectable`] treats that as what it is:
+//!
+//! - **The host keeps the seat.** The backend (or the liveness check) reports [`SeatLinkLost`];
+//!   the seat entity goes, quietly — no removal is announced — and the participant waits as
+//!   [`AwaitingSeat`] for [`Reconnectable::within`], while the backend makes a new connection to
+//!   it. Whatever the game hung on the participant's player stays, score and all. A client that
+//!   does not come back in time is dropped as [`SeatRemoval::TimedOut`](crate::SeatRemoval).
+//! - **The client waits for the same host.** [`HostLost`] on a reconnectable lobby waits as
+//!   [`AwaitingHost`] with the old host as its own successor
+//!   ([`is_reconnect`](AwaitingHost::is_reconnect)), and the link state is dropped so the new
+//!   connection is verified afresh. Reaching it again is the same handshake as reaching a new
+//!   host, and there is no [`HostChanged`]: the session never changed hands. A lobby that can
+//!   also migrate falls back to waiting for a successor when the old host does not come back.
+//!
+//! Only the host can make the new connection — it is always the offerer — so the client's half
+//! is to wait, and to read nothing it sends meanwhile.
+//!
 //! # What does not survive
 //!
 //! Anything in flight to or from the old host, anything this peer sent while switching, and the
@@ -36,7 +58,7 @@ use crate::{
     HandshakeVerified, Host, HostUuid, LivenessGrace, Lobby, LobbyClient, LobbyClientPlayerUuid,
     LobbyMessage, LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId, PeerReliableRtt,
     PeerRoute, PeerRtt, PeerRttJitter, PeerSilence, PeerWireRtt, PendingLobby, PlayerUUID,
-    ReceivedEnsembleMessage, RemoveLobbyParticipant, SendMode,
+    ReceivedEnsembleMessage, RemoveLobbyParticipant, SeatRemoval, SendMode,
     handshake::ProtocolMatched,
     ping::{EnsemblePong, PeerLastPongSeq},
     registry::HeldUntilVerified,
@@ -76,6 +98,30 @@ pub struct HostMigrationTimeouts {
     pub reach_within: Option<Duration>,
 }
 
+/// A broken link in this lobby is made again rather than ended: the host holds a lost client's
+/// seat, and a client that lost its host waits for it. See the module notes.
+///
+/// Inserted on a lobby entity — the host's and every client's — by a backend that can reach a
+/// lost peer again: whose arbiter still lists both ends in the lobby, and whose host can open a
+/// new connection to a member at any time. A lobby without it ends a broken link as it always
+/// did: the host removes the seat, the client leaves (or, in a [`HostMigratable`] lobby, waits for
+/// a successor).
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reconnectable {
+    /// How long the host keeps a lost client's seat, and a client waits for its host to reach it
+    /// again. Long enough for a new connection to be negotiated and checked, twice over; short
+    /// enough that the players left waiting are not waiting on somebody who has gone.
+    pub within: Duration,
+}
+
+impl Default for Reconnectable {
+    fn default() -> Self {
+        Self {
+            within: Duration::from_secs(20),
+        }
+    }
+}
+
 /// Why a lobby is waiting for a host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostLossCause {
@@ -86,20 +132,37 @@ pub enum HostLossCause {
     Silence,
 }
 
-/// On a client's lobby: its host is gone and it is waiting.
+/// On a client's lobby: its host is gone, or the link to it is, and it is waiting.
 ///
 /// Added when the host is lost; `successor` is filled in when the arbiter names the new host, and
 /// the component goes once this peer and the new host have compared protocols. If `waited`
 /// reaches `limit` first, the session ends.
+///
+/// In a [`Reconnectable`] lobby, `successor` is the old host from the start: the link broke, the
+/// host did not leave, and it is the one expected to reach this peer again. See
+/// [`is_reconnect`](Self::is_reconnect).
+///
+/// Nothing from the host is being applied while this is on, by definition: a game holds its
+/// clock and says so on screen, rather than letting the player carry on in a world nobody else
+/// is in.
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 pub struct AwaitingHost {
     /// The host that was lost.
     pub previous: PlayerUUID,
-    /// The host the arbiter named, once it has.
+    /// The host this lobby is waiting to be reached by: the one the arbiter named, or the old
+    /// one again after a broken link. `None` while nobody has been named.
     pub successor: Option<PlayerUUID>,
     pub cause: HostLossCause,
     pub waited: Duration,
     pub limit: Duration,
+}
+
+impl AwaitingHost {
+    /// Whether this is a wait for the same host to reach this peer again, after the link to it
+    /// broke: nobody left, and nobody is taking over.
+    pub fn is_reconnect(&self) -> bool {
+        self.successor == Some(self.previous)
+    }
 }
 
 /// On a participant of a lobby this peer has just started hosting: a member the arbiter says is
@@ -130,6 +193,27 @@ pub(crate) struct MigratedSeat;
 pub struct HostLost {
     pub entity: Entity,
 }
+
+/// Backend → core, on a host: the link to this seated client broke, and the client is not known
+/// to have left.
+///
+/// Trigger it on the client's `LobbyClient` seat, in place of despawning it. In a
+/// [`Reconnectable`] lobby the seat goes quietly — nobody is told the player left — and the
+/// participant waits as [`AwaitingSeat`] while the backend connects to the client again: a new
+/// seat for the same player takes the participant back. In any other lobby the seat is removed,
+/// and everybody told, as a timeout ([`SeatRemoval::TimedOut`]).
+///
+/// The liveness check reports a client that went silent the same way.
+#[derive(EntityEvent, Clone, Debug)]
+pub struct SeatLinkLost {
+    pub entity: Entity,
+}
+
+/// On a `LobbyClient` seat as it is despawned: its link broke and its player is being held, so
+/// the removal is not a departure. The removal observers — the core's, a backend's — read it to
+/// announce nothing and kick nobody. See [`SeatLinkLost`].
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeldSeat;
 
 /// Backend → core: the arbiter named the host of this lobby.
 ///
@@ -255,6 +339,36 @@ pub(crate) fn host_lost(world: &mut World, lobby: Entity, cause: HostLossCause) 
     }
     let promoted = entity.contains::<Lobby>() && !entity.contains::<PendingLobby>();
     let awaiting = entity.get::<AwaitingHost>().copied();
+    // Already waiting for this host to come back: a second word about the same loss -- the
+    // transport's after the liveness check's, a `Failed` after a `Disconnected` -- changes
+    // nothing, and must not restart the clock.
+    if awaiting.is_some_and(|awaiting| awaiting.is_reconnect()) {
+        return;
+    }
+    let reconnect = entity
+        .get::<Reconnectable>()
+        .copied()
+        .filter(|_| promoted && awaiting.is_none());
+    if let Some(reconnect) = reconnect {
+        let Some(host) = world.get_resource::<HostUuid>().map(|host| host.0) else {
+            end_client_session(world, lobby, LobbyLeftReason::HostGone);
+            return;
+        };
+        info!(
+            "lost the link to the host {host:#x} ({cause:?}); waiting up to {:.0}s for it to \
+             reach this peer again",
+            reconnect.within.as_secs_f64()
+        );
+        forget_host_link(world, lobby, &[host]);
+        world.entity_mut(lobby).insert(AwaitingHost {
+            previous: host,
+            successor: Some(host),
+            cause,
+            waited: Duration::ZERO,
+            limit: reconnect.within,
+        });
+        return;
+    }
     let Some(waits) = waits(world, lobby).filter(|_| promoted) else {
         // Nothing to keep: a join that never finished, or a lobby nobody will name a host for.
         let reason = match cause {
@@ -305,6 +419,78 @@ pub(crate) fn host_lost(world: &mut World, lobby: Entity, cause: HostLossCause) 
     world.entity_mut(lobby).insert(waiting);
 }
 
+/// Drop everything this client's lobby knew about its link to `hosts`: packets held until they
+/// were verified, protocols matched, and the [`HostLinkState`] on the lobby entity. What comes
+/// next — a new host, or a new connection to the same one — is verified from scratch.
+fn forget_host_link(world: &mut World, lobby: Entity, hosts: &[PlayerUUID]) {
+    for uuid in hosts {
+        if let Some(mut held) = world.get_mut::<HeldUntilVerified>(lobby) {
+            held.discard(*uuid);
+        }
+        if let Some(mut matched) = world.get_mut::<ProtocolMatched>(lobby) {
+            matched.0.remove(uuid);
+        }
+    }
+    world.entity_mut(lobby).remove::<HostLinkState>();
+}
+
+pub(crate) fn on_seat_link_lost(lost: On<SeatLinkLost>, mut commands: Commands) {
+    let seat = lost.entity;
+    commands.queue(move |world: &mut World| seat_link_lost(world, seat));
+}
+
+/// The link to a seated client broke: hold its place in a [`Reconnectable`] lobby, and remove
+/// the seat as a timeout in any other.
+fn seat_link_lost(world: &mut World, seat: Entity) {
+    let Ok(seat_ref) = world.get_entity(seat) else {
+        return;
+    };
+    if !seat_ref.contains::<LobbyClient>() {
+        return;
+    }
+    let (Some(uuid), Some(lobby)) = (
+        seat_ref.get::<LobbyClientPlayerUuid>().map(|uuid| uuid.0),
+        seat_ref.get::<LobbyParticipantOf>().map(|of| of.0),
+    ) else {
+        world.despawn(seat);
+        return;
+    };
+    let within = world
+        .get_entity(lobby)
+        .ok()
+        .filter(|lobby| lobby.contains::<Lobby>() && lobby.contains::<Host>())
+        .and_then(|lobby| lobby.get::<Reconnectable>())
+        .map(|reconnect| reconnect.within);
+    let participant = world
+        .query::<(Entity, &LobbyParticipant, &LobbyParticipantOf)>()
+        .iter(world)
+        .find(|(_, participant, of)| participant.player_uuid == uuid && of.0 == lobby)
+        .map(|(participant, _, _)| participant);
+    match (within, participant) {
+        (Some(within), Some(participant)) => {
+            info!(
+                "the link to {uuid:#x} broke; holding its seat for up to {:.0}s while it is \
+                 reached again",
+                within.as_secs_f64()
+            );
+            world.entity_mut(participant).insert(AwaitingSeat {
+                waited: Duration::ZERO,
+                limit: within,
+            });
+            // In one go, so the removal observers find the mark.
+            let mut seat = world.entity_mut(seat);
+            seat.insert(HeldSeat);
+            seat.despawn();
+        }
+        // Nothing to hold it in: removed, and everybody told, as a broken link always was.
+        _ => {
+            let mut seat = world.entity_mut(seat);
+            seat.insert(SeatRemoval::TimedOut);
+            seat.despawn();
+        }
+    }
+}
+
 pub(crate) fn on_new_host_named(named: On<NewHostNamed>, mut commands: Commands) {
     let named = named.event().clone();
     commands.queue(move |world: &mut World| new_host_named(world, named));
@@ -344,7 +530,8 @@ fn new_host_named(world: &mut World, named: NewHostNamed) {
         .get::<AwaitingHost>()
         .map_or(HostLossCause::Transport, |awaiting| awaiting.cause);
 
-    // Whatever was held from, or matched with, a host this peer will not hear from again.
+    // Whatever was held from, or matched with, a host this peer will not hear from again, and
+    // everything on the lobby entity that described the link to it.
     let stale: Vec<PlayerUUID> = [
         Some(previous),
         world.get_resource::<HostUuid>().map(|host| host.0),
@@ -353,17 +540,7 @@ fn new_host_named(world: &mut World, named: NewHostNamed) {
     .flatten()
     .filter(|uuid| *uuid != new_host)
     .collect();
-    for uuid in &stale {
-        if let Some(mut held) = world.get_mut::<HeldUntilVerified>(lobby) {
-            held.discard(*uuid);
-        }
-        if let Some(mut matched) = world.get_mut::<ProtocolMatched>(lobby) {
-            matched.0.remove(uuid);
-        }
-    }
-
-    // Everything on the lobby entity that described the old host.
-    world.entity_mut(lobby).remove::<HostLinkState>();
+    forget_host_link(world, lobby, &stale);
 
     // The roster. Entities that stay are kept, with whatever the game put on them.
     let participants: Vec<(Entity, PlayerUUID)> = world
@@ -521,6 +698,10 @@ pub(crate) fn run_host_migration_clocks(
         if awaiting.waited < awaiting.limit {
             continue;
         }
+        if awaiting.is_reconnect() {
+            commands.queue(move |world: &mut World| reconnect_ran_out(world, lobby));
+            continue;
+        }
         let reason = match (awaiting.successor, awaiting.cause) {
             (None, HostLossCause::Silence) => LobbyLeftReason::PeerTimeout,
             _ => LobbyLeftReason::HostGone,
@@ -545,7 +726,7 @@ pub(crate) fn run_host_migration_clocks(
         }
         let (lobby, uuid) = (of.0, player.player_uuid);
         warn!(
-            "dropping {uuid:#x} from the lobby: it did not reach this peer, its new host, in {:.0}s",
+            "dropping {uuid:#x} from the lobby: no connection to it was made in {:.0}s",
             seat.limit.as_secs_f64()
         );
         commands.entity(participant).try_despawn();
@@ -558,6 +739,44 @@ pub(crate) fn run_host_migration_clocks(
             send_mode: SendMode::Reliable,
         });
     }
+}
+
+/// The host did not reach this peer again in time. A lobby that can migrate goes on to wait for
+/// a successor — the host may have gone after all, and the arbiter not noticed yet — for what is
+/// left of that wait; any other ends.
+fn reconnect_ran_out(world: &mut World, lobby: Entity) {
+    let Some(awaiting) = world.get::<AwaitingHost>(lobby).copied() else {
+        return;
+    };
+    if !awaiting.is_reconnect() || awaiting.waited < awaiting.limit {
+        return;
+    }
+    if let Some(waits) = waits(world, lobby)
+        && waits.successor_within > awaiting.waited
+    {
+        info!(
+            "the host {:#x} did not reach this peer again in {:.0}s; waiting for the lobby to \
+             name a new one",
+            awaiting.previous,
+            awaiting.waited.as_secs_f64()
+        );
+        world.entity_mut(lobby).insert(AwaitingHost {
+            successor: None,
+            limit: waits.successor_within,
+            ..awaiting
+        });
+        return;
+    }
+    warn!(
+        "leaving the session: the host {:#x} did not reach this peer again in {:.0}s",
+        awaiting.previous,
+        awaiting.waited.as_secs_f64()
+    );
+    let reason = match awaiting.cause {
+        HostLossCause::Transport => LobbyLeftReason::HostGone,
+        HostLossCause::Silence => LobbyLeftReason::PeerTimeout,
+    };
+    end_client_session(world, lobby, reason);
 }
 
 /// A host closing its lobby tells everyone first, then leaves on the next frame, once that has

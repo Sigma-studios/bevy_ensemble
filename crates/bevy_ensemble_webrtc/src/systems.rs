@@ -3,11 +3,12 @@ use std::time::Duration;
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use bevy_ensemble::{
-    Host, HostLost, HostMigratable, HostUuid, LivenessGrace, Lobby, LobbyClient,
-    LobbyClientPlayerUuid, LobbyJoinFailed, LobbyLeft, LobbyLeftReason, LobbyParticipant,
-    LobbyParticipantOf, LocalMultiplayerPlayerId, NewHostNamed, ParticipantDeparted, PeerRoute,
-    PendingLobby, PublicLobbies, PublicLobbyInfo, RemoveLobbyParticipant, RequestLobby,
-    SerializedLobbyPacket, decode_ensemble_packet, encode_ensemble_message,
+    AwaitingHost, AwaitingSeat, HeldSeat, Host, HostLossCause, HostLost, HostMigratable, HostUuid,
+    LivenessGrace, Lobby, LobbyClient, LobbyClientPlayerUuid, LobbyJoinFailed, LobbyLeft,
+    LobbyLeftReason, LobbyParticipant, LobbyParticipantOf, LocalMultiplayerPlayerId, NewHostNamed,
+    ParticipantDeparted, PeerRoute, PendingLobby, PublicLobbies, PublicLobbyInfo, Reconnectable,
+    RemoveLobbyParticipant, RequestLobby, SeatLinkLost, SerializedLobbyPacket,
+    decode_ensemble_packet, encode_ensemble_message,
 };
 use bevy_ensemble_sockets::{PeerSignal, PeerState};
 
@@ -159,6 +160,7 @@ pub(crate) fn apply_lobby_events(
         Or<(With<LobbyClient>, With<PendingWebrtcLobbyClient>)>,
     >,
     participants: Query<(Entity, &LobbyParticipant, &LobbyParticipantOf)>,
+    promoted_seats: Query<(), With<LobbyClient>>,
     runtime: Res<crate::WebrtcRuntime>,
 ) {
     // Queries see the world as it was before this frame's events, and a promotion is only
@@ -368,11 +370,22 @@ pub(crate) fn apply_lobby_events(
                             .find(|(_, uuid)| *uuid == player_uuid)
                             .map(|(seat, _)| *seat)
                     });
-                if hosted.is_some()
+                if let Some(lobby) = hosted
                     && let Some(seat) = seat
                 {
                     seated.retain(|(entity, _)| *entity != seat);
                     commands.entity(seat).try_despawn();
+                    // A seat still connecting has no participant of its own -- unless it was
+                    // opened to reach a held member again, whose participant is the core's to
+                    // remove, and everybody's to be told about.
+                    if !promoted_seats.contains(seat) {
+                        commands
+                            .entity(lobby)
+                            .trigger(move |entity| ParticipantDeparted {
+                                entity,
+                                player_uuid,
+                            });
+                    }
                     continue;
                 }
                 // Somebody the server says is gone at a moment no host could say so: a member a
@@ -759,10 +772,12 @@ pub(crate) fn refresh_lobby_list(
 
 /// Poll the EnsembleSocket for peer connect/disconnect events.
 ///
-/// - On the **host**: despawns lobby client entities when a peer disconnects.
-/// - On a **client**: despawns the lobby entity when the *host* peer disconnects
-///   (e.g. kicked or host left), which triggers the full leave/cleanup flow. Any other peer
-///   going away is logged and ignored; it was never this client's session.
+/// - On the **host**: a seated client whose connection ended has lost its link
+///   ([`SeatLinkLost`]); the core holds or removes the seat. A seat still connecting is despawned.
+/// - On a **client**: the *host* peer's connection ending is [`HostLost`] in a lobby that can
+///   wait for it (reconnectable or migratable), and otherwise despawns the lobby entity, which
+///   triggers the full leave/cleanup flow. Any other peer going away is logged and ignored; it was
+///   never this client's session.
 /// - `Reconnecting` on either side is logged and nothing else: the socket is restarting ICE
 ///   with the data channels kept, and it reports `Connected` or `Failed` when that is settled.
 pub(crate) fn poll_socket_peers(
@@ -780,6 +795,8 @@ pub(crate) fn poll_socket_peers(
         Or<(With<LobbyClient>, With<PendingWebrtcLobbyClient>)>,
     >,
     migratable: Query<(), With<HostMigratable>>,
+    reconnectable: Query<(), With<Reconnectable>>,
+    seat_kinds: Query<(Has<LobbyClient>, Has<Redial>)>,
 ) {
     for (peer_id, state) in socket.update_peers() {
         match state {
@@ -836,14 +853,29 @@ pub(crate) fn poll_socket_peers(
                 // Host side: one player is gone, and the lobby carries on without them. Tearing
                 // it down here would evict everybody already playing over one arrival that could
                 // not get in.
+                //
+                // A seated client's link is the core's to judge: in a reconnectable lobby its
+                // seat is held and `redial_held_seats` reaches it again, in any other it is
+                // removed. A seat still connecting has nothing to hold; it goes, and if it was a
+                // join, the join failed.
                 if host_lobby.is_some() {
+                    let mut redial = false;
                     if let Some((client_entity, _)) = lobby_clients
                         .iter()
                         .find(|(_, client_uuid)| client_uuid.0 == peer_id)
                     {
-                        commands.entity(client_entity).try_despawn();
+                        let (seated, redialled) =
+                            seat_kinds.get(client_entity).unwrap_or((false, false));
+                        redial = redialled;
+                        if seated {
+                            commands.trigger(SeatLinkLost {
+                                entity: client_entity,
+                            });
+                        } else {
+                            commands.entity(client_entity).try_despawn();
+                        }
                     }
-                    if failed {
+                    if failed && !redial {
                         join_failed.write(LobbyJoinFailed {
                             reason: format!("A player could not connect to this lobby ({peer_id})"),
                         });
@@ -864,12 +896,12 @@ pub(crate) fn poll_socket_peers(
                         );
                         continue;
                     }
-                    // A lobby that outlives its host waits to be told who hosts it now.
-                    if !pending && migratable.contains(entity) {
-                        info!(
-                            "lost the connection to the host {peer_id:#x}; waiting for the \
-                             server to name the lobby's next host"
-                        );
+                    // A lobby that outlives a broken link waits for the host to reach it again,
+                    // and one that outlives its host waits to be told who hosts it now. The core
+                    // decides which; the socket answers the host's next offer as a new
+                    // connection, whatever is left of this one.
+                    if !pending && (reconnectable.contains(entity) || migratable.contains(entity)) {
+                        info!("lost the connection to the host {peer_id:#x}");
                         commands
                             .entity(entity)
                             .trigger(|entity| HostLost { entity });
@@ -900,6 +932,93 @@ pub(crate) fn poll_socket_peers(
                 }
             }
         }
+    }
+}
+
+/// On a seat a host opened to reach a held member again (see [`redial_held_seats`]), rather than
+/// for a join: its failing is not a join that failed. `since` is when it was opened, on the frame
+/// clock.
+#[derive(Component, Clone, Copy, Debug)]
+pub(crate) struct Redial {
+    since: Duration,
+}
+
+/// How long an attempt to reach a held member is given before it is dropped and made again. A
+/// connection that is going to work is up in a second or two; one that has heard nothing in this
+/// long is waiting on an answer that is not coming — an offer lost on its way, a client that had
+/// not yet noticed its old connection was gone.
+const REDIAL_EVERY: Duration = Duration::from_secs(5);
+
+/// Reach every member whose seat is held again: a new connection, offered as at a join, with a
+/// pending seat for the member's handshake to promote.
+///
+/// The host is always the one that offers, so it is the one that reconnects. A held member is a
+/// participant marked [`AwaitingSeat`] in a lobby this peer hosts — one whose link broke (see
+/// `bevy_ensemble::SeatLinkLost`), or one inherited by a migration. A member with a seat, pending
+/// or not, is left alone: that is an attempt under way, or one that worked. An attempt that has
+/// not worked within [`REDIAL_EVERY`] is dropped and made again, for as long as the core holds
+/// the seat; one whose member is no longer held — reached, departed, given up on — is dropped.
+pub(crate) fn redial_held_seats(
+    mut commands: Commands,
+    mut socket: ResMut<crate::EnsembleSocketRes>,
+    time: Res<Time>,
+    host_lobby: Option<Single<Entity, (With<Lobby>, With<Host>)>>,
+    held: Query<(&LobbyParticipant, &LobbyParticipantOf), With<AwaitingSeat>>,
+    seats: Query<
+        (Entity, &LobbyClientWebrtcUuid),
+        Or<(With<LobbyClient>, With<PendingWebrtcLobbyClient>)>,
+    >,
+    attempts: Query<(Entity, &LobbyClientWebrtcUuid, &Redial), With<PendingWebrtcLobbyClient>>,
+) {
+    let now = time.elapsed();
+    let held_uuids: Vec<u128> = match host_lobby.as_deref() {
+        Some(lobby) => held
+            .iter()
+            .filter(|(_, of)| of.0 == *lobby)
+            .map(|(participant, _)| participant.player_uuid)
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let mut dropped: Vec<Entity> = Vec::new();
+    for (seat, uuid, redial) in attempts.iter() {
+        let still_held = held_uuids.contains(&uuid.0);
+        if still_held && now.saturating_sub(redial.since) < REDIAL_EVERY {
+            continue;
+        }
+        if still_held {
+            info!(
+                "peer {:#x}: no connection after {:.0}s; trying again",
+                uuid.0,
+                REDIAL_EVERY.as_secs_f64()
+            );
+        }
+        commands.entity(seat).try_despawn();
+        socket.disconnect_peer(uuid.0);
+        dropped.push(seat);
+    }
+
+    let Some(lobby) = host_lobby.as_deref().copied() else {
+        return;
+    };
+    for uuid in held_uuids {
+        let attempt_under_way = seats
+            .iter()
+            .any(|(seat, seat_uuid)| seat_uuid.0 == uuid && !dropped.contains(&seat));
+        if attempt_under_way {
+            continue;
+        }
+        info!("peer {uuid:#x}: its seat is held; connecting to it again");
+        // Whatever is left of the old connection would make the offer a renegotiation of it.
+        socket.disconnect_peer(uuid);
+        socket.connect_peer(uuid);
+        commands.spawn((
+            PendingWebrtcLobbyClient,
+            Redial { since: now },
+            LobbyParticipantOf(lobby),
+            LobbyClientWebrtcUuid(uuid),
+            LobbyClientPlayerUuid(uuid),
+        ));
     }
 }
 
@@ -1580,6 +1699,45 @@ pub(crate) fn seat_removal_is_a_kick(
     seat_of.is_some_and(|seat_of| hosted_lobbies.contains(seat_of.0))
 }
 
+/// Every lobby, hosted or joined, is [`Reconnectable`] for as long as the plugin says: the
+/// signalling server keeps both ends of a broken link in the lobby, and the host can always offer
+/// again. Not one a game or a test already marked.
+pub(crate) fn mark_reconnectable(
+    added: On<Add, Lobby>,
+    lobbies: Query<(), With<Reconnectable>>,
+    runtime: Res<crate::WebrtcRuntime>,
+    mut commands: Commands,
+) {
+    let Some(within) = runtime.reconnect_within else {
+        return;
+    };
+    if lobbies.contains(added.entity) {
+        return;
+    }
+    commands
+        .entity(added.entity)
+        .try_insert(Reconnectable { within });
+}
+
+/// A client that stopped hearing its host closes the connection it no longer trusts, so the host
+/// hears at once that it is over and connects again — rather than in however long its own ICE
+/// takes to notice, if the link only died in one direction it never does.
+///
+/// Only for a silence: a connection the socket reported over is already closed, and the host's
+/// next offer may already have replaced it.
+pub(crate) fn close_the_link_to_a_silent_host(
+    added: On<Add, AwaitingHost>,
+    lobbies: Query<&AwaitingHost>,
+    mut socket: ResMut<crate::EnsembleSocketRes>,
+) {
+    let Ok(awaiting) = lobbies.get(added.entity) else {
+        return;
+    };
+    if awaiting.is_reconnect() && awaiting.cause == HostLossCause::Silence {
+        socket.disconnect_peer(awaiting.previous);
+    }
+}
+
 /// Sends a removal notification and disconnects the WebRTC peer when a
 /// [`LobbyClient`] is removed.
 ///
@@ -1595,16 +1753,20 @@ pub(crate) fn disconnect_removed_lobby_client(
         &LobbyClientPlayerUuid,
         Option<&LobbyParticipantOf>,
         Option<&bevy_ensemble::SeatRemoval>,
+        Has<HeldSeat>,
     )>,
     hosted_lobbies: Query<(), (With<Lobby>, With<Host>)>,
     registry: Res<bevy_ensemble::EnsembleMessageRegistry>,
     mut socket: ResMut<crate::EnsembleSocketRes>,
 ) {
-    let Ok((webrtc_uuid, player_uuid, seat_of, reason)) = query.get(trigger.event_target()) else {
+    let Ok((webrtc_uuid, player_uuid, seat_of, reason, held)) = query.get(trigger.event_target())
+    else {
         return;
     };
 
-    if seat_removal_is_a_kick(seat_of, &hosted_lobbies) {
+    // A held seat is not a kick: its player is waiting to be reached again, over a new
+    // connection, and the old one is closed so the client hears at once that it is over.
+    if !held && seat_removal_is_a_kick(seat_of, &hosted_lobbies) {
         // We send the removal packet manually here because Bevy does not
         // guarantee observer execution order. If this observer runs before the
         // core `on_lobby_client_removed`, the peer will be disconnected before

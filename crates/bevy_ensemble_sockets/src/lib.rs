@@ -55,7 +55,9 @@ pub const MAX_ICE_RESTARTS: u32 = 3;
 ///
 /// The order a connection goes through them: `Connecting`, then `Connected`; from there
 /// `Reconnecting` and back to `Connected` any number of times (bounded by [`MAX_ICE_RESTARTS`]),
-/// and finally `Disconnected` or `Failed`. Nothing is reported after `Failed`.
+/// and finally `Disconnected` or `Failed`. The socket closes a connection as it reports either,
+/// so nothing is reported after it, and the next connection to the same peer — made by either
+/// side — starts from `Connecting` again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerState {
     /// A connection has been created and nothing has happened on it yet: an offer is being made
@@ -77,8 +79,9 @@ pub enum PeerState {
     /// that made the original offer restarts; the other side reports this state while it waits
     /// for the restart offer.
     Reconnecting,
-    /// A connection that was open has ended: the data channel closed, or the peer was
-    /// disconnected on purpose.
+    /// A connection that was open has ended: the data channel closed, the peer was disconnected
+    /// on purpose, or the peer made a new connection to this side in its place — which is then
+    /// reported from `Connecting`, like any other.
     Disconnected,
     /// The connection is over and will not be coming back: ICE found no working pair, the
     /// transport gave up, or a restart did not find a path in time.
@@ -223,6 +226,18 @@ pub struct EnsembleSocket {
     /// because the game already calls that every frame on both platforms, and a deadline that
     /// is polled needs no runtime, no `setTimeout`, and nothing to cancel when the peer goes.
     reconnecting_since: HashMap<u128, Instant>,
+    /// The DTLS fingerprint of the offer each connection this side answered was made from.
+    ///
+    /// What tells a renegotiation from a new connection. An ICE restart is an offer on the same
+    /// peer connection, and keeps its certificate; a peer that dropped its connection and made a
+    /// new one — a host reaching a client again after the link broke — offers with a new
+    /// certificate. Applied as a renegotiation, that offer would fail on the fingerprint change and
+    /// leave this side holding a dead connection while the other waits on a new one.
+    remote_fingerprints: HashMap<u128, String>,
+    /// Answered connections a new offer from the same peer replaced, for
+    /// [`update_peers`](Self::update_peers) to report `Disconnected` before the new one's first
+    /// word.
+    superseded: Vec<u128>,
     /// Remote candidates the transport refused, over the socket's lifetime. See
     /// [`discarded_candidates`](EnsembleSocket::discarded_candidates).
     discarded_candidates: Arc<AtomicU64>,
@@ -247,6 +262,8 @@ impl EnsembleSocket {
             routes: HashMap::new(),
             relay_reports: Vec::new(),
             reconnecting_since: HashMap::new(),
+            remote_fingerprints: HashMap::new(),
+            superseded: Vec::new(),
             discarded_candidates: Arc::new(AtomicU64::new(0)),
             ice_servers: IceServers::default(),
             runtime_handle,
@@ -268,6 +285,8 @@ impl EnsembleSocket {
             routes: HashMap::new(),
             relay_reports: Vec::new(),
             reconnecting_since: HashMap::new(),
+            remote_fingerprints: HashMap::new(),
+            superseded: Vec::new(),
             discarded_candidates: Arc::new(AtomicU64::new(0)),
             ice_servers: IceServers::default(),
         }
@@ -392,12 +411,13 @@ impl EnsembleSocket {
     pub fn receive_signal(&mut self, sender: u128, signal: PeerSignal) {
         match signal {
             PeerSignal::Offer(sdp) => {
+                let fingerprint = sdp_fingerprint(&sdp);
                 if let Some(pc) = self.peers.get(&sender) {
                     // A second offer from the peer this side answered is a renegotiation, which
-                    // here means its ICE restarted (see `restart_ice`). Answered like the first;
-                    // the transport reads the new credentials out of the SDP and restarts its
-                    // own agent to match. A second offer from a peer this side *offered to* is
-                    // glare, and stays refused.
+                    // here means its ICE restarted (see `restart_ice`) -- unless it carries
+                    // another certificate, in which case the peer has made a new connection and
+                    // this one is dead at its end; see `remote_fingerprints`. A second offer from
+                    // a peer this side *offered to* is glare, and stays refused.
                     #[cfg(not(target_arch = "wasm32"))]
                     let answerer = native::role(pc) == recovery::Role::Answerer;
                     #[cfg(target_arch = "wasm32")]
@@ -409,14 +429,31 @@ impl EnsembleSocket {
                         );
                         return;
                     }
-                    log::info!("peer {sender:#x}: applying a new offer from it, restarting ICE");
-                    #[cfg(not(target_arch = "wasm32"))]
-                    native::accept_offer(pc, &sdp);
-                    #[cfg(target_arch = "wasm32")]
-                    wasm::accept_offer(pc, &sdp);
-                    return;
+                    let known = self.remote_fingerprints.get(&sender).map(String::as_str);
+                    let new_connection =
+                        known.is_some() && fingerprint.is_some() && known != fingerprint;
+                    if !new_connection {
+                        log::info!(
+                            "peer {sender:#x}: applying a new offer from it, restarting ICE"
+                        );
+                        #[cfg(not(target_arch = "wasm32"))]
+                        native::accept_offer(pc, &sdp);
+                        #[cfg(target_arch = "wasm32")]
+                        wasm::accept_offer(pc, &sdp);
+                        return;
+                    }
+                    log::info!(
+                        "peer {sender:#x}: it made a new connection to this side; dropping the one \
+                         it made before"
+                    );
+                    self.disconnect_peer(sender);
+                    self.superseded.push(sender);
                 }
                 log::info!("peer {sender:#x}: applying its offer, answering as the callee");
+                if let Some(fingerprint) = fingerprint {
+                    self.remote_fingerprints
+                        .insert(sender, fingerprint.to_owned());
+                }
                 let (state_tx, route_tx) = self.events_for(sender);
 
                 #[cfg(not(target_arch = "wasm32"))]
@@ -511,7 +548,14 @@ impl EnsembleSocket {
     /// deadline, and a `Connected` that follows a `Failed` would put a peer back into a session
     /// that has already been torn down around it.
     pub fn update_peers(&mut self) -> Vec<(u128, PeerState)> {
-        let mut changes = Vec::new();
+        // A connection a new one from the same peer replaced ended, and is said to have before
+        // the new one says anything.
+        let mut changes: Vec<(u128, PeerState)> = self
+            .superseded
+            .drain(..)
+            .map(|peer| (peer, PeerState::Disconnected))
+            .collect();
+        let mut ended: Vec<u128> = Vec::new();
         // Order matters within one connection and means nothing across two.
         let reported: Vec<(u128, PeerState)> = self
             .events
@@ -548,6 +592,9 @@ impl EnsembleSocket {
             if report {
                 self.states.insert(peer, state);
                 changes.push((peer, state));
+                if matches!(state, PeerState::Disconnected | PeerState::Failed) {
+                    ended.push(peer);
+                }
             }
         }
 
@@ -569,6 +616,13 @@ impl EnsembleSocket {
             );
             self.states.insert(peer, PeerState::Failed);
             changes.push((peer, PeerState::Failed));
+            ended.push(peer);
+        }
+        // What ended is closed, here rather than by whoever reads the report: the other end hears
+        // at once that the connection is over, instead of waiting on its own ICE to notice, and a
+        // later connection to the same peer -- a host reaching a client again -- starts afresh.
+        for peer in ended {
+            self.disconnect_peer(peer);
         }
         changes
     }
@@ -716,6 +770,8 @@ impl EnsembleSocket {
     /// one's.
     pub fn disconnect_peer(&mut self, peer: u128) {
         self.events.remove(&peer);
+        self.remote_fingerprints.remove(&peer);
+        self.superseded.retain(|superseded| *superseded != peer);
         if self.peers.remove(&peer).is_some() {
             self.states.remove(&peer);
             self.routes.remove(&peer);
@@ -727,9 +783,33 @@ impl EnsembleSocket {
     pub fn disconnect_all(&mut self) {
         self.peers.clear();
         self.events.clear();
+        self.remote_fingerprints.clear();
+        self.superseded.clear();
         self.states.clear();
         self.routes.clear();
         self.reconnecting_since.clear();
+    }
+}
+
+/// The DTLS certificate fingerprint an SDP announces: the value of its first
+/// `a=fingerprint:` line, hash name included. Both browsers and `webrtc-rs` make a certificate per
+/// peer connection, so this names the connection an offer belongs to.
+fn sdp_fingerprint(sdp: &str) -> Option<&str> {
+    sdp.lines()
+        .find_map(|line| line.trim_end().strip_prefix("a=fingerprint:"))
+        .map(str::trim)
+}
+
+#[cfg(test)]
+mod sdp_tests {
+    use super::sdp_fingerprint;
+
+    #[test]
+    fn the_fingerprint_is_read_from_the_first_line_that_has_one() {
+        let sdp = "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\na=fingerprint:sha-256 AB:CD\r\n\
+                   m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=fingerprint:sha-256 EF\r\n";
+        assert_eq!(sdp_fingerprint(sdp), Some("sha-256 AB:CD"));
+        assert_eq!(sdp_fingerprint("v=0\r\n"), None);
     }
 }
 
