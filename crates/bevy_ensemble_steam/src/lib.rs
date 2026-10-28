@@ -1318,7 +1318,7 @@ fn lobby_is_closed(steam_client: &Client, lobby: LobbyId) -> bool {
 /// everyone, still admitted by their session callbacks, and a member Steam could hand the lobby
 /// to. Leaving twice is harmless.
 fn forget_lobby(
-    trigger: On<Remove, LobbySteamId>,
+    trigger: On<Remove<LobbySteamId>>,
     mut commands: Commands,
     steam_client: Res<Client>,
     current_lobby: Res<CurrentSteamLobby>,

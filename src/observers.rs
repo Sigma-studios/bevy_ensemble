@@ -84,7 +84,7 @@ pub(crate) fn encode_lobby_message<T: EnsembleMessage>(
 /// Except a [`HeldSeat`]: its link broke and its player is being held for it to come back, so
 /// nobody is told anything and the participant stays.
 pub(crate) fn on_lobby_client_removed(
-    trigger: On<Remove, LobbyClient>,
+    trigger: On<Remove<LobbyClient>>,
     query: Query<(
         &LobbyClientPlayerUuid,
         &LobbyParticipantOf,

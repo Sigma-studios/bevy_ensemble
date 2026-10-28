@@ -169,7 +169,7 @@ pub(crate) fn announce_protocol(
 /// What was held is on the lobby: for a seat, the lobby the seat belongs to; for a client, the
 /// verified entity is its lobby.
 pub(crate) fn replay_held_packets(
-    verified: On<Add, HandshakeVerified>,
+    verified: On<Add<HandshakeVerified>>,
     clients: Query<(&LobbyClientPlayerUuid, &LobbyParticipantOf), With<LobbyClient>>,
     host: Option<Res<HostUuid>>,
     mut commands: Commands,

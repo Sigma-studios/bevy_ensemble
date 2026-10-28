@@ -701,7 +701,7 @@ pub(crate) fn join_requested_lobbies_by_code(
 /// On despawn rather than on removal: the component is removed on purpose when the answer is
 /// attached, and that is not a cancellation.
 pub(crate) fn cancel_abandoned_request(
-    trigger: On<Despawn, LobbyRequest>,
+    trigger: On<Despawn<LobbyRequest>>,
     requests: Query<&LobbyRequest>,
     lobby_conn: Option<ResMut<LobbyConnection>>,
 ) {
@@ -1493,7 +1493,7 @@ pub(crate) fn send_serialized_lobby_packet(
     }
 
     // `debug!`, not `error!`. The ordinary way to get here is a peer leaving: the
-    // `On<Remove, LobbyClient>` observer notifies the departing client, and by the
+    // `On<Remove<LobbyClient>>` observer notifies the departing client, and by the
     // time that trigger has been through the encode observer and back out as a
     // `SerializedLobbyPacket` the entity no longer resolves. Nothing is wrong -- a
     // packet aimed at somebody who has already disconnected is not an error, and a
@@ -1703,7 +1703,7 @@ pub(crate) fn seat_removal_is_a_kick(
 /// signalling server keeps both ends of a broken link in the lobby, and the host can always offer
 /// again. Not one a game or a test already marked.
 pub(crate) fn mark_reconnectable(
-    added: On<Add, Lobby>,
+    added: On<Add<Lobby>>,
     lobbies: Query<(), With<Reconnectable>>,
     runtime: Res<crate::WebrtcRuntime>,
     mut commands: Commands,
@@ -1726,7 +1726,7 @@ pub(crate) fn mark_reconnectable(
 /// Only for a silence: a connection the socket reported over is already closed, and the host's
 /// next offer may already have replaced it.
 pub(crate) fn close_the_link_to_a_silent_host(
-    added: On<Add, AwaitingHost>,
+    added: On<Add<AwaitingHost>>,
     lobbies: Query<&AwaitingHost>,
     mut socket: ResMut<crate::EnsembleSocketRes>,
 ) {
@@ -1747,7 +1747,7 @@ pub(crate) fn close_the_link_to_a_silent_host(
 ///
 /// Sent only for a kick; see [`seat_removal_is_a_kick`].
 pub(crate) fn disconnect_removed_lobby_client(
-    trigger: On<Remove, LobbyClient>,
+    trigger: On<Remove<LobbyClient>>,
     query: Query<(
         &LobbyClientWebrtcUuid,
         &LobbyClientPlayerUuid,
@@ -1798,7 +1798,7 @@ mod departure_tests {
     struct Verdicts(Vec<bool>);
 
     fn record_verdict(
-        trigger: On<Remove, LobbyClient>,
+        trigger: On<Remove<LobbyClient>>,
         seats: Query<Option<&LobbyParticipantOf>>,
         hosted_lobbies: Query<(), (With<Lobby>, With<Host>)>,
         mut verdicts: ResMut<Verdicts>,

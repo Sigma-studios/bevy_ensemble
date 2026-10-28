@@ -4,6 +4,26 @@ One section per phase of the netcode overhaul, in the order they landed. Each na
 what to change in a consumer, and why. Both peers of a session must be built from the same
 commit; the join handshake enforces it from phase E2 onward.
 
+## Bevy 0.20
+
+Every crate is on Bevy 0.20, which needs rustc 1.97.1. Nothing on the wire changed, and neither
+did any of this crate's own types; what a game notices is Bevy's own migration
+(<https://bevy.org/learn/migration-guides/0-19-to-0-20/>), and three things here:
+
+- **Observers:** `On<Add, Lobby>` is `On<Add<Lobby>>` now, and the same for `Insert`, `Remove`,
+  `Despawn` on any of this crate's components (`LobbyClient`, `AwaitingHost`,
+  `HandshakeVerified`, …).
+- **The net-debug overlay's preset buttons** are `ui_widgets::Button`s, applied on
+  `Activate` (on the press, as before) rather than read from the deprecated `Interaction`. They
+  are pressed through UI picking, so `netdebug` now switches on `bevy/bevy_ui_widgets` and
+  `bevy/ui_picking` (both already in Bevy's default features). An app built without
+  `DefaultPlugins` adds `UiWidgetsPlugins` and the picking plugins itself, or the buttons do
+  nothing; the toggle key works either way.
+- **Steam:** `bevy-steamworks` has no Bevy 0.20 release yet, so `bevy_ensemble_steam` takes the
+  port in its upstream PR #95 by git rev (`extrawurst/bevy_steamworks@8882c209`), which changes
+  only the Bevy version. A game that names `bevy-steamworks` itself takes the same rev, or cargo
+  builds two of it. Back to crates.io once 0.18 is published.
+
 ## A native build's log is kept in a file
 
 `session_log_layer(game)` is a `LogPlugin::custom_layer` that writes everything the console gets to
