@@ -28,6 +28,7 @@
 use std::time::Duration;
 
 use bevy::prelude::*;
+use bevy::ui_widgets::{Activate, ActivateOnPress, Button};
 
 use crate::{
     PeerRoute, PeerRtt, PeerSilence, PeerWireRtt,
@@ -130,13 +131,9 @@ impl Plugin for NetDebugPlugin {
         .add_systems(Startup, (apply_initial_preset, spawn_overlay))
         .add_systems(
             Update,
-            (
-                toggle_overlay,
-                update_overlay_text,
-                handle_preset_buttons,
-                tint_preset_buttons,
-            ),
-        );
+            (toggle_overlay, update_overlay_text, tint_preset_buttons),
+        )
+        .add_observer(handle_preset_buttons);
     }
 }
 
@@ -270,6 +267,9 @@ fn spawn_overlay(mut commands: Commands, config: Res<NetDebugConfig>) {
                     for preset in NetPreset::ALL {
                         row.spawn((
                             Button,
+                            // As the old `Interaction::Pressed` did: the preset applies on the
+                            // press, not when the pointer is let go.
+                            ActivateOnPress,
                             PresetButton(preset),
                             Node {
                                 padding: UiRect::axes(Val::Px(6.0), Val::Px(3.0)),
@@ -434,16 +434,15 @@ fn update_overlay_text(
     ***text = out;
 }
 
-/// Apply a preset when its button is clicked.
+/// Apply a preset when its button is pressed.
 fn handle_preset_buttons(
-    buttons: Query<(&Interaction, &PresetButton), Changed<Interaction>>,
+    activate: On<Activate>,
+    buttons: Query<&PresetButton>,
     mut sim: ResMut<NetSim>,
 ) {
-    for (interaction, button) in buttons.iter() {
-        if *interaction == Interaction::Pressed {
-            sim.set_preset(button.0);
-            info!("netsim: preset set to `{}`", button.0.label());
-        }
+    if let Ok(button) = buttons.get(activate.entity) {
+        sim.set_preset(button.0);
+        info!("netsim: preset set to `{}`", button.0.label());
     }
 }
 

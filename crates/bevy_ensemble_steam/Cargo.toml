@@ -4,10 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = { version = "0.19", default-features = false, features = ["std", "bevy_log"] }
+bevy = { version = "0.20", default-features = false, features = ["std", "bevy_log"] }
 # bevy-steamworks re-exports the *safe* `steamworks` wrapper (currently the
 # published 0.13.1). We use it for everything except one call — see below.
-bevy-steamworks = { git = "https://github.com/HouraiTeahouse/bevy_steamworks", branch = "main" }
+# Pinned to the Bevy 0.20 port in upstream PR #95 (HouraiTeahouse/bevy_steamworks), which only
+# bumps `bevy_app`/`bevy_ecs` to 0.20: upstream `main` and crates.io (0.17) are still on 0.19.
+# Go back to `bevy-steamworks = "0.18"` once that is published.
+bevy-steamworks = { git = "https://github.com/extrawurst/bevy_steamworks", rev = "8882c209c8e6d2ecb318a0ec60446109700c9ceb" }
 bevy_ensemble = { path = "../.." }
 serde = { version = "1", features = ["derive"] }
 # Raw Steamworks FFI. Needed because the published safe `steamworks` crate does
@@ -21,5 +24,5 @@ steamworks-sys = { git = "https://github.com/Noxime/steamworks-rs", rev = "ee852
 
 [dev-dependencies]
 # The examples run whole apps; the plugin itself only needs the ECS.
-bevy = "0.19"
-bevy_immediate = "0.7"
+bevy = "0.20"
+bevy_immediate = "0.9"

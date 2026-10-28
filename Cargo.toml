@@ -12,7 +12,7 @@ members = [
 ]
 
 [dependencies]
-bevy = { version = "0.19", default-features = false, features = ["std", "serialize", "bevy_log"] }
+bevy = { version = "0.20", default-features = false, features = ["std", "serialize", "bevy_log"] }
 postcard = { version = "1", features = ["alloc"] }
 # `Instant` that works on wasm too, for stamping packets at the socket seam.
 web-time = "1"
@@ -43,8 +43,10 @@ netmetrics = []
 # Interactive overlay: live metrics window + toggleable network-condition
 # simulation (delay / jitter / loss / duplication). Implies `netmetrics`.
 # Inert until the game adds `NetDebugPlugin`, so it costs nothing when unused.
-# The overlay is bevy UI, so this is where the UI half of bevy is switched on.
-netdebug = ["netmetrics", "bevy/bevy_ui", "bevy/bevy_ui_render", "bevy/bevy_text", "bevy/bevy_color"]
+# The overlay is bevy UI, so this is where the UI half of bevy is switched on. Its preset
+# buttons are `ui_widgets::Button`s, pressed through UI picking: both are in bevy's default `ui`
+# features already, and named here so `DefaultPlugins` has them in a build that strips those.
+netdebug = ["netmetrics", "bevy/bevy_ui", "bevy/bevy_ui_render", "bevy/bevy_text", "bevy/bevy_color", "bevy/bevy_ui_widgets", "bevy/ui_picking"]
 
 # bevy-steamworks pulls the safe `steamworks` wrapper, which transitively depends
 # on the crates.io `steamworks-sys`. bevy_ensemble_steam also depends on

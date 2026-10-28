@@ -83,7 +83,7 @@ fn collect(
 /// What a layer above does the moment its peer is verified: say something to it. The ticked
 /// bridge announces its registries this way.
 fn greet_on_verification(
-    verified: On<Add, HandshakeVerified>,
+    verified: On<Add<HandshakeVerified>>,
     lobbies: Query<(), (With<Lobby>, Without<Host>)>,
     mut commands: Commands,
 ) {
