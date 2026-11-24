@@ -449,10 +449,12 @@ pub(crate) fn create_peer_connection(
         conn.create_data_channel_with_data_channel_dict("ensemble_reliable", &reliable_config);
     reliable_dc.set_binary_type(RtcDataChannelType::Arraybuffer);
 
-    // Create negotiated unreliable data channel (unordered, no retransmits).
+    // Create negotiated unreliable data channel (unordered, expiring). A lifetime rather than
+    // `maxRetransmits: 0`; see `UNRELIABLE_LIFETIME_MS`. Reliability is the sender's setting, so
+    // a native peer still on `max_retransmits: 0` talks to this one unchanged.
     let unreliable_config = RtcDataChannelInit::new();
     unreliable_config.set_ordered(false);
-    unreliable_config.set_max_retransmits(0);
+    unreliable_config.set_max_packet_life_time(UNRELIABLE_LIFETIME_MS);
     unreliable_config.set_negotiated(true);
     unreliable_config.set_id(1);
     let unreliable_dc =
@@ -509,7 +511,7 @@ pub(crate) fn create_peer_connection(
                     let arr = js_sys::Uint8Array::new(&buf);
                     let bytes = arr.to_vec().into_boxed_slice();
                     if let Some(reply) = inbox.arrive(peer_id, bytes, received_at, reliable) {
-                        let _ = reply_on.send_with_u8_array(&reply);
+                        send_on(&reply_on, &reply, reliable);
                     }
                 }
             }));
@@ -709,5 +711,34 @@ pub(crate) fn send_message(pc: &WasmPeerConnection, data: &[u8], reliable: bool)
     } else {
         &pc.unreliable_channel
     };
-    let _ = dc.send_with_u8_array(&mut data.to_vec());
+    send_on(dc, data, reliable);
+}
+
+/// How long an unreliable message may wait in the browser before it is thrown away unsent.
+///
+/// `maxRetransmits: 0` bounds retransmissions and nothing else: a message still waiting for the
+/// congestion window waited as long as the window took to open, and a stalled link once queued
+/// 800 KB — seconds of snapshots, every one stale on arrival. Chrome's SCTP stack (dcsctp) starts
+/// a message's lifetime at `send()` and drops it from the send queue once expired, so a lifetime
+/// bounds the wait itself. Within it a lost packet may still be retransmitted, which at 100 ms is
+/// at most a fast retransmit. Six ticks at 64 Hz: anything older is a snapshot or input the
+/// receiver has already moved past.
+const UNRELIABLE_LIFETIME_MS: u16 = 100;
+
+/// Bytes the browser may already hold for the unreliable channel before a send is dropped here.
+///
+/// For the browsers whose stack applies the lifetime to retransmissions only, where it bounds
+/// nothing about the queue: this caps it by size instead. Chrome expires the queue long before it
+/// gets here. A message is always admitted onto an empty buffer, however large.
+const UNRELIABLE_BUFFER_BYTES: usize = 64 * 1024;
+
+/// The one place a packet is handed to a channel, keepalive replies included.
+fn send_on(dc: &RtcDataChannel, data: &[u8], reliable: bool) {
+    if !reliable {
+        let buffered = dc.buffered_amount() as usize;
+        if buffered > 0 && buffered + data.len() > UNRELIABLE_BUFFER_BYTES {
+            return;
+        }
+    }
+    let _ = dc.send_with_u8_array(data);
 }

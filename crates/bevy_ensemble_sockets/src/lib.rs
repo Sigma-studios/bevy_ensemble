@@ -688,7 +688,8 @@ impl EnsembleSocket {
     /// Send binary data to a peer, choosing reliable or unreliable delivery.
     ///
     /// - `reliable = true`: ordered, guaranteed delivery.
-    /// - `reliable = false`: unordered, fire-and-forget (no retransmits).
+    /// - `reliable = false`: unordered, fire-and-forget. Native sends each packet once; a
+    ///   browser drops one that waited 100 ms unsent, and one past a full send buffer.
     pub fn send_with_mode(&self, data: Box<[u8]>, peer: u128, reliable: bool) {
         if let Some(pc) = self.peers.get(&peer) {
             #[cfg(not(target_arch = "wasm32"))]
