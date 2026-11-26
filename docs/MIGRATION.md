@@ -4,6 +4,37 @@ One section per phase of the netcode overhaul, in the order they landed. Each na
 what to change in a consumer, and why. Both peers of a session must be built from the same
 commit; the join handshake enforces it from phase E2 onward.
 
+## webrtc-rs 0.21 on native
+
+`bevy_ensemble_sockets`' native backend is on webrtc-rs 0.21, the async layer over the sans-I/O
+`rtc` core, instead of 0.17. The web backend is the browser's own WebRTC and did not change.
+Nothing on the wire changed, and neither did any API here; what a game notices:
+
+- **Drop any patch of the 0.17 crates.** 0.17 parsed a FORWARD-TSN chunk to the end of the packet,
+  so one bundled ahead of other chunks — how a browser sends it — dropped the whole packet, SACK
+  and DATA with it, between a browser and a native peer. A game that patched `webrtc-sctp` for it
+  removes the patch; `rtc-sctp` reads each chunk within its own length. The relay in `server`
+  still uses the `turn` 0.17 crate, which is separate from the peer connection.
+- **Host candidates on container and VM bridges are no longer offered, rather than no longer
+  gathered.** 0.21's driver binds every interface itself (and again on an ICE restart, so a restart
+  after a network change gathers on the interfaces that exist then), and its `SettingEngine` has no
+  interface filter, so `interfaces::gathers_from` is applied to the candidates sent to the peer.
+  The bridge sockets still exist locally; nothing remote is told about them.
+- **A relayed session's report counts its STUN checks.** 0.17 left the pair counters at zero; the
+  report now says, per pair, how many checks were sent and answered each way.
+- **Patch webrtc and rtc to connect at full speed.** 0.21.1 opens a data channel about 400 ms
+  later than its round trips allow: five steps of bringing a connection up each wait for an
+  unrelated timer (the ClientHello, ICE nomination on both sides, a trickled candidate, the SCTP
+  INIT). Sigma-studios/webrtc's `fix/connect-latency` branch fixes them, with `rtc` in its
+  submodule. A `[patch]` only applies in the final workspace, so a game adds both, from the same
+  rev, since this crate uses `rtc` directly and a second copy would not share its types:
+
+  ```toml
+  [patch.crates-io]
+  webrtc = { git = "https://github.com/Sigma-studios/webrtc", rev = "a0629c2" }
+  rtc = { git = "https://github.com/Sigma-studios/webrtc", rev = "a0629c2" }
+  ```
+
 ## Bevy 0.20
 
 Every crate is on Bevy 0.20, which needs rustc 1.97.1. Nothing on the wire changed, and neither

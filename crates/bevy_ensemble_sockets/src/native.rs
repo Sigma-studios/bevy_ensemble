@@ -1,35 +1,34 @@
-// TODO(sans-io): migrate this native backend off tokio + the async `webrtc`
-// crate onto the sans-IO webrtc-rs stack (`rtc` core, or `webrtc` 0.20 once it
-// reaches beta). Goal: drive I/O/timers ourselves from a Bevy system (poll each
-// frame) and drop the tokio runtime dependency entirely. Wait for the sans-IO
-// line to hit beta / stabilize interop before committing; str0m is the
-// lower-risk alternative if we want to move sooner.
+//! The native backend: webrtc-rs 0.21, the async layer over the sans-I/O `rtc` core.
+//!
+//! A peer connection is built with an event handler (candidates, ICE and connection state) and a
+//! driver task of its own, which owns the sockets. The two negotiated data channels report their
+//! own events — open, close, messages — through `DataChannel::poll`, one task per channel here.
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use web_time::Instant;
 
+use async_trait::async_trait;
+use rtc::peer_connection::configuration::RTCOfferOptions;
 use tokio::sync::mpsc;
-use webrtc::api::APIBuilder;
-use webrtc::api::setting_engine::SettingEngine;
-use webrtc::data_channel::RTCDataChannel;
-use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
-use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
-use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
-use webrtc::ice_transport::ice_server::RTCIceServer;
-use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::offer_answer_options::RTCOfferOptions;
-use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-
-use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
+use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
+use webrtc::peer_connection::{
+    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
+    RTCIceCandidateInit, RTCIceCandidateType, RTCIceConnectionState, RTCIceGatheringState,
+    RTCIceServer, RTCPeerConnectionIceEvent, RTCPeerConnectionState, RTCSessionDescription,
+    RTCStatsReportEntry, StatsSelector,
+};
 
 use crate::recovery::{Recover, Recovery, Role};
 use crate::{IceServers, MAX_ICE_RESTARTS, OutgoingSignal, PeerRoute, PeerSignal, PeerState};
 
+/// Where the driver binds. A wildcard is expanded into one socket per usable interface at every
+/// bind — including the rebind of an ICE restart, so a restart after a network change gathers on
+/// the interfaces that exist then rather than the ones that did at the start.
+const BIND_ADDRS: [&str; 2] = ["0.0.0.0:0", "[::]:0"];
+
 pub(crate) struct NativePeerConnection {
-    pub connection: Arc<RTCPeerConnection>,
+    pub connection: Arc<dyn PeerConnection>,
     runtime_handle: tokio::runtime::Handle,
     /// Every signal for this peer, applied strictly in the order it arrived.
     ///
@@ -37,16 +36,10 @@ pub(crate) struct NativePeerConnection {
     /// and applying two of its steps concurrently loses information. `set_remote_description`
     /// parses SDP and brings up DTLS; `add_ice_candidate` is a few instructions. Spawn a task
     /// per signal, as this used to, and the cheap one routinely finishes first, which on
-    /// loopback is nearly always. `RTCPeerConnection::add_ice_candidate` then returns
-    /// `ErrNoRemoteDescription` and the address is gone: no retry, no queue, and — until this
-    /// was hunted down — no log line either.
-    ///
-    /// ICE usually survives that, because one address surviving in either direction lets the
-    /// other side be discovered as a peer-reflexive candidate. It fails only when *every*
-    /// candidate on *both* sides is lost, at which point neither peer can send the first packet
-    /// and nothing bootstraps: `pingAllCandidates called with no candidate pairs`, for ever, on
-    /// a connection that looked healthy right up to the data channel that never opened. Measured
-    /// at one session in four on loopback, where host candidates are the only candidates.
+    /// loopback is nearly always: the candidate is applied against no remote description and
+    /// the address is gone. ICE survives that when one address gets through in either
+    /// direction, and fails — `pingAllCandidates called with no candidate pairs`, for ever —
+    /// when every candidate on both sides is lost. Measured at one session in four on loopback.
     ///
     /// One worker per peer, awaiting each signal to completion, is the whole fix. It is also why
     /// there is no separate candidate buffer here: ordering is a property of the queue rather
@@ -64,19 +57,18 @@ pub(crate) struct NativePeerConnection {
     /// packet waiting behind a reliable one costs nothing measurable, and a single queue cannot
     /// reorder anything.
     outbound: mpsc::UnboundedSender<(bytes::Bytes, bool)>,
-    /// The two workers above, so that a disconnect ends them rather than leaving whatever they
-    /// were awaiting to finish on its own.
-    workers: [tokio::task::JoinHandle<()>; 2],
+    /// The signal and outbound workers and one event loop per data channel, so that a
+    /// disconnect ends them rather than leaving whatever they were awaiting to finish on its own.
+    workers: [tokio::task::JoinHandle<()>; 4],
     /// Everything an ICE restart needs, shared with the state handlers that trigger one.
     restarter: Restarter,
 }
 
 impl Drop for NativePeerConnection {
-    /// Dropping the `Arc<RTCPeerConnection>` is not enough: webrtc-rs keeps its ICE agent, its
-    /// sockets and their tasks alive until `close()` is called, and a socket that is rebuilt on
-    /// every lobby leaves a set of them behind each time. Closing here rather than in
-    /// `disconnect_peer` means every path that lets go of a peer — one disconnect, all of them,
-    /// or the socket itself being dropped — closes it.
+    /// Dropping the handle is not enough: the driver keeps its sockets and its task until
+    /// `close()` is called, and a socket that is rebuilt on every lobby leaves a set of them
+    /// behind each time. Closing here rather than in `disconnect_peer` means every path that lets
+    /// go of a peer — one disconnect, all of them, or the socket itself being dropped — closes it.
     ///
     /// Spawned rather than awaited because this runs on the game thread, and a runtime that has
     /// already shut down drops the future instead of running it, which is the right outcome
@@ -86,9 +78,10 @@ impl Drop for NativePeerConnection {
         self.runtime_handle.spawn(async move {
             let _ = pc.close().await;
         });
-        // The senders die with `self`, which ends both loops at their next `recv()`. The abort
-        // covers a worker that is mid-await — a write the peer has stopped acknowledging, an SDP
-        // that is still being applied — and would otherwise outlive the connection it serves.
+        // The senders die with `self`, which ends the queue workers at their next `recv()`. The
+        // abort covers a worker that is mid-await — a write the peer has stopped acknowledging,
+        // an SDP that is still being applied, a channel still polled — and would otherwise
+        // outlive the connection it serves.
         for worker in &self.workers {
             worker.abort();
         }
@@ -101,13 +94,12 @@ impl Drop for NativePeerConnection {
 /// Local candidates held back until the description they belong to has been sent.
 ///
 /// The transport gathers as soon as it can: on the first `set_local_description`, and — for an
-/// ICE restart — inside `create_offer` and inside the answerer's `set_remote_description`, before
-/// the SDP that carries the new credentials even exists. A candidate can therefore fire, and be
-/// sent, *before* the offer or answer it belongs to. On the far side it then arrives ahead of
-/// that description, and the remote description it is applied against is the old one (a restart)
-/// or none at all (a first answer) — and webrtc-rs's restart wipes the remote candidate list, so
-/// either way the address is lost. The far peer's signal queue keeps signals in arrival order;
-/// it cannot fix an order that was wrong when it was sent.
+/// ICE restart — when the offerer applies its restart offer and when the answerer applies it as
+/// its remote description, before the answer that carries the new credentials even exists. A
+/// candidate can therefore fire, and be sent, *before* the offer or answer it belongs to. On the
+/// far side it then arrives ahead of that description, and is applied against the old one (a
+/// restart) or none at all (a first answer), and the address is lost. The far peer's signal queue
+/// keeps signals in arrival order; it cannot fix an order that was wrong when it was sent.
 ///
 /// So while an offer or answer is being made, candidates are held here, and released — in the
 /// order they were gathered, behind the description — when it has been sent. A guard rather than
@@ -175,12 +167,13 @@ impl Drop for Held {
 
 /// What an ICE restart needs, in a form the state handlers can hold.
 ///
-/// Holds the connection weakly: this lives inside handlers the connection itself owns, and an
-/// `Arc` here would be a cycle that `close()` does not break.
+/// Holds the connection weakly, and only once it exists: the handler that owns this is given to
+/// the builder that makes the connection, and the connection owns the handler, so an `Arc` here
+/// would be a cycle that `close()` does not break.
 #[derive(Clone)]
 struct Restarter {
     peer_id: u128,
-    connection: Weak<RTCPeerConnection>,
+    connection: Arc<OnceLock<Weak<dyn PeerConnection>>>,
     signal_tx: mpsc::UnboundedSender<OutgoingSignal>,
     peer_state_tx: mpsc::UnboundedSender<(u128, PeerState)>,
     gate: CandidateGate,
@@ -204,7 +197,7 @@ impl Restarter {
                 let restored = self.recovery.lock().unwrap().ice_connected();
                 if restored {
                     log::info!("peer {peer_id:#x}: ICE found a path again ({state})");
-                    // The data channel never closed, so its `on_open` will not say so.
+                    // The data channel never closed, so its `OnOpen` will not say so.
                     self.report(PeerState::Connected);
                 } else {
                     log::info!("peer {peer_id:#x}: ICE state {state}");
@@ -257,7 +250,7 @@ impl Restarter {
     /// Make an offer — the first, or one with `ice_restart` — and send it, then whatever
     /// candidates gathering produced meanwhile.
     fn spawn_offer(&self, restart: bool) {
-        let Some(conn) = self.connection.upgrade() else {
+        let Some(conn) = self.connection.get().and_then(Weak::upgrade) else {
             log::debug!("peer {:#x}: no offer, the connection is gone", self.peer_id);
             return;
         };
@@ -281,19 +274,16 @@ impl Restarter {
 }
 
 async fn make_offer(
-    conn: Arc<RTCPeerConnection>,
+    conn: Arc<dyn PeerConnection>,
     peer_id: u128,
     signal_tx: mpsc::UnboundedSender<OutgoingSignal>,
     gate: CandidateGate,
     restart: bool,
 ) {
     let _held = gate.hold();
-    let options = restart.then_some(RTCOfferOptions {
-        ice_restart: true,
-        voice_activity_detection: false,
-    });
-    // With `ice_restart`, webrtc-rs restarts the ICE agent -- new credentials, candidates
-    // regathered -- inside this call; the DTLS and SCTP transports over it are untouched.
+    let options = restart.then_some(RTCOfferOptions { ice_restart: true });
+    // With `ice_restart`, the offer carries new ICE credentials, and applying it restarts the
+    // agent and regathers; the DTLS and SCTP transports over it are untouched.
     let offer = match conn.create_offer(options).await {
         Ok(offer) => offer,
         Err(error) => {
@@ -312,6 +302,115 @@ async fn make_offer(
     });
 }
 
+/// The peer connection's events: local candidates out through the gate, ICE and connection
+/// state into the recovery policy.
+struct Events {
+    peer_id: u128,
+    gate: CandidateGate,
+    restarter: Restarter,
+}
+
+#[async_trait]
+impl PeerConnectionEventHandler for Events {
+    /// Trickle ICE: send candidates as they come, behind the description they belong to (see
+    /// `CandidateGate`). The remote peer applies them in order.
+    async fn on_ice_candidate(&self, event: RTCPeerConnectionIceEvent) {
+        let peer_id = self.peer_id;
+        let candidate = event.candidate;
+        // Container and VM bridges would be offered as host candidates nobody can reach, and
+        // enough of them bury the real LAN address until the relay wins: see `interfaces`. The
+        // driver binds every interface, so the filter is applied here, to what is offered.
+        if candidate.typ == RTCIceCandidateType::Host
+            && !crate::interfaces::offers_host_candidate(&candidate.address)
+        {
+            log::debug!(
+                "peer {peer_id:#x}: not offering host candidate {} (virtual interface)",
+                candidate.address
+            );
+            return;
+        }
+        let mut init = match candidate.to_json() {
+            Ok(init) => init,
+            Err(error) => {
+                log::warn!(
+                    "peer {peer_id:#x}: dropping a local candidate that would not serialise: \
+                     {error}"
+                );
+                return;
+            }
+        };
+        // Looked up per candidate, not per connection, so an ICE restart after a network change
+        // ranks the new default route first.
+        init.candidate = crate::interfaces::promote_default_route(
+            &init.candidate,
+            &crate::interfaces::default_route_addrs(),
+        );
+        let json = serde_json::to_string(&init).unwrap();
+        // The candidate line carries its type (host / srflx / relay) and address, which is what
+        // says whether this peer has anything a remote peer could reach it on.
+        log::info!(
+            "peer {peer_id:#x}: gathered local candidate {}",
+            init.candidate
+        );
+        self.gate.send(json);
+    }
+
+    /// Worth a line of its own: "gathering finished having found nothing usable" and "gathering
+    /// is still running" are different problems that otherwise look identical from the log.
+    async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
+        if state == RTCIceGatheringState::Complete {
+            log::info!(
+                "peer {:#x}: finished gathering local candidates",
+                self.peer_id
+            );
+        }
+    }
+
+    // ICE and peer connection state.
+    //
+    // Every other event here reports success -- a channel that opened, a message that arrived --
+    // so a connection that simply never completes produced no line at all. That is the one
+    // symptom shared by every distinct failure in this stack: a lost candidate, a blocked port, a
+    // peer that went away, a NAT neither side can traverse. These two handlers are what separate
+    // them, and they cost nothing on a connection that works.
+    //
+    // ICE is also where a lost path is noticed and, on the offerer, restarted: `Disconnected` and
+    // `Failed` go through the recovery policy, which decides between a restart offer, waiting for
+    // one, and `Failed`. `Connected` from the data channel opening is still the proof that traffic
+    // flows; the ICE `Connected` that ends a restart is reported too, because the channel never
+    // closed and will not open again.
+    async fn on_ice_connection_state_change(&self, state: RTCIceConnectionState) {
+        self.restarter.on_ice_state(state);
+    }
+
+    /// Both handlers report, and the duplicate costs nothing: `update_peers` reports a state
+    /// once. Which of the two reaches `Failed` first -- or at all -- differs between stacks, and
+    /// this is not a signal to be clever about missing. The one exception is a restart under
+    /// way: `Failed` here follows the ICE `Failed` that started it (the ICE handler runs first),
+    /// and reporting it would end a recovery that has restarts left.
+    async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        let peer_id = self.peer_id;
+        match state {
+            RTCPeerConnectionState::Failed => {
+                if self.restarter.recovery.lock().unwrap().in_progress() {
+                    log::info!(
+                        "peer {peer_id:#x}: connection failed while ICE is restarting; not \
+                         giving up yet"
+                    );
+                } else {
+                    log::warn!(
+                        "peer {peer_id:#x}: connection failed. If ICE reported `connected` \
+                         before this, the failure is in DTLS or SCTP rather than in reaching the \
+                         peer."
+                    );
+                    self.restarter.report(PeerState::Failed);
+                }
+            }
+            _ => log::info!("peer {peer_id:#x}: connection state {state}"),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_peer_connection(
     peer_id: u128,
@@ -324,28 +423,19 @@ pub(crate) fn create_peer_connection(
     discarded_candidates: Arc<AtomicU64>,
     handle: tokio::runtime::Handle,
 ) -> NativePeerConnection {
-    // Container and VM bridges would be offered as host candidates nobody can reach, and enough
-    // of them bury the real LAN address until the relay wins: see `interfaces`, and the
-    // default-route ranking where candidates are sent.
-    let mut settings = SettingEngine::default();
-    settings.set_interface_filter(Box::new(crate::interfaces::gathers_from));
-    let api = APIBuilder::new().with_setting_engine(settings).build();
-
-    let config = RTCConfiguration {
-        ice_servers: ice_servers
-            .0
-            .iter()
-            .map(|server| RTCIceServer {
-                urls: server.urls.clone(),
-                username: server.username.clone(),
-                credential: server.credential.clone(),
-            })
-            .collect(),
-        ..Default::default()
-    };
-
-    let connection =
-        handle.block_on(async { Arc::new(api.new_peer_connection(config).await.unwrap()) });
+    let config = RTCConfigurationBuilder::default()
+        .with_ice_servers(
+            ice_servers
+                .0
+                .iter()
+                .map(|server| RTCIceServer {
+                    urls: server.urls.clone(),
+                    username: server.username.clone(),
+                    credential: server.credential.clone(),
+                })
+                .collect(),
+        )
+        .build();
 
     // First, so that whoever listens hears of this peer before anything happens to it.
     let _ = peer_state_tx.send((peer_id, PeerState::Connecting));
@@ -357,7 +447,7 @@ pub(crate) fn create_peer_connection(
     };
     let restarter = Restarter {
         peer_id,
-        connection: Arc::downgrade(&connection),
+        connection: Arc::new(OnceLock::new()),
         signal_tx: signal_tx.clone(),
         peer_state_tx: peer_state_tx.clone(),
         gate: gate.clone(),
@@ -365,10 +455,29 @@ pub(crate) fn create_peer_connection(
         handle: handle.clone(),
         offer: Arc::new(Mutex::new(None)),
     };
+    let events = Arc::new(Events {
+        peer_id,
+        gate: gate.clone(),
+        restarter: restarter.clone(),
+    });
+
+    // Built on the socket's runtime: the driver and every task it spawns live there.
+    let connection: Arc<dyn PeerConnection> = handle.block_on(async {
+        Arc::new(
+            PeerConnectionBuilder::new()
+                .with_configuration(config)
+                .with_handler(events)
+                .with_udp_addrs(BIND_ADDRS.to_vec())
+                .build()
+                .await
+                .unwrap(),
+        )
+    });
+    let _ = restarter.connection.set(Arc::downgrade(&connection));
 
     let (signal_queue_tx, signal_queue_rx) = mpsc::unbounded_channel::<PeerSignal>();
     let signal_worker = handle.spawn(run_signal_queue(
-        connection.clone(),
+        Arc::clone(&connection),
         peer_id,
         signal_tx.clone(),
         gate.clone(),
@@ -376,129 +485,36 @@ pub(crate) fn create_peer_connection(
         signal_queue_rx,
     ));
 
-    // Trickle ICE: send candidates as they come, behind the description they belong to (see
-    // `CandidateGate`). The remote peer applies them in order.
-    {
-        let gate = gate.clone();
-        connection.on_ice_candidate(Box::new(move |candidate| {
-            let gate = gate.clone();
-            Box::pin(async move {
-                // `None` is the end-of-candidates marker. Worth a line of its own: "gathering
-                // finished having found nothing usable" and "gathering is still running" are
-                // different problems that otherwise look identical from the log.
-                let Some(candidate) = candidate else {
-                    log::info!("peer {peer_id:#x}: finished gathering local candidates");
-                    return;
-                };
-                let mut init = match candidate.to_json() {
-                    Ok(init) => init,
-                    Err(error) => {
-                        log::warn!(
-                            "peer {peer_id:#x}: dropping a local candidate that would not \
-                             serialise: {error}"
-                        );
-                        return;
-                    }
-                };
-                // Looked up per candidate, not per connection, so an ICE restart after a
-                // network change ranks the new default route first.
-                init.candidate = crate::interfaces::promote_default_route(
-                    &init.candidate,
-                    &crate::interfaces::default_route_addrs(),
-                );
-                let json = serde_json::to_string(&init).unwrap();
-                // The candidate line carries its type (host / srflx / relay) and address, which
-                // is what says whether this peer has anything a remote peer could reach it on.
-                log::info!(
-                    "peer {peer_id:#x}: gathered local candidate {}",
-                    init.candidate
-                );
-                gate.send(json);
-            })
-        }));
-    }
-
-    // ICE and peer connection state.
-    //
-    // Every other callback in this file reports success -- a channel that opened, a message that
-    // arrived -- so a connection that simply never completes produced no line at all. That is the
-    // one symptom shared by every distinct failure in this stack: a lost candidate, a blocked
-    // port, a peer that went away, a NAT neither side can traverse. These two handlers are what
-    // separate them, and they cost nothing on a connection that works.
-    //
-    // ICE is also where a lost path is noticed and, on the offerer, restarted: `Disconnected`
-    // and `Failed` go through the recovery policy, which decides between a restart offer,
-    // waiting for one, and `Failed`. `Connected` from the data channel opening is still the
-    // proof that traffic flows; the ICE `Connected` that ends a restart is reported too, because
-    // the channel never closed and will not open again.
-    {
-        let restarter = restarter.clone();
-        connection.on_ice_connection_state_change(Box::new(move |state| {
-            restarter.on_ice_state(state);
-            Box::pin(async {})
-        }));
-    }
-
-    {
-        // Both handlers report, and the duplicate costs nothing: `update_peers` reports a state
-        // once. Which of the two reaches `Failed` first -- or at all -- differs between stacks,
-        // and this is not a signal to be clever about missing. The one exception is a restart
-        // under way: `Failed` here follows the ICE `Failed` that started it (the ICE handler
-        // runs first), and reporting it would end a recovery that has restarts left.
-        let restarter = restarter.clone();
-        connection.on_peer_connection_state_change(Box::new(move |state| {
-            match state {
-                RTCPeerConnectionState::Failed => {
-                    if restarter.recovery.lock().unwrap().in_progress() {
-                        log::info!(
-                            "peer {peer_id:#x}: connection failed while ICE is restarting; \
-                             not giving up yet"
-                        );
-                    } else {
-                        log::warn!(
-                            "peer {peer_id:#x}: connection failed. If ICE reported `connected` \
-                             before this, the failure is in DTLS or SCTP rather than in reaching \
-                             the peer."
-                        );
-                        restarter.report(PeerState::Failed);
-                    }
-                }
-                _ => log::info!("peer {peer_id:#x}: connection state {state}"),
-            }
-            Box::pin(async {})
-        }));
-    }
-
-    // Create negotiated reliable data channel (ordered, reliable).
-    let reliable_config = RTCDataChannelInit {
-        ordered: Some(true),
-        negotiated: Some(0),
-        ..Default::default()
-    };
+    // Both channels are negotiated out of band, by id, on both sides: nothing waits on DCEP.
     let reliable_channel = handle.block_on(async {
         connection
-            .create_data_channel("ensemble_reliable", Some(reliable_config))
+            .create_data_channel(
+                "ensemble_reliable",
+                Some(RTCDataChannelInit {
+                    ordered: true,
+                    negotiated: Some(0),
+                    ..Default::default()
+                }),
+            )
             .await
             .unwrap()
     });
-
-    // Create negotiated unreliable data channel (unordered, no retransmits).
-    let unreliable_config = RTCDataChannelInit {
-        ordered: Some(false),
-        max_retransmits: Some(0),
-        negotiated: Some(1),
-        ..Default::default()
-    };
     let unreliable_channel = handle.block_on(async {
         connection
-            .create_data_channel("ensemble_unreliable", Some(unreliable_config))
+            .create_data_channel(
+                "ensemble_unreliable",
+                Some(RTCDataChannelInit {
+                    ordered: false,
+                    max_retransmits: Some(0),
+                    negotiated: Some(1),
+                    ..Default::default()
+                }),
+            )
             .await
             .unwrap()
     });
 
     let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<(bytes::Bytes, bool)>();
-    // The writer owns the only handles to the channels this side keeps; the peer connection
-    // holds its own, so this is not what keeps them alive.
     let outbound_worker = handle.spawn(run_outbound_queue(
         peer_id,
         Arc::clone(&reliable_channel),
@@ -506,89 +522,107 @@ pub(crate) fn create_peer_connection(
         outbound_rx,
     ));
 
-    // Use the reliable channel for connection state signaling.
-    {
-        let ps_tx = peer_state_tx.clone();
-        let route_tx = route_tx.clone();
-        let pc = Arc::clone(&connection);
-        let route_handle = handle.clone();
-        reliable_channel.on_open(Box::new(move || {
-            let _ = ps_tx.send((peer_id, PeerState::Connected));
-
-            // Asked here, and only here, because this is the one moment the answer is both
-            // available and relevant: a negotiated data channel opens over SCTP, which needs
-            // DTLS, which needs a nominated pair — so by now ICE has chosen, and traffic is
-            // about to start flowing over whatever it chose.
-            //
-            // Reported rather than logged, because "is this session relayed" is the first thing
-            // to establish when somebody says the game feels worse than usual. A renomination
-            // later in the session would not be picked up; ICE rarely does one, and the cost of
-            // being wrong is a stale word in a debug overlay.
-            let route_tx = route_tx.clone();
-            let pc = Arc::clone(&pc);
-            route_handle.spawn(async move {
-                let dtls = pc.sctp().transport();
-                let Some(pair) = dtls.ice_transport().get_selected_candidate_pair().await else {
-                    log::debug!("peer {peer_id:#x}: no candidate pair to report");
-                    return;
-                };
-                let relayed = pair.local.typ == RTCIceCandidateType::Relay
-                    || pair.remote.typ == RTCIceCandidateType::Relay;
-                let route = if relayed {
-                    PeerRoute::Relayed
-                } else {
-                    PeerRoute::Direct
-                };
-                log::info!("peer {peer_id:#x}: {} pair, {pair}", route.label());
-                let report = if relayed {
-                    let selected = (
-                        (pair.local.address.clone(), pair.local.port),
-                        (pair.remote.address.clone(), pair.remote.port),
-                    );
-                    Some(relay_report(&pc, peer_id, selected).await)
-                } else {
-                    None
-                };
-                let _ = route_tx.send((peer_id, route, report));
-            });
-            Box::pin(async {})
-        }));
-    }
-
-    {
-        let ps_tx = peer_state_tx;
-        reliable_channel.on_close(Box::new(move || {
-            let _ = ps_tx.send((peer_id, PeerState::Disconnected));
-            Box::pin(async {})
-        }));
-    }
-
     // Both channels feed into the same inbox, and a keepalive is answered from here, on the
     // runtime, on the channel it came in on — see `inbox`. Through the outbound queue like any
-    // other send, and through a weak handle to it: the queue's worker owns the channels, the
-    // channels own these handlers, and a strong sender here would keep the worker alive for ever.
-    for (channel, reliable) in [(&reliable_channel, true), (&unreliable_channel, false)] {
-        let inbox = inbox.clone();
-        let replies = outbound_tx.downgrade();
-        channel.on_message(Box::new(move |msg| {
-            let received_at = Instant::now();
-            let bytes = msg.data.to_vec().into_boxed_slice();
-            if let Some(reply) = inbox.arrive(peer_id, bytes, received_at, reliable)
-                && let Some(replies) = replies.upgrade()
-            {
-                let _ = replies.send((bytes::Bytes::copy_from_slice(&reply), reliable));
-            }
-            Box::pin(async {})
-        }));
-    }
+    // other send, and through a weak handle to it: the event loops must not keep the writer
+    // alive once the connection has let go of it.
+    let reliable_events = handle.spawn(run_channel_events(ChannelEvents {
+        peer_id,
+        channel: reliable_channel,
+        reliable: true,
+        inbox: inbox.clone(),
+        replies: outbound_tx.downgrade(),
+        peer_state_tx: Some(peer_state_tx),
+        route: Some((route_tx, Arc::downgrade(&connection))),
+    }));
+    let unreliable_events = handle.spawn(run_channel_events(ChannelEvents {
+        peer_id,
+        channel: unreliable_channel,
+        reliable: false,
+        inbox,
+        replies: outbound_tx.downgrade(),
+        peer_state_tx: None,
+        route: None,
+    }));
 
     NativePeerConnection {
         connection,
         runtime_handle: handle,
         signal_queue: signal_queue_tx,
         outbound: outbound_tx,
-        workers: [signal_worker, outbound_worker],
+        workers: [
+            signal_worker,
+            outbound_worker,
+            reliable_events,
+            unreliable_events,
+        ],
         restarter,
+    }
+}
+
+/// One data channel's events, and what to do with them.
+struct ChannelEvents {
+    peer_id: u128,
+    channel: Arc<dyn DataChannel>,
+    reliable: bool,
+    inbox: crate::Inbox,
+    replies: mpsc::WeakUnboundedSender<(bytes::Bytes, bool)>,
+    /// The reliable channel's opening and closing are the peer's: `Connected`, `Disconnected`.
+    peer_state_tx: Option<mpsc::UnboundedSender<(u128, PeerState)>>,
+    /// The reliable channel's opening is also when the route is worth asking for.
+    route: Option<(
+        mpsc::UnboundedSender<crate::RouteReport>,
+        Weak<dyn PeerConnection>,
+    )>,
+}
+
+/// Run one data channel's events until it closes or the connection lets go of it.
+async fn run_channel_events(events: ChannelEvents) {
+    let peer_id = events.peer_id;
+    while let Some(event) = events.channel.poll().await {
+        match event {
+            DataChannelEvent::OnMessage(message) => {
+                let received_at = Instant::now();
+                let bytes = message.data.to_vec().into_boxed_slice();
+                if let Some(reply) =
+                    events
+                        .inbox
+                        .arrive(peer_id, bytes, received_at, events.reliable)
+                    && let Some(replies) = events.replies.upgrade()
+                {
+                    let _ = replies.send((bytes::Bytes::copy_from_slice(&reply), events.reliable));
+                }
+            }
+            DataChannelEvent::OnOpen => {
+                if let Some(states) = &events.peer_state_tx {
+                    let _ = states.send((peer_id, PeerState::Connected));
+                }
+                if let Some((route_tx, connection)) = &events.route
+                    && let Some(connection) = connection.upgrade()
+                {
+                    // Asked here, and only here, because this is the one moment the answer is
+                    // both available and relevant: a negotiated data channel opens over SCTP,
+                    // which needs DTLS, which needs a nominated pair — so by now ICE has chosen,
+                    // and traffic is about to start flowing over whatever it chose.
+                    //
+                    // Reported rather than logged, because "is this session relayed" is the
+                    // first thing to establish when somebody says the game feels worse than
+                    // usual. A renomination later in the session would not be picked up; ICE
+                    // rarely does one, and the cost of being wrong is a stale word in a debug
+                    // overlay.
+                    let route_tx = route_tx.clone();
+                    tokio::spawn(async move {
+                        report_route(connection.as_ref(), peer_id, &route_tx).await;
+                    });
+                }
+            }
+            DataChannelEvent::OnClose => {
+                if let Some(states) = &events.peer_state_tx {
+                    let _ = states.send((peer_id, PeerState::Disconnected));
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -597,8 +631,8 @@ pub(crate) fn create_peer_connection(
 /// Ends when the sender is dropped, i.e. with the peer connection; see `NativePeerConnection::outbound`.
 async fn run_outbound_queue(
     peer_id: u128,
-    reliable: Arc<RTCDataChannel>,
-    unreliable: Arc<RTCDataChannel>,
+    reliable: Arc<dyn DataChannel>,
+    unreliable: Arc<dyn DataChannel>,
     mut outbound: mpsc::UnboundedReceiver<(bytes::Bytes, bool)>,
 ) {
     while let Some((bytes, reliably)) = outbound.recv().await {
@@ -609,7 +643,7 @@ async fn run_outbound_queue(
         };
         // Sending before the channel is open, or after it has closed, is the usual reason. Either
         // way a packet the caller believes was sent was not, and that used to be silent.
-        if let Err(error) = channel.send(&bytes).await {
+        if let Err(error) = channel.send(bytes::BytesMut::from(&bytes[..])).await {
             log::warn!(
                 "peer {peer_id:#x}: could not send {} bytes on the {label} channel: {error}",
                 bytes.len()
@@ -623,7 +657,7 @@ async fn run_outbound_queue(
 /// Lives for as long as the channel does: dropping the peer connection drops the sender, the
 /// `recv()` returns `None`, and the worker ends.
 async fn run_signal_queue(
-    conn: Arc<RTCPeerConnection>,
+    conn: Arc<dyn PeerConnection>,
     peer_id: u128,
     signal_tx: mpsc::UnboundedSender<OutgoingSignal>,
     gate: CandidateGate,
@@ -640,8 +674,8 @@ async fn run_signal_queue(
                     log::warn!("peer {peer_id:#x} sent an offer that is not valid SDP");
                     continue;
                 };
-                // A second offer with new ICE credentials makes webrtc-rs restart its own
-                // agent here, to match the offerer's. Nothing to do for it beyond answering.
+                // A second offer with new ICE credentials restarts this side's agent too, to
+                // match the offerer's. Nothing to do for it beyond answering.
                 if let Err(error) = conn.set_remote_description(remote).await {
                     log::warn!("peer {peer_id:#x}: could not apply its offer: {error}");
                     continue;
@@ -755,65 +789,121 @@ pub(crate) fn send_message(pc: &NativePeerConnection, data: Box<[u8]>, reliable:
     let _ = pc.outbound.send((bytes, reliable));
 }
 
-/// Read a relayed connection's stats into a [`describe`](crate::diagnosis::describe) report.
-/// `selected` is the chosen pair's two ends, as `(address, port)`, matched against the stats'
-/// candidates to name them.
-async fn relay_report(
-    pc: &RTCPeerConnection,
+/// Say whether the selected pair is relayed, and why a relayed one was, from one stats snapshot.
+///
+/// The transport names the selected pair, and the pair names its two candidates: their types
+/// say direct or relayed, and the rest of the snapshot is the [`describe`](crate::diagnosis::describe)
+/// report of a relayed one.
+async fn report_route(
+    pc: &dyn PeerConnection,
     peer_id: u128,
-    selected: ((String, u16), (String, u16)),
-) -> String {
-    use crate::diagnosis::{Candidate, Pair, describe};
-    use webrtc::stats::StatsReportType;
+    route_tx: &mpsc::UnboundedSender<crate::RouteReport>,
+) {
+    use crate::diagnosis::{Candidate, Checks, Pair, describe};
 
-    let stats = pc.get_stats().await;
+    let stats = pc
+        .get_stats(std::time::Instant::now(), StatsSelector::None)
+        .await;
     let (mut local, mut remote, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
-    for report in stats.reports.values() {
-        match report {
-            StatsReportType::LocalCandidate(c) | StatsReportType::RemoteCandidate(c) => {
+    let mut kinds = std::collections::HashMap::new();
+    for entry in stats.iter() {
+        match entry {
+            RTCStatsReportEntry::LocalCandidate(c) | RTCStatsReportEntry::RemoteCandidate(c) => {
+                kinds.insert(c.stats.id.clone(), c.candidate_type);
                 let candidate = Candidate {
-                    id: c.id.clone(),
+                    id: c.stats.id.clone(),
                     kind: c.candidate_type.to_string(),
-                    address: c.ip.clone(),
+                    address: c.address.clone().unwrap_or_default(),
                     port: c.port,
-                    protocol: c.network_type.to_string(),
+                    protocol: c.protocol.clone(),
                 };
-                if matches!(report, StatsReportType::LocalCandidate(_)) {
+                if matches!(entry, RTCStatsReportEntry::LocalCandidate(_)) {
                     local.push(candidate);
                 } else {
                     remote.push(candidate);
                 }
             }
-            StatsReportType::CandidatePair(p) => pairs.push(Pair {
+            RTCStatsReportEntry::IceCandidatePair(p) => pairs.push(Pair {
                 local_id: p.local_candidate_id.clone(),
                 remote_id: p.remote_candidate_id.clone(),
-                state: p.state.to_string(),
+                state: pair_state(p.state).into(),
                 nominated: p.nominated,
-                // webrtc-rs leaves the counters at zero; see `Pair::checks`.
-                checks: None,
+                checks: Some(Checks {
+                    sent: p.requests_sent,
+                    answered: p.responses_received,
+                    received: p.requests_received,
+                    answered_back: p.responses_sent,
+                }),
             }),
             _ => {}
         }
     }
-    // Stable order, so two reports of the same situation read the same.
-    for candidates in [&mut local, &mut remote] {
-        candidates
-            .sort_by(|a, b| (&a.kind, &a.address, a.port).cmp(&(&b.kind, &b.address, b.port)));
-    }
-    pairs.sort_by(|a, b| (&a.local_id, &a.remote_id).cmp(&(&b.local_id, &b.remote_id)));
-
-    let id_of = |candidates: &[Candidate], (address, port): &(String, u16)| {
-        candidates
-            .iter()
-            .find(|c| c.address == *address && c.port == *port)
-            .map(|c| c.id.clone())
+    let selected = stats.transport().and_then(|transport| {
+        stats
+            .candidate_pairs()
+            .find(|pair| pair.stats.id == transport.selected_candidate_pair_id)
+            .map(|pair| {
+                (
+                    pair.local_candidate_id.clone(),
+                    pair.remote_candidate_id.clone(),
+                )
+            })
+    });
+    let Some((local_id, remote_id)) = selected else {
+        log::debug!("peer {peer_id:#x}: no candidate pair to report");
+        return;
     };
-    let selected_ids = id_of(&local, &selected.0).zip(id_of(&remote, &selected.1));
-    describe(
-        peer_id,
-        selected_ids.as_ref().map(|(l, r)| (l.as_str(), r.as_str())),
-        &local,
-        &remote,
-        &pairs,
-    )
+    let relayed = [&local_id, &remote_id]
+        .iter()
+        .any(|id| kinds.get(*id) == Some(&RTCIceCandidateType::Relay));
+    let route = if relayed {
+        PeerRoute::Relayed
+    } else {
+        PeerRoute::Direct
+    };
+    let name = |candidates: &[Candidate], id: &str| {
+        candidates.iter().find(|c| c.id == id).map_or_else(
+            || id.to_string(),
+            |c| format!("{} {}:{}", c.kind, c.address, c.port),
+        )
+    };
+    log::info!(
+        "peer {peer_id:#x}: {} pair, {} <-> {}",
+        route.label(),
+        name(&local, &local_id),
+        name(&remote, &remote_id)
+    );
+    let report = relayed.then(|| {
+        // Stable order, so two reports of the same situation read the same.
+        for candidates in [&mut local, &mut remote] {
+            candidates
+                .sort_by(|a, b| (&a.kind, &a.address, a.port).cmp(&(&b.kind, &b.address, b.port)));
+        }
+        pairs.sort_by(|a, b| (&a.local_id, &a.remote_id).cmp(&(&b.local_id, &b.remote_id)));
+        describe(
+            peer_id,
+            Some((local_id.as_str(), remote_id.as_str())),
+            &local,
+            &remote,
+            &pairs,
+        )
+    });
+    let _ = route_tx.send((peer_id, route, report));
+}
+
+/// A pair's state in the words `diagnosis` reads: the spec's, which these stats name in serde
+/// but do not `Display`.
+fn pair_state(
+    state: rtc::statistics::stats::ice_candidate_pair::RTCStatsIceCandidatePairState,
+) -> &'static str {
+    use rtc::statistics::stats::ice_candidate_pair::RTCStatsIceCandidatePairState as State;
+    match state {
+        State::Frozen => "frozen",
+        State::Waiting => "waiting",
+        State::InProgress => "in-progress",
+        State::Failed => "failed",
+        State::Succeeded => "succeeded",
+        // `#[non_exhaustive]`: a state this does not know yet is not one `diagnosis` reads.
+        _ => "unspecified",
+    }
 }

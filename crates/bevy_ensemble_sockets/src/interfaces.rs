@@ -33,17 +33,36 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 /// VPN tunnels (`tun*`, `utun*`, `wg*`, `tailscale*`) are deliberately absent: those do reach
 /// other machines. So are plain `br0` / `bridge0`, which are commonly the real LAN bridged for
 /// VMs. ant-p2p also matches Hyper-V's internal `vEthernet (…)` switches; that is left out here
-/// because webrtc-util reports every Windows interface with an empty name, so no name filter
-/// can act there.
+/// because the interface list (`rtc::shared::ifaces`, as `webrtc-util` before it) reports every
+/// Windows interface with an empty name, so no name filter can act there.
 const VIRTUAL_INTERFACE_PREFIXES: &[&str] = &[
     "docker", "veth", "cni", "flannel", "cali", "cilium", "weave", "kube-", "virbr", "vboxnet",
     "vmnet", "podman", "lxcbr", "lxdbr",
 ];
 
-/// Should ICE gather host candidates on the interface called `name`? The webrtc-rs
-/// `SettingEngine::set_interface_filter` callback: `false` drops the interface.
+/// Should ICE offer host candidates on the interface called `name`? `false` drops the interface.
 pub(crate) fn gathers_from(name: &str) -> bool {
     !is_virtual_interface(name)
+}
+
+/// Should a host candidate on `address` be offered to the remote peer? Looks the address up
+/// among this machine's interfaces and asks [`gathers_from`] about the one that has it.
+///
+/// webrtc-rs 0.21 binds every interface itself and its `SettingEngine` has no interface filter
+/// any more, so the filter is applied to what is offered rather than to what is gathered. An
+/// address no interface reports — gone between the gather and now, or not parseable — is
+/// offered: dropping a real address costs the connection, keeping a dead one costs a few checks.
+pub(crate) fn offers_host_candidate(address: &str) -> bool {
+    let Ok(ip) = address.parse::<IpAddr>() else {
+        return true;
+    };
+    let Ok(interfaces) = rtc::shared::ifaces::ifaces() else {
+        return true;
+    };
+    interfaces
+        .iter()
+        .find(|interface| interface.addr.is_some_and(|addr| addr.ip() == ip))
+        .is_none_or(|interface| gathers_from(&interface.name))
 }
 
 fn is_virtual_interface(name: &str) -> bool {

@@ -16,61 +16,54 @@
 #[cfg(not(target_arch = "wasm32"))]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
     use std::time::{Duration, Instant};
 
-    use bytes::Bytes;
-    use tokio::sync::{Notify, mpsc};
-    use webrtc::api::APIBuilder;
-    use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
-    use webrtc::data_channel::data_channel_message::DataChannelMessage;
-    use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
-    use webrtc::peer_connection::configuration::RTCConfiguration;
+    use bytes::BytesMut;
+    use tokio::sync::{mpsc, oneshot};
+    use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
+    use webrtc::peer_connection::{
+        PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
+        RTCPeerConnectionIceEvent,
+    };
 
     const WARMUP: usize = 50;
     const SAMPLES: usize = 500;
     const PAYLOAD_BYTES: usize = 64;
 
-    let api = APIBuilder::new().build();
+    /// Trickles each local candidate straight into the other peer (same process, no
+    /// serialization beyond the crate's own `to_json`).
+    struct Trickle(Arc<OnceLock<Arc<dyn PeerConnection>>>);
+
+    #[async_trait::async_trait]
+    impl PeerConnectionEventHandler for Trickle {
+        async fn on_ice_candidate(&self, event: RTCPeerConnectionIceEvent) {
+            if let (Some(other), Ok(init)) = (self.0.get(), event.candidate.to_json()) {
+                let _ = other.add_ice_candidate(init).await;
+            }
+        }
+    }
+
     // No ICE servers: gather host candidates only, so the pair stays on loopback/LAN and we
     // measure transport, not STUN. (STUN would only affect connection setup anyway.)
-    let config = || RTCConfiguration::default();
-
-    let pinger = Arc::new(api.new_peer_connection(config()).await?);
-    let ponger = Arc::new(api.new_peer_connection(config()).await?);
-
-    // Trickle ICE candidates directly into the other peer (same process, no serialization
-    // needed beyond the crate's own to_json round trip).
-    {
-        let ponger = ponger.clone();
-        pinger.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
-            let ponger = ponger.clone();
-            Box::pin(async move {
-                if let Some(c) = c {
-                    if let Ok(init) = c.to_json() {
-                        let _ = ponger.add_ice_candidate(init).await;
-                    }
-                }
-            })
-        }));
-    }
-    {
-        let pinger = pinger.clone();
-        ponger.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
-            let pinger = pinger.clone();
-            Box::pin(async move {
-                if let Some(c) = c {
-                    if let Ok(init) = c.to_json() {
-                        let _ = pinger.add_ice_candidate(init).await;
-                    }
-                }
-            })
-        }));
-    }
+    let to_ponger = Arc::new(OnceLock::new());
+    let to_pinger = Arc::new(OnceLock::new());
+    let build = |trickle: Arc<OnceLock<Arc<dyn PeerConnection>>>| async move {
+        PeerConnectionBuilder::new()
+            .with_handler(Arc::new(Trickle(trickle)))
+            .with_udp_addrs(vec!["0.0.0.0:0"])
+            .build()
+            .await
+            .map(|pc| Arc::new(pc) as Arc<dyn PeerConnection>)
+    };
+    let pinger = build(to_ponger.clone()).await?;
+    let ponger = build(to_pinger.clone()).await?;
+    let _ = to_ponger.set(ponger.clone());
+    let _ = to_pinger.set(pinger.clone());
 
     // Same negotiated unreliable channel both sides create (matches native.rs).
     let dc_init = || RTCDataChannelInit {
-        ordered: Some(false),
+        ordered: false,
         max_retransmits: Some(0),
         negotiated: Some(1),
         ..Default::default()
@@ -82,41 +75,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .create_data_channel("ensemble_unreliable", Some(dc_init()))
         .await?;
 
-    // Ponger echoes every message straight back.
-    {
-        let pong_dc_echo = pong_dc.clone();
-        pong_dc.on_message(Box::new(move |msg: DataChannelMessage| {
-            let pong_dc_echo = pong_dc_echo.clone();
-            Box::pin(async move {
-                let _ = pong_dc_echo.send(&msg.data).await;
-            })
-        }));
-    }
-
-    // Pinger forwards each received pong to the measurement loop.
+    // Each channel's events: the ponger echoes every message straight back, the pinger forwards
+    // each pong to the measurement loop, and both say when they are open.
     let (pong_tx, mut pong_rx) = mpsc::unbounded_channel::<()>();
-    ping_dc.on_message(Box::new(move |_msg: DataChannelMessage| {
-        let _ = pong_tx.send(());
-        Box::pin(async {})
-    }));
-
-    // Signal when both channels are open.
-    let ping_open = Arc::new(Notify::new());
-    let pong_open = Arc::new(Notify::new());
-    {
-        let n = ping_open.clone();
-        ping_dc.on_open(Box::new(move || {
-            let n = n.clone();
-            Box::pin(async move { n.notify_one() })
-        }));
-    }
-    {
-        let n = pong_open.clone();
-        pong_dc.on_open(Box::new(move || {
-            let n = n.clone();
-            Box::pin(async move { n.notify_one() })
-        }));
-    }
+    let events =
+        |dc: Arc<dyn DataChannel>, echo: bool, pongs: Option<mpsc::UnboundedSender<()>>| {
+            let (open_tx, open_rx) = oneshot::channel::<()>();
+            tokio::spawn(async move {
+                let mut open_tx = Some(open_tx);
+                while let Some(event) = dc.poll().await {
+                    match event {
+                        DataChannelEvent::OnOpen => {
+                            if let Some(open) = open_tx.take() {
+                                let _ = open.send(());
+                            }
+                        }
+                        DataChannelEvent::OnMessage(message) if echo => {
+                            let _ = dc.send(message.data).await;
+                        }
+                        DataChannelEvent::OnMessage(_) => {
+                            if let Some(pongs) = &pongs {
+                                let _ = pongs.send(());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            open_rx
+        };
+    let ping_open = events(ping_dc.clone(), false, Some(pong_tx));
+    let pong_open = events(pong_dc.clone(), true, None);
 
     // Offer / answer exchange (same process — pass descriptions directly).
     let offer = pinger.create_offer(None).await?;
@@ -128,8 +117,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("connecting...");
     tokio::time::timeout(Duration::from_secs(15), async {
-        ping_open.notified().await;
-        pong_open.notified().await;
+        let _ = ping_open.await;
+        let _ = pong_open.await;
     })
     .await
     .map_err(|_| "data channels did not open within 15s")?;
@@ -137,13 +126,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "channels open; measuring {SAMPLES} sequential round trips ({PAYLOAD_BYTES}B, unreliable)..."
     );
 
-    let payload = Bytes::from(vec![0u8; PAYLOAD_BYTES]);
+    let payload = BytesMut::from(&[0u8; PAYLOAD_BYTES][..]);
     let mut samples: Vec<Duration> = Vec::with_capacity(SAMPLES);
     let mut drops = 0usize;
 
     for i in 0..(WARMUP + SAMPLES) {
         let start = Instant::now();
-        ping_dc.send(&payload).await?;
+        ping_dc.send(payload.clone()).await?;
         // Sequential: send one, wait for its echo before the next. Loopback drops are ~nil;
         // a timeout just skips that sample (unreliable channel, no retransmit).
         match tokio::time::timeout(Duration::from_secs(1), pong_rx.recv()).await {

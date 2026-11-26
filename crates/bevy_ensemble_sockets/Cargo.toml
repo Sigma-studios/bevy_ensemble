@@ -11,7 +11,10 @@ web-time = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["sync", "rt"] }
-webrtc = { version = "0.17", default-features = false }
+webrtc = { version = "0.21.1", default-features = false, features = ["runtime-tokio", "crypto-ring"] }
+# The sans-I/O core under `webrtc`: its interface list (for `interfaces`) and offer options.
+rtc = { version = "0.21.1", default-features = false }
+async-trait = "0.1"
 bytes = "1"
 
 # For the `loopback_rtt` benchmark example (needs a real runtime + timers).
